@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import warnings
 import argparse
 import csv
 from pathlib import Path
 from typing import Any
+
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r".*torch\.distributed\.reduce_op.*",
+)
 
 import pocketeer as pt
 

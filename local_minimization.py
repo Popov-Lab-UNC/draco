@@ -140,12 +140,14 @@ def minimize_overlay_pose(
             positions_nm=positions_nm,
             atom_indices=restrained_protein_indices,
             k_kcal_per_mol_a2=protein_restraint_k_kcal_per_mol_A2,
+            k_param_name="k_protein_posres",
         )
         n_ligand_restrained = _add_positional_restraints(
             system=system,
             positions_nm=positions_nm,
             atom_indices=ligand_atom_indices,
             k_kcal_per_mol_a2=ligand_restraint_k_kcal_per_mol_A2,
+            k_param_name="k_ligand_posres",
         )
 
         integrator = LangevinIntegrator(
@@ -302,12 +304,18 @@ def _add_positional_restraints(
     positions_nm: npt.NDArray[np.float64],
     atom_indices: list[int],
     k_kcal_per_mol_a2: float,
+    k_param_name: str,
 ) -> int:
     if k_kcal_per_mol_a2 <= 0.0 or not atom_indices:
         return 0
 
-    force = CustomExternalForce("0.5*k*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
-    force.addGlobalParameter("k", k_kcal_per_mol_a2 * KCAL_PER_MOL_A2_TO_KJ_PER_MOL_NM2)
+    force = CustomExternalForce(
+        f"0.5*{k_param_name}*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)"
+    )
+    force.addGlobalParameter(
+        k_param_name,
+        k_kcal_per_mol_a2 * KCAL_PER_MOL_A2_TO_KJ_PER_MOL_NM2,
+    )
     force.addPerParticleParameter("x0")
     force.addPerParticleParameter("y0")
     force.addPerParticleParameter("z0")
