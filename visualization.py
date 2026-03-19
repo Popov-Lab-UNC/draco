@@ -7,6 +7,7 @@ import biotite.structure as struc  # type: ignore
 
 from ligand_preparation import conformer_to_pdb_block
 from pocket_coloring import PocketColoring, FEATURE_COLORS
+from local_minimization import LocalMinimizationResult
 from overlay import OverlayResult
 
 
@@ -83,11 +84,17 @@ def view_pocket_overlay(
 
 
 def summarize_overlay(result: OverlayResult) -> dict[str, Any]:
+    """Return a flat dict of all overlay scores for a single pose.
+
+    Includes both the coarse integer ``ranking_score`` (useful as a
+    filter: keep > 0) and the continuous ``gaussian_fit_score`` (use
+    for sorting — higher = tighter, more complementary match).
+    """
     return {
         "pocket_id": result.pocket_id,
         "ligand_name": result.ligand_name,
         "conformer_id": result.conformer_id,
-        "ranking_score": result.ranking_score,
+        "gaussian_fit_score": round(result.gaussian_fit_score, 4),
         "n_compatible": result.n_compatible,
         "n_neutral": result.n_neutral,
         "n_incompatible": result.n_incompatible,
@@ -98,10 +105,70 @@ def summarize_overlay(result: OverlayResult) -> dict[str, Any]:
                 "sphere_labels": list(s.sphere_labels),
                 "matched_ligand_label": s.matched_ligand_label,
                 "ligand_point_index": s.ligand_point_index,
-                "distance": s.distance,
+                "distance": round(s.distance, 3),
                 "compatibility": s.compatibility,
             }
             for s in result.sphere_results
         ],
     }
+
+
+def summarize_minimization(
+    overlay: OverlayResult,
+    minim: LocalMinimizationResult,
+) -> dict[str, Any]:
+    """Return a flat dict merging overlay scores with post-minimization physics.
+
+    Designed for use in notebooks::
+
+        import pandas as pd
+        rows = [summarize_minimization(pose, minim) for pose, minim in results]
+        df = pd.DataFrame(rows).sort_values("gaussian_fit_score", ascending=False)
+
+    Interpretation guide
+    --------------------
+    gaussian_fit_score
+        Higher = tighter pharmacophore complementarity.  Primary sort key.
+    interaction_energy_kj_per_mol
+        Approximate protein–ligand MM interaction energy.  More negative = more
+        favourable.  ``None`` if decomposition was skipped or unavailable.
+    delta_energy_kj_per_mol
+        final − initial potential energy.  Dominated by clash relief; more
+        negative = more starting strain resolved by minimization.
+    ligand_heavy_atom_rmsd_angstrom
+        Ligand drift from the overlay pose after minimization.  Large values
+        (> ~2 Å) indicate the overlay geometry was too strained to hold.
+    induced_fit_ligand_rmsd_angstrom
+        Ligand drift from the minimized pose after 50 ps of free dynamics.
+        ``None`` if induced-fit MD was not run.  Large values (> ~2–3 Å)
+        suggest the binding mode is not stable.
+    """
+    summary = summarize_overlay(overlay)
+    summary.update(
+        {
+            "initial_energy_kj_per_mol": round(minim.initial_energy_kj_per_mol, 2),
+            "final_energy_kj_per_mol": round(minim.final_energy_kj_per_mol, 2),
+            "delta_energy_kj_per_mol": round(
+                minim.final_energy_kj_per_mol - minim.initial_energy_kj_per_mol, 2
+            ),
+            "interaction_energy_kj_per_mol": (
+                round(minim.interaction_energy_kj_per_mol, 2)
+                if minim.interaction_energy_kj_per_mol is not None
+                else None
+            ),
+            "ligand_heavy_atom_rmsd_angstrom": round(
+                minim.ligand_heavy_atom_rmsd_angstrom, 3
+            ),
+            "induced_fit_ligand_rmsd_angstrom": (
+                round(minim.induced_fit_ligand_rmsd_angstrom, 3)
+                if minim.induced_fit_ligand_rmsd_angstrom is not None
+                else None
+            ),
+            "protein_atoms_flexible": minim.protein_atoms_flexible,
+        }
+    )
+    # Move sphere_results to the end for readability
+    sphere_results = summary.pop("sphere_results")
+    summary["sphere_results"] = sphere_results
+    return summary
 

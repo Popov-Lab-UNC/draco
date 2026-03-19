@@ -40,6 +40,12 @@ class LocalMinimizationResult:
     ligand_atoms_restrained: int
     minimized_positions_angstrom: npt.NDArray[np.float64]
     minimized_complex_pdb: str
+    # --- Physics-based interaction score (None if unavailable) ---
+    interaction_energy_kj_per_mol: float | None = None
+    # --- Induced-fit MD results (None if run_induced_fit_md=False) ---
+    induced_fit_ligand_rmsd_angstrom: float | None = None
+    induced_fit_final_energy_kj_per_mol: float | None = None
+    induced_fit_complex_pdb: str | None = None
 
     def save_pdb(self, output_path: str | Path) -> None:
         Path(output_path).write_text(self.minimized_complex_pdb)
@@ -65,12 +71,32 @@ def minimize_overlay_pose(
     output_path: str | Path | None = None,
     write_pdb_on_error: bool = True,
     error_suffix: str = "_error",
+    compute_interaction_energy: bool = True,
+    run_induced_fit_md: bool = False,
+    induced_fit_steps: int = 25000,
 ) -> LocalMinimizationResult:
     """Minimise one overlay pose against a pre-prepared protein.
 
     The caller is responsible for running ``prepare_protein()`` once and
     passing the resulting ``PreparedProtein`` here.  This avoids repeating
     the (slow) PDBFixer repair step for every pose.
+
+    Parameters
+    ----------
+    compute_interaction_energy:
+        If True (default), compute an approximate protein–ligand interaction
+        energy by zeroing NonbondedForce parameters for each component in
+        turn.  Returns ``None`` gracefully if the NonbondedForce cannot be
+        located (e.g. when GAFF custom forces are used exclusively).
+    run_induced_fit_md:
+        If True, after minimization the ligand restraints are released and
+        protein restraints softened 5×, then ``induced_fit_steps`` MD steps
+        are run (default 25 000 × 2 fs = 50 ps) followed by a short
+        re-minimization.  The RMSD of the ligand from the minimized pose is
+        reported — a large drift indicates the pose is not stable.
+    induced_fit_steps:
+        Number of MD steps for the induced-fit phase (default 25 000 = 50 ps
+        at a 2 fs timestep).
     """
     ligand_pdb = PDBFile(
         io.StringIO(
@@ -198,6 +224,48 @@ def minimize_overlay_pose(
             final_positions_nm[ligand_heavy_abs] * 10.0,
         )
 
+        # ── Optional: interaction energy decomposition ─────────────────────────────
+        interaction_energy: float | None = None
+        if compute_interaction_energy:
+            interaction_energy = _compute_interaction_energy(
+                simulation=simulation,
+                ligand_atom_indices=ligand_atom_indices,
+                protein_atom_indices=protein_atom_indices,
+                final_energy_kj_per_mol=final_energy,
+            )
+
+        # ── Optional: induced-fit MD phase ───────────────────────────────────
+        induced_fit_ligand_rmsd: float | None = None
+        induced_fit_final_energy: float | None = None
+        induced_fit_complex_pdb: str | None = None
+
+        if run_induced_fit_md:
+            # Release ligand; soften protein backbone restraints 5×
+            simulation.context.setParameter("k_ligand_posres", 0.0)
+            simulation.context.setParameter(
+                "k_protein_posres",
+                (protein_restraint_k_kcal_per_mol_A2 / 5.0) * KCAL_PER_MOL_A2_TO_KJ_PER_MOL_NM2,
+            )
+            simulation.step(induced_fit_steps)
+            simulation.minimizeEnergy(maxIterations=500)
+
+            ifd_state = simulation.context.getState(getEnergy=True, getPositions=True)
+            induced_fit_final_energy = float(
+                ifd_state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+            )
+            ifd_positions_nm = np.asarray(
+                ifd_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+                dtype=np.float64,
+            )
+            # RMSD of ligand heavy atoms relative to the post-minimization pose
+            induced_fit_ligand_rmsd = _rmsd(
+                final_positions_nm[ligand_heavy_abs] * 10.0,
+                ifd_positions_nm[ligand_heavy_abs] * 10.0,
+            )
+            ifd_out = io.StringIO()
+            PDBFile.writeFile(modeller.topology, ifd_state.getPositions(), ifd_out, keepIds=True)
+            induced_fit_complex_pdb = ifd_out.getvalue()
+
         final_positions = final_state.getPositions()
         final_out = io.StringIO()
         PDBFile.writeFile(modeller.topology, final_positions, final_out, keepIds=True)
@@ -215,6 +283,10 @@ def minimize_overlay_pose(
             ligand_atoms_restrained=n_ligand_restrained,
             minimized_positions_angstrom=final_positions_nm * 10.0,
             minimized_complex_pdb=minimized_pdb,
+            interaction_energy_kj_per_mol=interaction_energy,
+            induced_fit_ligand_rmsd_angstrom=induced_fit_ligand_rmsd,
+            induced_fit_final_energy_kj_per_mol=induced_fit_final_energy,
+            induced_fit_complex_pdb=induced_fit_complex_pdb,
         )
     except Exception:
         if output_path and write_pdb_on_error:
@@ -222,6 +294,93 @@ def minimize_overlay_pose(
             error_path = out_path.with_name(out_path.stem + error_suffix + out_path.suffix)
             error_path.write_text(initial_complex_pdb)
         raise
+
+
+def _compute_interaction_energy(
+    *,
+    simulation: object,
+    ligand_atom_indices: list[int],
+    protein_atom_indices: list[int],
+    final_energy_kj_per_mol: float,
+) -> float | None:
+    """Approximate protein–ligand interaction energy via NonbondedForce decomposition.
+
+    Strategy
+    --------
+    1. Record E(complex) — already computed as *final_energy_kj_per_mol*.
+    2. Zero the charge and epsilon of all **ligand** atoms → get E(protein_alone).
+    3. Restore ligand params; zero charge and epsilon of all **protein** atoms →
+       get E(ligand_alone).
+    4. Restore protein params.
+    5. Return  ΔE = E(complex) − E(protein_alone) − E(ligand_alone).
+
+    This isolates the nonbonded cross-interaction terms (van der Waals + electrostatics
+    between protein and ligand).  Intramolecular bonded contributions (bonds, angles,
+    torsions) cancel exactly in the subtraction because they are unchanged by zeroing
+    nonbonded parameters.
+
+    Returns
+    -------
+    float or None
+        Interaction energy in kJ/mol.  More negative = more favourable.
+        Returns ``None`` if the NonbondedForce cannot be found (e.g. custom forces only).
+    """
+    # Locate the standard NonbondedForce (charge + LJ)
+    nb_force = None
+    for force in simulation.system.getForces():  # type: ignore[attr-defined]
+        if type(force).__name__ == "NonbondedForce":
+            nb_force = force
+            break
+    if nb_force is None:
+        return None
+
+    try:
+        # ── Save and zero ligand params ──────────────────────────────────────
+        lig_saved: list[tuple] = []
+        for idx in ligand_atom_indices:
+            params = nb_force.getParticleParameters(idx)
+            lig_saved.append(params)
+            # Zero charge (index 0) and epsilon (index 2); keep sigma (index 1)
+            nb_force.setParticleParameters(idx, 0.0 * params[0].unit, params[1], 0.0 * params[2].unit)
+        nb_force.updateParametersInContext(simulation.context)  # type: ignore[attr-defined]
+
+        state = simulation.context.getState(getEnergy=True)  # type: ignore[attr-defined]
+        e_protein = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
+
+        # ── Restore ligand, save and zero protein params ─────────────────────
+        for i, idx in enumerate(ligand_atom_indices):
+            nb_force.setParticleParameters(idx, *lig_saved[i])
+
+        prot_saved: list[tuple] = []
+        for idx in protein_atom_indices:
+            params = nb_force.getParticleParameters(idx)
+            prot_saved.append(params)
+            nb_force.setParticleParameters(idx, 0.0 * params[0].unit, params[1], 0.0 * params[2].unit)
+        nb_force.updateParametersInContext(simulation.context)  # type: ignore[attr-defined]
+
+        state = simulation.context.getState(getEnergy=True)  # type: ignore[attr-defined]
+        e_ligand = float(state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole))
+
+        # ── Restore protein params ───────────────────────────────────────────
+        for i, idx in enumerate(protein_atom_indices):
+            nb_force.setParticleParameters(idx, *prot_saved[i])
+        nb_force.updateParametersInContext(simulation.context)  # type: ignore[attr-defined]
+
+        return final_energy_kj_per_mol - e_protein - e_ligand
+
+    except Exception:
+        # Restore everything on failure so simulation context is not corrupted
+        try:
+            for i, idx in enumerate(ligand_atom_indices):
+                if i < len(lig_saved):
+                    nb_force.setParticleParameters(idx, *lig_saved[i])
+            for i, idx in enumerate(protein_atom_indices):
+                if i < len(prot_saved):
+                    nb_force.setParticleParameters(idx, *prot_saved[i])
+            nb_force.updateParametersInContext(simulation.context)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return None
 
 
 def _register_ligand_template(
@@ -235,6 +394,7 @@ def _register_ligand_template(
     Uses OpenFF Sage (openff-2.3.0 by default) via SMIRNOFFTemplateGenerator —
     the recommended ligand force field for protein-ligand systems alongside
     AMBER ff14SB.  Falls back to GAFF-2.11 if openff-toolkit is unavailable.
+
     """
     ligand_mol = Chem.MolFromMolBlock(overlay_result.conformer.mol_block, removeHs=False)
     if ligand_mol is None:

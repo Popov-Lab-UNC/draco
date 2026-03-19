@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 from collections import defaultdict
@@ -13,6 +14,26 @@ from ligand_preparation import (
     PreparedLigandConformer,
 )
 from pocket_coloring import PocketColoring, FEATURE_COMPAT
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gaussian fit-score constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+# σ for Gaussian kernel: contribution halves every ~1.0 Å from ideal distance
+_GAUSSIAN_SIGMA_A: float = 1.5
+
+# Feature weights: H-bonds & ionic contacts matter most
+_FEATURE_WEIGHTS: dict[str, float] = {
+    "donor":      2.0,
+    "acceptor":   2.0,
+    "cation":     2.0,
+    "anion":      2.0,
+    "ring":       1.5,
+    "hydrophobe": 1.0,
+    "mixed":      0.5,
+    "unlabeled":  0.0,
+}
 
 
 @dataclass(frozen=True)
@@ -30,7 +51,7 @@ class OverlayResult:
     pocket_id: int
     ligand_name: str
     conformer_id: int
-    ranking_score: int
+    gaussian_fit_score: float
     n_compatible: int
     n_neutral: int
     n_incompatible: int
@@ -84,7 +105,6 @@ def overlay_prepared_ligand_poses(
     overlap_cutoff: float = 1.5,
     max_iterations: int = 8,
     max_poses: int | None = None,
-    min_ranking_score: int | None = None,
     dedupe_heavy_atom_rmsd: float | None = None,
 ) -> list[OverlayResult]:
     all_results = [
@@ -98,9 +118,7 @@ def overlay_prepared_ligand_poses(
         )
         for conformer in prepared_ligand.conformers
     ]
-    ranked = sorted(all_results, key=lambda r: r.ranking_score, reverse=True)
-    if min_ranking_score is not None:
-        ranked = [r for r in ranked if r.ranking_score >= min_ranking_score]
+    ranked = sorted(all_results, key=lambda r: r.gaussian_fit_score, reverse=True)
     if dedupe_heavy_atom_rmsd is not None and dedupe_heavy_atom_rmsd > 0.0:
         ranked = _dedupe_results_by_heavy_atom_rmsd(ranked, dedupe_heavy_atom_rmsd)
     if max_poses is not None:
@@ -126,7 +144,7 @@ def rank_ligand_over_pockets(
         )
         for pocket_coloring in pocket_colorings
     ]
-    return sorted(results, key=lambda r: r.ranking_score, reverse=True)
+    return sorted(results, key=lambda r: r.gaussian_fit_score, reverse=True)
 
 
 def rank_ligand_over_pockets_multi(
@@ -137,7 +155,6 @@ def rank_ligand_over_pockets_multi(
     overlap_cutoff: float = 2.5,
     max_iterations: int = 8,
     poses_per_pocket: int = 3,
-    min_ranking_score: int | None = None,
     dedupe_heavy_atom_rmsd: float | None = None,
 ) -> list[OverlayResult]:
     if poses_per_pocket < 1:
@@ -151,11 +168,10 @@ def rank_ligand_over_pockets_multi(
             overlap_cutoff=overlap_cutoff,
             max_iterations=max_iterations,
             max_poses=poses_per_pocket,
-            min_ranking_score=min_ranking_score,
             dedupe_heavy_atom_rmsd=dedupe_heavy_atom_rmsd,
         )
         results.extend(pocket_results)
-    return sorted(results, key=lambda r: r.ranking_score, reverse=True)
+    return sorted(results, key=lambda r: r.gaussian_fit_score, reverse=True)
 
 
 def overlay_conformer(
@@ -176,7 +192,7 @@ def overlay_conformer(
     BestPayload = tuple[
         npt.NDArray[np.float64],
         npt.NDArray[np.float64],
-        int, int, int, int, int,
+        float, int, int, int, int,
         tuple[SphereOverlapResult, ...],
     ]
     best_payload: BestPayload | None = None
@@ -195,31 +211,31 @@ def overlay_conformer(
             rotation, translation = _rigid_transform(source, target)
 
         xpts = _apply_color_points(conformer.color_points, rotation, translation)
-        ranking_score, n_comp, n_neut, n_incomp, n_unused, sphere_results = (
+        gaussian_fit_score, n_comp, n_neut, n_incomp, n_unused, sphere_results = (
             _score_sphere_overlap(pocket_coloring, xpts, overlap_cutoff)
         )
         payload: BestPayload = (
             rotation, translation,
-            ranking_score, n_comp, n_neut, n_incomp, n_unused,
+            gaussian_fit_score, n_comp, n_neut, n_incomp, n_unused,
             sphere_results,
         )
-        if best_payload is None or ranking_score > best_payload[2]:
+        if best_payload is None or gaussian_fit_score > best_payload[2]:
             best_payload = payload
 
     if best_payload is None:
         rotation = np.eye(3, dtype=np.float64)
         translation = pocket_coloring.centroid - conformer.centroid
         xpts = _apply_color_points(conformer.color_points, rotation, translation)
-        ranking_score, n_comp, n_neut, n_incomp, n_unused, sphere_results = (
+        gaussian_fit_score, n_comp, n_neut, n_incomp, n_unused, sphere_results = (
             _score_sphere_overlap(pocket_coloring, xpts, overlap_cutoff)
         )
         best_payload = (
             rotation, translation,
-            ranking_score, n_comp, n_neut, n_incomp, n_unused,
+            gaussian_fit_score, n_comp, n_neut, n_incomp, n_unused,
             sphere_results,
         )
 
-    rotation, translation, ranking_score, n_comp, n_neut, n_incomp, n_unused, sphere_results = best_payload
+    rotation, translation, gaussian_fit_score, n_comp, n_neut, n_incomp, n_unused, sphere_results = best_payload
     transformed_all_atom_coords = _apply_transform(conformer.all_atom_coords, rotation, translation)
     transformed_color_points = tuple(
         LigandColorPoint(
@@ -234,7 +250,7 @@ def overlay_conformer(
         pocket_id=pocket_coloring.pocket_id,
         ligand_name=ligand_name,
         conformer_id=conformer.conformer_id,
-        ranking_score=ranking_score,
+        gaussian_fit_score=gaussian_fit_score,
         n_compatible=n_comp,
         n_neutral=n_neut,
         n_incompatible=n_incomp,
@@ -256,18 +272,25 @@ def _score_sphere_overlap(
     pocket_coloring: PocketColoring,
     transformed_color_points: tuple[LigandColorPoint, ...],
     overlap_cutoff: float,
-) -> tuple[int, int, int, int, int, tuple[SphereOverlapResult, ...]]:
+) -> tuple[float, int, int, int, int, tuple[SphereOverlapResult, ...]]:
+    """Score alignment of ligand color points against a colored pocket.
 
+    Returns ``(gaussian_fit_score, n_compatible, n_neutral, n_incompatible,
+    n_unused, sphere_results)``.  ``gaussian_fit_score`` is the primary
+    ranking signal: each compatible match contributes ``w * exp(-d²/2σ²)``
+    and each incompatible match subtracts the same.
+    """
     if not transformed_color_points:
         n_labeled = sum(1 for s in pocket_coloring.spheres if s.sphere_labels)
-        return 0, 0, 0, 0, n_labeled, ()
+        return 0.0, 0, 0, 0, n_labeled, ()
 
     lig_coords = np.asarray([p.coords for p in transformed_color_points], dtype=np.float64)
     n_compatible = n_neutral = n_incompatible = n_unused = 0
+    gaussian_fit_score: float = 0.0
     sphere_results: list[SphereOverlapResult] = []
 
-    # Track which ligand atoms have already been "claimed" by a sphere to prevent score inflation
     used_lig_indices: set[int] = set()
+    _two_sigma_sq = 2.0 * _GAUSSIAN_SIGMA_A ** 2
 
     for sphere in pocket_coloring.spheres:
         if not sphere.sphere_labels:
@@ -320,13 +343,16 @@ def _score_sphere_overlap(
         )
         if best_compat > 0:
             n_compatible += 1
+            w = _FEATURE_WEIGHTS.get(best_lig_label, 1.0)
+            gaussian_fit_score += w * math.exp(-(best_dist ** 2) / _two_sigma_sq)
         elif best_compat == 0:
             n_neutral += 1
         else:
             n_incompatible += 1
+            w = _FEATURE_WEIGHTS.get(best_lig_label, 1.0)
+            gaussian_fit_score -= w * math.exp(-(best_dist ** 2) / _two_sigma_sq)
 
-    ranking_score = n_compatible - n_incompatible
-    return ranking_score, n_compatible, n_neutral, n_incompatible, n_unused, tuple(sphere_results)
+    return gaussian_fit_score, n_compatible, n_neutral, n_incompatible, n_unused, tuple(sphere_results)
 
 
 def _build_align_points(pocket_coloring: PocketColoring) -> list[_PocketAlignPoint]:

@@ -87,6 +87,20 @@ def parse_args() -> argparse.Namespace:
         default="minimized_poses_multimodel.pdb",
         help="Optional multi-model PDB output filename (empty string to disable)",
     )
+    parser.add_argument(
+        "--run-induced-fit-md",
+        action="store_true",
+        default=False,
+        help="After local minimization, run a short 50 ps induced-fit MD with "
+             "ligand restraints removed and lighter protein restraints, then re-minimize. "
+             "Reports ligand RMSD drift as a stability indicator.",
+    )
+    parser.add_argument(
+        "--no-interaction-energy",
+        action="store_true",
+        default=False,
+        help="Skip the interaction energy decomposition step (saves time).",
+    )
     return parser.parse_args()
 
 
@@ -127,8 +141,8 @@ def main() -> None:
             poses_per_pocket=args.poses_per_pocket,
             dedupe_heavy_atom_rmsd=dedupe,
         )
-    positive_poses = [result for result in overlay_results if result.ranking_score > 0]
-    print(f"      Overlay poses with rank score > 0: {len(positive_poses)}")
+    positive_poses = [result for result in overlay_results if result.gaussian_fit_score > 0]
+    print(f"      Overlay poses with gaussian_fit_score > 0: {len(positive_poses)}")
     if not positive_poses:
         print("No positive overlay poses found. Exiting.")
         return
@@ -141,12 +155,12 @@ def main() -> None:
     for idx, pose in enumerate(positive_poses, start=1):
         pose_name = (
             f"pose_{idx:03d}_pocket_{pose.pocket_id:03d}"
-            f"_rank_{pose.ranking_score:+d}_conf_{pose.conformer_id}.pdb"
+            f"_gfit_{pose.gaussian_fit_score:.3f}_conf_{pose.conformer_id}.pdb"
         )
         pose_path = outdir / pose_name
         print(
             f"      Minimizing pose {idx}/{len(positive_poses)} "
-            f"(pocket={pose.pocket_id}, rank={pose.ranking_score:+d})"
+            f"(pocket={pose.pocket_id}, gaussian_fit={pose.gaussian_fit_score:.3f})"
         )
 
         try:
@@ -159,6 +173,8 @@ def main() -> None:
                 minimize_max_iterations=args.minimize_max_iterations,
                 platform_name=args.platform_name,
                 output_path=pose_path,
+                compute_interaction_energy=not args.no_interaction_energy,
+                run_induced_fit_md=args.run_induced_fit_md,
             )
             successful.append((pose, minim, pose_path))
             summary_rows.append(
@@ -167,11 +183,19 @@ def main() -> None:
                     "pose_index": idx,
                     "pocket_id": pose.pocket_id,
                     "pocket_score": pocket_score_map.get(pose.pocket_id, float("nan")),
-                    "rank_score": pose.ranking_score,
+                    "gaussian_fit_score": f"{pose.gaussian_fit_score:.4f}",
                     "conformer_id": pose.conformer_id,
                     "initial_energy_kj_per_mol": minim.initial_energy_kj_per_mol,
                     "final_energy_kj_per_mol": minim.final_energy_kj_per_mol,
+                    "interaction_energy_kj_per_mol": (
+                        f"{minim.interaction_energy_kj_per_mol:.2f}"
+                        if minim.interaction_energy_kj_per_mol is not None else ""
+                    ),
                     "ligand_heavy_atom_rmsd_angstrom": minim.ligand_heavy_atom_rmsd_angstrom,
+                    "induced_fit_ligand_rmsd_angstrom": (
+                        f"{minim.induced_fit_ligand_rmsd_angstrom:.3f}"
+                        if minim.induced_fit_ligand_rmsd_angstrom is not None else ""
+                    ),
                     "protein_atoms_flexible": minim.protein_atoms_flexible,
                     "protein_atoms_restrained": minim.protein_atoms_restrained,
                     "ligand_atoms_restrained": minim.ligand_atoms_restrained,
@@ -187,11 +211,13 @@ def main() -> None:
                     "pose_index": idx,
                     "pocket_id": pose.pocket_id,
                     "pocket_score": pocket_score_map.get(pose.pocket_id, float("nan")),
-                    "rank_score": pose.ranking_score,
+                    "gaussian_fit_score": f"{pose.gaussian_fit_score:.4f}",
                     "conformer_id": pose.conformer_id,
                     "initial_energy_kj_per_mol": "",
                     "final_energy_kj_per_mol": "",
+                    "interaction_energy_kj_per_mol": "",
                     "ligand_heavy_atom_rmsd_angstrom": "",
+                    "induced_fit_ligand_rmsd_angstrom": "",
                     "protein_atoms_flexible": "",
                     "protein_atoms_restrained": "",
                     "ligand_atoms_restrained": "",
@@ -220,11 +246,13 @@ def write_summary_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "pose_index",
         "pocket_id",
         "pocket_score",
-        "rank_score",
+        "gaussian_fit_score",
         "conformer_id",
         "initial_energy_kj_per_mol",
         "final_energy_kj_per_mol",
+        "interaction_energy_kj_per_mol",
         "ligand_heavy_atom_rmsd_angstrom",
+        "induced_fit_ligand_rmsd_angstrom",
         "protein_atoms_flexible",
         "protein_atoms_restrained",
         "ligand_atoms_restrained",
@@ -245,7 +273,7 @@ def write_multimodel_pdb(
     for model_idx, (pose, minim, _) in enumerate(pose_results, start=1):
         lines.append(f"MODEL     {model_idx:4d}")
         lines.append(
-            f"REMARK POCKET_ID {pose.pocket_id} RANK_SCORE {pose.ranking_score:+d} "
+            f"REMARK POCKET_ID {pose.pocket_id} GAUSSIAN_FIT {pose.gaussian_fit_score:.4f} "
             f"CONFORMER_ID {pose.conformer_id}"
         )
         for line in minim.minimized_complex_pdb.splitlines():
