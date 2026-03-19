@@ -114,9 +114,24 @@ For each (conformation, pocket) pair, compute an **enrichment-based SAR-discrimi
 
 4. **Rank conformations** by SAR_score. The top-ranked conformations are those whose pocket geometry is maximally consistent with the SAR — i.e., the pocket shape and chemistry complement the actives but not the inactives.
 
-#### Step 6: Validation via Full Docking
+#### Step 6: Local Protein Minimization Around Overlaid Ligand (OpenMM)
 
-Take the top-K conformations (e.g. K = 5–10) and run full molecular docking (AutoDock-GPU or Vina) of all actives and inactives into each. Compute:
+After selecting a high-scoring overlay pose for a given conformation, run a **local protein-ligand minimization** to relax steric clashes and sidechain geometry before expensive validation.
+
+Recommended protocol:
+
+1. **Build complex:** Place the overlaid ligand coordinates into the protein conformation selected by the geometric scoring stage.
+2. **Define a local shell:** Select protein atoms within ~6-10 A of any ligand atom as the flexible region.
+3. **Restrain the rest of the system:** Apply positional restraints (e.g. harmonic, 5-20 kcal/mol/A^2 equivalent) to protein atoms outside the shell so minimization remains local and does not distort global conformation.
+4. **Keep ligand near overlay pose:** Optionally apply weak restraints to ligand heavy atoms to preserve the intended pharmacophore alignment while allowing clash relief.
+5. **Energy minimize:** Use OpenMM (`LangevinIntegrator` + `Simulation.minimizeEnergy`) for short local relaxation (typically hundreds to a few thousand minimization iterations).
+6. **Quality checks:** Record minimized energy, ligand heavy-atom RMSD from the original overlay, and key contact preservation. Reject poses that drift excessively or lose critical SAR-defining contacts.
+
+This gives a physically relaxed structure that is still close to the geometry identified by SAR-discriminative overlay.
+
+#### Step 7: Validation via Full Docking
+
+Take the top-K conformations (e.g. K = 5-10) and run full molecular docking (AutoDock-GPU or Vina) of all actives and inactives into each. Compute:
 
 - AUC-ROC for active/inactive discrimination
 - Enrichment factor at 1%, 5%, 10%

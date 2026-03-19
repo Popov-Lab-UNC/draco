@@ -12,7 +12,10 @@
 
 module load cuda
 
-source /work/users/s/h/shuhang/draco/.venv/bin/activate
-which python
+export PIXI_HOME=/work/users/s/h/shuhang/.pixi
+export PATH="$PIXI_HOME/bin:$PATH"
 
-python -m openmm.testInstallation
+cd /work/users/s/h/shuhang/draco
+
+pixi run which python
+pixi run python -m openmm.testInstallation

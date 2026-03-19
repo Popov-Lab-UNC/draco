@@ -63,9 +63,32 @@ def overlay_prepared_ligand(
     overlap_cutoff: float = 1.5,
     max_iterations: int = 8,
 ) -> OverlayResult:
-    best_result: OverlayResult | None = None
-    for conformer in prepared_ligand.conformers:
-        result = overlay_conformer(
+    poses = overlay_prepared_ligand_poses(
+        prepared_ligand,
+        pocket_coloring,
+        feature_cutoff=feature_cutoff,
+        overlap_cutoff=overlap_cutoff,
+        max_iterations=max_iterations,
+        max_poses=1,
+    )
+    if not poses:
+        raise ValueError(f"No conformers available for ligand '{prepared_ligand.name}'")
+    return poses[0]
+
+
+def overlay_prepared_ligand_poses(
+    prepared_ligand: PreparedLigand,
+    pocket_coloring: PocketColoring,
+    *,
+    feature_cutoff: float = 3.0,
+    overlap_cutoff: float = 1.5,
+    max_iterations: int = 8,
+    max_poses: int | None = None,
+    min_ranking_score: int | None = None,
+    dedupe_heavy_atom_rmsd: float | None = None,
+) -> list[OverlayResult]:
+    all_results = [
+        overlay_conformer(
             conformer,
             prepared_ligand.name,
             pocket_coloring,
@@ -73,11 +96,16 @@ def overlay_prepared_ligand(
             overlap_cutoff=overlap_cutoff,
             max_iterations=max_iterations,
         )
-        if best_result is None or result.ranking_score > best_result.ranking_score:
-            best_result = result
-    if best_result is None:
-        raise ValueError(f"No conformers available for ligand '{prepared_ligand.name}'")
-    return best_result
+        for conformer in prepared_ligand.conformers
+    ]
+    ranked = sorted(all_results, key=lambda r: r.ranking_score, reverse=True)
+    if min_ranking_score is not None:
+        ranked = [r for r in ranked if r.ranking_score >= min_ranking_score]
+    if dedupe_heavy_atom_rmsd is not None and dedupe_heavy_atom_rmsd > 0.0:
+        ranked = _dedupe_results_by_heavy_atom_rmsd(ranked, dedupe_heavy_atom_rmsd)
+    if max_poses is not None:
+        ranked = ranked[:max_poses]
+    return ranked
 
 
 def rank_ligand_over_pockets(
@@ -98,6 +126,35 @@ def rank_ligand_over_pockets(
         )
         for pocket_coloring in pocket_colorings
     ]
+    return sorted(results, key=lambda r: r.ranking_score, reverse=True)
+
+
+def rank_ligand_over_pockets_multi(
+    prepared_ligand: PreparedLigand,
+    pocket_colorings: list[PocketColoring],
+    *,
+    feature_cutoff: float = 3.0,
+    overlap_cutoff: float = 2.5,
+    max_iterations: int = 8,
+    poses_per_pocket: int = 3,
+    min_ranking_score: int | None = None,
+    dedupe_heavy_atom_rmsd: float | None = None,
+) -> list[OverlayResult]:
+    if poses_per_pocket < 1:
+        raise ValueError("poses_per_pocket must be >= 1")
+    results: list[OverlayResult] = []
+    for pocket_coloring in pocket_colorings:
+        pocket_results = overlay_prepared_ligand_poses(
+            prepared_ligand,
+            pocket_coloring,
+            feature_cutoff=feature_cutoff,
+            overlap_cutoff=overlap_cutoff,
+            max_iterations=max_iterations,
+            max_poses=poses_per_pocket,
+            min_ranking_score=min_ranking_score,
+            dedupe_heavy_atom_rmsd=dedupe_heavy_atom_rmsd,
+        )
+        results.extend(pocket_results)
     return sorted(results, key=lambda r: r.ranking_score, reverse=True)
 
 
@@ -388,4 +445,27 @@ def _apply_transform(
     translation: npt.NDArray[np.float64],
 ) -> npt.NDArray[np.float64]:
     return np.asarray(coords, dtype=np.float64) @ rotation.T + translation
+
+
+def _dedupe_results_by_heavy_atom_rmsd(
+    results: list[OverlayResult],
+    cutoff_angstrom: float,
+) -> list[OverlayResult]:
+    kept: list[OverlayResult] = []
+    for candidate in results:
+        candidate_idx = np.asarray(candidate.conformer.heavy_atom_indices, dtype=int)
+        candidate_coords = candidate.transformed_all_atom_coords[candidate_idx]
+        is_duplicate = False
+        for existing in kept:
+            existing_idx = np.asarray(existing.conformer.heavy_atom_indices, dtype=int)
+            if candidate_coords.shape != existing.transformed_all_atom_coords[existing_idx].shape:
+                continue
+            existing_coords = existing.transformed_all_atom_coords[existing_idx]
+            rmsd = float(np.sqrt(np.mean(np.sum((candidate_coords - existing_coords) ** 2, axis=1))))
+            if rmsd <= cutoff_angstrom:
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            kept.append(candidate)
+    return kept
 
