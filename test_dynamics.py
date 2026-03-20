@@ -129,13 +129,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--production-steps",  type=int, default=2_500_000,
                         help="Production MD steps (default 2.5M = 5 ns @ 2 fs)")
     parser.add_argument("--timestep-fs",       type=float, default=2.0)
+    parser.add_argument("--nvt-timestep-fs",    type=float, default=1.0,
+                        help="Timestep (fs) used only during NVT equilibration (default 1.0 fs).")
     parser.add_argument("--temperature-kelvin", type=float, default=300.0)
     parser.add_argument("--pressure-bar",      type=float, default=1.0)
     parser.add_argument("--report-interval-steps", type=int, default=5_000,
                         help="RMSD check interval in steps (default 5000 = 10 ps)")
     parser.add_argument("--rmsd-threshold-angstrom", type=float, default=1.5,
                         help="Backbone RMSD threshold (Å) to trigger frame extraction (default 1.5)")
-    parser.add_argument("--equil-restraint-k", type=float, default=10.0,
+    parser.add_argument("--equil-restraint-k", type=float, default=2.0,
                         help="Protein heavy-atom restraint k (kcal/mol/Å²) during NVT equil")
     parser.add_argument("--no-trajectory",     action="store_true", default=False,
                         help="Skip writing DCD trajectory (saves disk space)")
@@ -234,6 +236,7 @@ def main() -> None:
         pressure_bar=args.pressure_bar,
         friction_per_ps=1.0,
         timestep_fs=args.timestep_fs,
+        nvt_timestep_fs=args.nvt_timestep_fs,
         report_interval_steps=args.report_interval_steps,
         rmsd_threshold_angstrom=args.rmsd_threshold_angstrom,
         equil_restraint_k_kcal=args.equil_restraint_k,
@@ -274,7 +277,7 @@ def main() -> None:
     for frame in dynamics_result.frames:
         print(
             f"\n  ── Frame {frame.frame_index:4d}  "
-            f"t={frame.frame_time_ps:8.1f} ps  "
+            f"t={frame.simulation_time_ps:8.1f} ps  "
             f"RMSD={frame.rmsd_from_prev_angstrom:.2f} Å ──"
         )
 
@@ -345,7 +348,7 @@ def main() -> None:
                 )
                 result = _FramePoseResult(
                     frame_index=frame.frame_index,
-                    frame_time_ps=frame.frame_time_ps,
+                    frame_time_ps=frame.simulation_time_ps,
                     pocket_id=pose.pocket_id,
                     pocket_score=pocket_score_map.get(pose.pocket_id, float("nan")),
                     conformer_id=pose.conformer_id,
@@ -662,7 +665,7 @@ def _error_row(
     return {
         "status": "error",
         "frame_index": frame.frame_index,
-        "frame_time_ps": f"{frame.frame_time_ps:.3f}",
+        "frame_time_ps": f"{frame.simulation_time_ps:.3f}",
         "pocket_id": pose.pocket_id,
         "pocket_score": f"{pocket_score:.3f}",
         "gaussian_fit_score": f"{pose.gaussian_fit_score:.4f}",

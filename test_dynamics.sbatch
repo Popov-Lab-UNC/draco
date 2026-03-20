@@ -31,7 +31,7 @@ pixi run python test_dynamics.py \
   --cuda-precision     mixed \
   --box-padding-nm     1.0 \
   --ionic-strength     0.15 \
-  --minimize-max-iterations 5000 \
+  --minimize-max-iterations 10000 \
   --nvt-steps          50000  \
   --npt-steps          50000  \
   --production-steps   25000000 \
@@ -44,6 +44,8 @@ pixi run python test_dynamics.py \
   --shell-radius-angstrom  8.0 \
   --protein-restraint-k    10.0 \
   --ligand-restraint-k     1.0 \
+  --equil-restraint-k      2.0 \
+  --nvt-timestep-fs        1.0 \
   --minimize-pose-iterations 1000 \
   --top-k 5 \
   --top-pdb "top5_poses.pdb"

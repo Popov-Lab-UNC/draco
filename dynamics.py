@@ -96,7 +96,23 @@ except ImportError:  # pragma: no cover
 
 KCAL_PER_MOL_A2_TO_KJ_PER_MOL_NM2: float = 418.4
 _DEFAULT_FORCEFIELD = ("amber14-all.xml", "amber14/tip3pfb.xml")
-_DEFAULT_WATER_MODEL = "tip3pfb"  # matches amber14/tip3pfb.xml
+_DEFAULT_WATER_MODEL = "tip3pfb"  # chemistry model; placement via Modeller (see below)
+
+# Ion / water residue names that should be excluded when identifying protein atoms.
+_SOLVENT_ION_RESNAMES: set[str] = {
+    "HOH", "WAT", "TIP3", "SPC", "T3P", "T4P", "T5P",
+    "NA", "CL", "Na+", "Cl-", "NA+", "CL-",
+    "K", "K+", "MG", "CA", "ZN", "FE",
+}
+
+# OpenMM Modeller.addSolvent only accepts tip3p, spce, tip4pew, tip5p, swm4ndp.
+# TIP3P-FB uses the same 3-site geometry as TIP3P; parameters come from the FF XML.
+_MODELLER_SOLVENT_MODEL_ALIASES: dict[str, str] = {"tip3pfb": "tip3p"}
+
+
+def _modeller_solvent_model(water_model: str) -> str:
+    """Return the ``model=`` string required by ``Modeller.addSolvent``."""
+    return _MODELLER_SOLVENT_MODEL_ALIASES.get(water_model, water_model)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -169,7 +185,7 @@ def run_dynamics(
     box_padding_nm: float = 1.0,
     ionic_strength_molar: float = 0.15,
     # Simulation lengths
-    minimize_max_iterations: int = 5000,
+    minimize_max_iterations: int = 10_000,
     nvt_steps: int = 50_000,        # 100 ps @ 2 fs
     npt_steps: int = 50_000,        # 100 ps @ 2 fs
     production_steps: int = 2_500_000,  # 5 ns @ 2 fs
@@ -178,11 +194,12 @@ def run_dynamics(
     pressure_bar: float = 1.0,
     friction_per_ps: float = 1.0,
     timestep_fs: float = 2.0,
+    nvt_timestep_fs: float = 1.0,   # smaller timestep for NVT equil (safer)
     # Conformational-change detection
     report_interval_steps: int = 5_000,   # check RMSD every 10 ps
     rmsd_threshold_angstrom: float = 1.5,
     # NVT equilibration restraints
-    equil_restraint_k_kcal: float = 10.0,
+    equil_restraint_k_kcal: float = 5.0,  # softer spring → less first-step force spike
     # Platform
     platform_name: str = "CUDA",
     cuda_precision: str = "mixed",
@@ -242,7 +259,10 @@ def run_dynamics(
     forcefield_files:
         Force-field XML files (default AMBER14-all + TIP3P-FB water).
     water_model:
-        Water model name for ``Modeller.addSolvent`` (default 'tip3pfb').
+        Water chemistry label (default ``'tip3pfb'``, paired with
+        ``amber14/tip3pfb.xml``).  Passed to ``Modeller.addSolvent`` after
+        mapping known aliases (e.g. *tip3pfb* → *tip3p* for placement), because
+        OpenMM only ships pre-equilibrated boxes for a fixed set of models.
     verbose:
         Print progress messages (default True).
 
@@ -273,7 +293,7 @@ def run_dynamics(
 
     modeller.addSolvent(
         forcefield,
-        model=water_model,
+        model=_modeller_solvent_model(water_model),
         padding=box_padding_nm * unit.nanometer,
         ionicStrength=ionic_strength_molar * unit.molar,
     )
@@ -281,12 +301,7 @@ def run_dynamics(
 
     # Identify protein atom indices in the solvated system (before any simulation)
     all_atoms = list(modeller.topology.atoms())
-    protein_atom_indices = [
-        a.index for a in all_atoms
-        if a.residue.chain.id != "W"           # not water chain
-        and a.residue.name not in {"HOH", "WAT", "NA", "CL", "Na+", "Cl-", "Na", "Cl"}
-        and a.element is not None
-    ]
+    protein_atom_indices = _identify_protein_atoms(all_atoms)
     n_protein_atoms = len(protein_atom_indices)
     log(f"   Protein atoms identified: {n_protein_atoms}")
 
@@ -327,22 +342,156 @@ def run_dynamics(
     simulation.context.setVelocitiesToTemperature(temperature_kelvin * unit.kelvin)
 
     simulation.minimizeEnergy(maxIterations=minimize_max_iterations)
+    # Run a second round if energy is still very high — some large proteins
+    # need more iterations to fully relax crystal contacts.
+    _state_post_min = simulation.context.getState(getEnergy=True)
+    _pe_post_min = _state_post_min.getPotentialEnergy().value_in_unit(
+        unit.kilojoule_per_mole
+    )
+    if not np.isfinite(_pe_post_min) or _pe_post_min > 0:
+        log(f"   Post-minimisation PE = {_pe_post_min:.0f} kJ/mol — running additional "
+            f"{minimize_max_iterations} steps …")
+        simulation.minimizeEnergy(maxIterations=minimize_max_iterations)
     log("   Minimisation complete.")
+    # Minimization updates coordinates but does not reliably initialize velocities
+    # for subsequent dynamics. Reset them so the first integration step starts
+    # from a valid Maxwell-Boltzmann distribution.
+    simulation.context.setVelocitiesToTemperature(temperature_kelvin * unit.kelvin)
+    if verbose:
+        # Fail fast with a clear error if CUDA produced/retained non-finite
+        # state. Without this, OpenMM throws "Particle coordinate is NaN"
+        # later during stepping.
+        state0 = simulation.context.getState(getPositions=True, getVelocities=True)
+        pos_nm = np.asarray(
+            state0.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+            dtype=np.float64,
+        )
+        if not np.isfinite(pos_nm).all():
+            raise ValueError("NaN/Inf detected in particle positions after minimization.")
+        vel_nm_ps = np.asarray(
+            state0.getVelocities(asNumpy=True).value_in_unit(
+                unit.nanometer / unit.picosecond
+            ),
+            dtype=np.float64,
+        )
+        if not np.isfinite(vel_nm_ps).all():
+            raise ValueError("NaN/Inf detected in particle velocities after minimization.")
 
     # ── Step 5: Equilibration (NVT with restraints → NPT) ─────────────────
     if nvt_steps > 0:
         log(f"── Step 5a/6: NVT equilibration ({nvt_steps} steps = "
             f"{nvt_steps/steps_per_ps:.1f} ps, protein restrained) …")
         # Add heavy-atom restraints (release before production)
+        protein_heavy_set = set(protein_atom_indices)
         protein_heavy_indices = [
             a.index for a in all_atoms
-            if a.index in set(protein_atom_indices) and a.element.symbol != "H"
+            if a.index in protein_heavy_set and a.element.symbol != "H"
         ]
-        _add_restraints(system, simulation, modeller.positions,
-                        protein_heavy_indices, equil_restraint_k_kcal)
-        simulation.step(nvt_steps)
+        # Use the current (minimized) coordinates as restraint reference positions.
+        # Otherwise, restraint targets may be "stale" (from before minimization),
+        # creating large initial forces and risking numerical instability.
+        current_positions = simulation.context.getState(getPositions=True).getPositions()
+
+        # Pre-NVT sanity check: verify energy is finite before adding restraints.
+        _check_state_finite(simulation, label="pre-NVT (after minimization)")
+
+        _add_restraints(
+            system,
+            simulation,
+            current_positions,
+            protein_heavy_indices,
+            equil_restraint_k_kcal,
+        )
+
+        # ── Re-minimise with restraints in place ────────────────────────────
+        # Adding restraint forces changes the energy landscape.  Even though
+        # we use the post-minimisation coordinates as reference positions, the
+        # mixed-precision rounding on CUDA means particles are NOT exactly at
+        # their reference positions, so the restraint potential contributes
+        # non-trivially.  A quick re-minimisation relaxes these micro-clashes
+        # before any integration step occurs.
+        log("   Re-minimising with restraints in place …")
+        simulation.minimizeEnergy(maxIterations=2000)
+        _check_state_finite(simulation, label="post-restraint re-minimization")
+
+        # ── Staged timestep + temperature warmup ────────────────────────────
+        # Large solvated systems (>100k atoms) can blow up on the very first
+        # integration step even after minimization, because mixed-precision
+        # CUDA rounds coordinates slightly, causing tiny inter-atomic clashes
+        # that hit stiff restraints or PME cutoffs.  Running a short warmup at
+        # progressively larger timesteps AND starting from a low temperature
+        # (small velocities → smaller initial displacements) lets those micro-
+        # clashes dissipate before committing to the full NVT run.
+        prod_timestep = integrator.getStepSize().value_in_unit(unit.femtoseconds)
+
+        # Temperature ramp: start at 50 K and ramp to target.
+        _WARMUP_TEMP_K = 50.0
+        simulation.context.setVelocitiesToTemperature(
+            _WARMUP_TEMP_K * unit.kelvin
+        )
+        log(f"   Starting temperature ramp from {_WARMUP_TEMP_K} K → "
+            f"{temperature_kelvin} K")
+
+        warmup_stages: list[tuple[float, int, str, float]] = [
+            # (dt_fs,  n_steps,  label,  temperature_K)
+            (0.1,   200,  "warmup 0.1 fs × 200 steps",   _WARMUP_TEMP_K),
+            (0.25,  200,  "warmup 0.25 fs × 200 steps",  _WARMUP_TEMP_K),
+            (0.5,   500,  "warmup 0.5 fs × 500 steps",   100.0),
+            (1.0,   500,  "warmup 1.0 fs × 500 steps",   200.0),
+            (nvt_timestep_fs, nvt_steps,
+             f"NVT {nvt_timestep_fs} fs × {nvt_steps} steps",
+             temperature_kelvin),
+        ]
+        # Collapse consecutive identical dt values so we don't double-count
+        # when nvt_timestep_fs overlaps a warmup stage.
+        seen_dt: set[float] = set()
+        deduped_stages: list[tuple[float, int, str, float]] = []
+        for _dt, _n, _lbl, _T in warmup_stages:
+            if _dt not in seen_dt or _lbl.startswith("NVT"):
+                deduped_stages.append((_dt, _n, _lbl, _T))
+                seen_dt.add(_dt)
+
+        for stage_dt, stage_steps, stage_label, stage_T in deduped_stages:
+            log(f"   [{stage_label}] timestep={stage_dt} fs, T={stage_T} K …")
+            integrator.setStepSize(stage_dt * unit.femtoseconds)
+            integrator.setTemperature(stage_T * unit.kelvin)
+            try:
+                simulation.step(stage_steps)
+            except Exception as exc:
+                # ── Automatic retry with halved timestep ────────────────────
+                retry_dt = stage_dt / 2.0
+                retry_steps = stage_steps * 2  # keep total integration time
+                log(f"   ⚠ Stage '{stage_label}' crashed: {exc}")
+                log(f"     Retrying with dt={retry_dt} fs × {retry_steps} steps …")
+                # Re-minimise to recover from partially-blown-up state.
+                try:
+                    simulation.minimizeEnergy(maxIterations=2000)
+                except Exception:
+                    pass  # minimiser may also fail; positions might still be OK
+                simulation.context.setVelocitiesToTemperature(
+                    max(50.0, stage_T * 0.5) * unit.kelvin
+                )
+                integrator.setStepSize(retry_dt * unit.femtoseconds)
+                try:
+                    simulation.step(retry_steps)
+                except Exception as exc2:
+                    raise RuntimeError(
+                        f"NVT equilibration crashed at stage '{stage_label}' "
+                        f"even after retry with dt={retry_dt} fs "
+                        f"(k={equil_restraint_k_kcal} kcal/mol/Å², "
+                        f"{len(protein_heavy_indices)} restrained atoms). "
+                        f"Try: --equil-restraint-k 2.0 or "
+                        f"--cuda-precision double. "
+                        f"Original error: {exc2}"
+                    ) from exc2
+
+        # Restore production timestep and temperature.
+        integrator.setStepSize(prod_timestep * unit.femtoseconds)
+        integrator.setTemperature(temperature_kelvin * unit.kelvin)
+
         _remove_restraints(system, simulation)
-        log("   NVT equilibration done, restraints removed.")
+        log(f"   NVT equilibration done, restraints removed. "
+            f"Timestep restored to {prod_timestep} fs, T={temperature_kelvin} K.")
 
     if npt_steps > 0:
         log(f"── Step 5b/6: NPT equilibration ({npt_steps} steps = "
@@ -467,6 +616,27 @@ def run_dynamics(
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _identify_protein_atoms(all_atoms: list) -> list[int]:
+    """Return indices of protein atoms (excluding water, ions, and solvent).
+
+    Works across varied PDB chain/residue naming conventions.
+    """
+    protein_indices: list[int] = []
+    for a in all_atoms:
+        if a.element is None:
+            continue
+        res_name = a.residue.name.strip().upper()
+        if res_name in _SOLVENT_ION_RESNAMES:
+            continue
+        chain_id = a.residue.chain.id
+        # OpenMM places water/ions on chain "W" or similar; skip if the
+        # residue name is a water variant we haven't yet listed.
+        if chain_id == "W":
+            continue
+        protein_indices.append(a.index)
+    return protein_indices
+
+
 def _build_simulation(
     modeller: Modeller,
     system: object,
@@ -489,6 +659,30 @@ def _build_simulation(
     except Exception as exc:
         log(f"   Warning: {platform_name} unavailable ({exc}), falling back to CPU.")
         return Simulation(modeller.topology, system, integrator)
+
+
+def _check_state_finite(simulation: Simulation, label: str = "") -> None:
+    """Raise ValueError if positions or potential energy contain NaN/Inf.
+
+    Call this before starting any integration phase so that instability is
+    caught with a clear message rather than an opaque OpenMM crash.
+    """
+    state = simulation.context.getState(getPositions=True, getEnergy=True)
+    pos_nm = np.asarray(
+        state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+        dtype=np.float64,
+    )
+    if not np.isfinite(pos_nm).all():
+        tag = f" [{label}]" if label else ""
+        raise ValueError(f"NaN/Inf in particle positions{tag}.")
+    pe = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+    if not np.isfinite(pe):
+        tag = f" [{label}]" if label else ""
+        raise ValueError(
+            f"Non-finite potential energy ({pe} kJ/mol){tag}. "
+            "The system is likely in a high-energy configuration that was not "
+            "resolved by minimization."
+        )
 
 
 def _add_restraints(
