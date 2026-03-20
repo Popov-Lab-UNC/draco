@@ -28,7 +28,7 @@ pixi run python test_dynamics.py \
   --ligand-smiles      "CN(CC1(CC1)c1ccc(F)cc1)C(=O)[C@H](Cc1csc2ccccc12)Nc1cc(ncn1)C(N)=O" \
   --output-dir         "test_dynamics_output" \
   --platform-name      CUDA \
-  --cuda-precision     mixed \
+  --cuda-precision     double \
   --box-padding-nm     1.0 \
   --ionic-strength     0.15 \
   --minimize-max-iterations 10000 \

@@ -70,6 +70,7 @@ try:
         PME,
         Simulation,
         StateDataReporter,
+        Topology,
     )
 except ImportError:  # pragma: no cover
     from simtk.openmm import (  # type: ignore
@@ -285,6 +286,11 @@ def run_dynamics(
     prepared_protein = prepare_protein(protein_pdb_path, ph=ph)
     base_atomarray = pt.load_structure(str(protein_pdb_path))
 
+    # ── Snapshot: prepared protein (before solvation) ──────────────────────
+    step1_pdb = outdir / "step1_prepared_protein.pdb"
+    _save_pdb(prepared_protein.topology, prepared_protein.positions, step1_pdb)
+    log(f"   Snapshot saved: {step1_pdb}")
+
     # ── Step 2: Build solvated system ──────────────────────────────────────
     log(f"── Step 2/6: Adding {water_model} water box (padding {box_padding_nm} nm, "
         f"[NaCl]={ionic_strength_molar} M) …")
@@ -308,6 +314,16 @@ def run_dynamics(
     # Save solvated topology PDB (needed as DCD reference)
     topo_pdb_path = outdir / "solvated_topology.pdb"
     _save_pdb(modeller.topology, modeller.positions, topo_pdb_path)
+
+    # ── Snapshot: solvated system + protein-only (before minimization) ─────
+    step2_prot_pdb = outdir / "step2_solvated_protein_only.pdb"
+    _save_protein_only_pdb(
+        all_atoms, protein_atom_indices,
+        np.asarray(modeller.positions.value_in_unit(unit.nanometer), dtype=np.float64),
+        step2_prot_pdb,
+    )
+    log(f"   Snapshot saved: {topo_pdb_path}  (full solvated)")
+    log(f"   Snapshot saved: {step2_prot_pdb}  (protein only)")
 
     # ── Step 3: Create OpenMM system ───────────────────────────────────────
     log("── Step 3/6: Building OpenMM system (PME, HBonds constraints) …")
@@ -353,6 +369,20 @@ def run_dynamics(
             f"{minimize_max_iterations} steps …")
         simulation.minimizeEnergy(maxIterations=minimize_max_iterations)
     log("   Minimisation complete.")
+
+    # ── Snapshot: post-minimisation ────────────────────────────────────────
+    _min_state = simulation.context.getState(getPositions=True)
+    _min_pos_nm = np.asarray(
+        _min_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+        dtype=np.float64,
+    )
+    step4_full = outdir / "step4_minimized_full.pdb"
+    _save_pdb(modeller.topology, _min_state.getPositions(), step4_full)
+    step4_prot = outdir / "step4_minimized_protein_only.pdb"
+    _save_protein_only_pdb(all_atoms, protein_atom_indices, _min_pos_nm, step4_prot)
+    log(f"   Snapshot saved: {step4_full}  (full solvated)")
+    log(f"   Snapshot saved: {step4_prot}  (protein only)")
+
     # Minimization updates coordinates but does not reliably initialize velocities
     # for subsequent dynamics. Reset them so the first integration step starts
     # from a valid Maxwell-Boltzmann distribution.
@@ -493,6 +523,19 @@ def run_dynamics(
         log(f"   NVT equilibration done, restraints removed. "
             f"Timestep restored to {prod_timestep} fs, T={temperature_kelvin} K.")
 
+        # ── Snapshot: post-NVT equilibration ──────────────────────────────
+        _nvt_state = simulation.context.getState(getPositions=True)
+        _nvt_pos_nm = np.asarray(
+            _nvt_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+            dtype=np.float64,
+        )
+        step5a_full = outdir / "step5a_nvt_equil_full.pdb"
+        _save_pdb(modeller.topology, _nvt_state.getPositions(), step5a_full)
+        step5a_prot = outdir / "step5a_nvt_equil_protein_only.pdb"
+        _save_protein_only_pdb(all_atoms, protein_atom_indices, _nvt_pos_nm, step5a_prot)
+        log(f"   Snapshot saved: {step5a_full}  (full solvated)")
+        log(f"   Snapshot saved: {step5a_prot}  (protein only)")
+
     if npt_steps > 0:
         log(f"── Step 5b/6: NPT equilibration ({npt_steps} steps = "
             f"{npt_steps/steps_per_ps:.1f} ps, {pressure_bar} bar) …")
@@ -506,6 +549,19 @@ def run_dynamics(
         system.removeForce(system.getNumForces() - 1)
         simulation.context.reinitialize(preserveState=True)
         log("   NPT equilibration done, barostat removed.")
+
+        # ── Snapshot: post-NPT equilibration ──────────────────────────────
+        _npt_state = simulation.context.getState(getPositions=True)
+        _npt_pos_nm = np.asarray(
+            _npt_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+            dtype=np.float64,
+        )
+        step5b_full = outdir / "step5b_npt_equil_full.pdb"
+        _save_pdb(modeller.topology, _npt_state.getPositions(), step5b_full)
+        step5b_prot = outdir / "step5b_npt_equil_protein_only.pdb"
+        _save_protein_only_pdb(all_atoms, protein_atom_indices, _npt_pos_nm, step5b_prot)
+        log(f"   Snapshot saved: {step5b_full}  (full solvated)")
+        log(f"   Snapshot saved: {step5b_prot}  (protein only)")
 
     # ── Step 6: Production MD with conformational-change detection ─────────
     production_time_ps = production_steps * timestep_fs / 1000.0
@@ -740,14 +796,14 @@ def _extract_protein_frame(
     protein_idx_set = set(protein_atom_indices)
 
     # Create a minimal topology for the protein-only atoms
-    from openmm.app import Topology as _OMMTopology
-    prot_topology = _OMMTopology()
+    prot_topology = Topology()
     prot_positions_list = []
     global_to_local: dict[int, int] = {}
 
     chain_map: dict[object, object] = {}
     res_map: dict[object, object] = {}
 
+    from openmm import Vec3
     for atom in all_atoms:
         if atom.index not in protein_idx_set:
             continue
@@ -768,7 +824,7 @@ def _extract_protein_frame(
         global_to_local[atom.index] = local_idx
         xyz_nm = positions_nm[atom.index]
         prot_positions_list.append(
-            xyz_nm * unit.nanometer
+            Vec3(xyz_nm[0] * 10.0, xyz_nm[1] * 10.0, xyz_nm[2] * 10.0)
         )
 
     buf = io.StringIO()
@@ -788,6 +844,44 @@ def _extract_protein_frame(
 def _save_pdb(topology: object, positions: object, path: Path) -> None:
     buf = io.StringIO()
     PDBFile.writeFile(topology, positions, buf)
+    path.write_text(buf.getvalue())
+
+
+def _save_protein_only_pdb(
+    all_atoms: list,
+    protein_atom_indices: list[int],
+    positions_nm: npt.NDArray[np.float64],
+    path: Path,
+) -> None:
+    """Write a protein-only PDB (no water/ions) for easy visualisation in PyMol."""
+    from openmm import Vec3
+
+    protein_idx_set = set(protein_atom_indices)
+    prot_topology = Topology()
+    prot_positions_list = []
+    chain_map: dict[object, object] = {}
+    res_map: dict[object, object] = {}
+
+    for atom in all_atoms:
+        if atom.index not in protein_idx_set:
+            continue
+        orig_chain = atom.residue.chain
+        if orig_chain not in chain_map:
+            chain_map[orig_chain] = prot_topology.addChain(orig_chain.id)
+        orig_res = atom.residue
+        if orig_res not in res_map:
+            res_map[orig_res] = prot_topology.addResidue(
+                orig_res.name, chain_map[orig_chain], orig_res.id
+            )
+        prot_topology.addAtom(atom.name, atom.element, res_map[orig_res])
+        
+        # Multiply by 10 to firmly convert nanometers to Angstroms
+        # and feed a raw list of Vec3. PDBFile treats un-unit-ified Vec3s as Angstroms.
+        xyz_nm = positions_nm[atom.index]
+        prot_positions_list.append(Vec3(xyz_nm[0] * 10.0, xyz_nm[1] * 10.0, xyz_nm[2] * 10.0))
+
+    buf = io.StringIO()
+    PDBFile.writeFile(prot_topology, prot_positions_list, buf, keepIds=True)
     path.write_text(buf.getvalue())
 
 
