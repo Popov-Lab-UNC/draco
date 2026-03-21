@@ -377,7 +377,7 @@ def run_dynamics(
     log("   Minimisation complete.")
 
     # ── Snapshot: post-minimisation ────────────────────────────────────────
-    _min_state = simulation.context.getState(getPositions=True)
+    _min_state = simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
     _min_pos_nm = np.asarray(
         _min_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
         dtype=np.float64,
@@ -468,42 +468,57 @@ def run_dynamics(
         log(f"   Starting temperature ramp from {_WARMUP_TEMP_K} K → "
             f"{temperature_kelvin} K")
 
+        # Each warmup stage changes EITHER timestep OR temperature, never both
+        # simultaneously. Changing both at once doubles the displacement per step
+        # and velocity magnitude together, greatly increasing the risk of a force
+        # spike and NaN coordinates.
         warmup_stages: list[tuple[float, int, str, float]] = [
             # (dt_fs,  n_steps,  label,  temperature_K)
-            (0.1,   200,  "warmup 0.1 fs × 200 steps",   _WARMUP_TEMP_K),
-            (0.25,  200,  "warmup 0.25 fs × 200 steps",  _WARMUP_TEMP_K),
-            (0.5,   500,  "warmup 0.5 fs × 500 steps",   100.0),
-            (1.0,   500,  "warmup 1.0 fs × 500 steps",   200.0),
+            (0.1,   200,  "warmup 0.1 fs × 200 steps",        _WARMUP_TEMP_K),
+            (0.25,  200,  "warmup 0.25 fs × 200 steps",       _WARMUP_TEMP_K),
+            (0.5,   500,  "warmup 0.5 fs × 500 steps",        _WARMUP_TEMP_K),  # dt only
+            (0.5,   500,  "warmup 0.5 fs × 500 steps @100K",  100.0),           # T only
+            (1.0,   500,  "warmup 1.0 fs × 500 steps @100K",  100.0),           # dt only
+            (1.0,   500,  "warmup 1.0 fs × 500 steps @200K",  200.0),           # T only
             (nvt_timestep_fs, nvt_steps,
              f"NVT {nvt_timestep_fs} fs × {nvt_steps} steps",
              temperature_kelvin),
         ]
-        # Collapse consecutive identical dt values so we don't double-count
-        # when nvt_timestep_fs overlaps a warmup stage.
-        seen_dt: set[float] = set()
+        # Collapse consecutive stages that are identical in (dt, T) so we don't
+        # double-count when nvt_timestep_fs happens to match a warmup entry.
+        seen_dt_T: set[tuple[float, float]] = set()
         deduped_stages: list[tuple[float, int, str, float]] = []
         for _dt, _n, _lbl, _T in warmup_stages:
-            if _dt not in seen_dt or _lbl.startswith("NVT"):
+            key = (_dt, _T)
+            if key not in seen_dt_T or _lbl.startswith("NVT"):
                 deduped_stages.append((_dt, _n, _lbl, _T))
-                seen_dt.add(_dt)
+                seen_dt_T.add(key)
 
         for stage_dt, stage_steps, stage_label, stage_T in deduped_stages:
             log(f"   [{stage_label}] timestep={stage_dt} fs, T={stage_T} K …")
             integrator.setStepSize(stage_dt * unit.femtoseconds)
             integrator.setTemperature(stage_T * unit.kelvin)
+
+            # Snapshot positions before stepping so we can restore on NaN crash.
+            _pre_stage_state = simulation.context.getState(
+                getPositions=True, getVelocities=True
+            )
+            _pre_stage_positions = _pre_stage_state.getPositions()
+
             try:
                 simulation.step(stage_steps)
             except Exception as exc:
-                # ── Automatic retry with halved timestep ────────────────────
+                # ── Automatic retry: restore checkpoint, halve dt, keep T ───
                 retry_dt = stage_dt / 2.0
                 retry_steps = stage_steps * 2  # keep total integration time
                 log(f"   ⚠ Stage '{stage_label}' crashed: {exc}")
-                log(f"     Retrying with dt={retry_dt} fs × {retry_steps} steps …")
-                # Re-minimise to recover from partially-blown-up state.
-                try:
-                    simulation.minimizeEnergy(maxIterations=2000)
-                except Exception:
-                    pass  # minimiser may also fail; positions might still be OK
+                log(f"     Restoring pre-stage checkpoint and retrying "
+                    f"with dt={retry_dt} fs × {retry_steps} steps …")
+                # Restore the last known-good positions so we are not stepping
+                # from a NaN state (which always re-crashes immediately).
+                simulation.context.setPositions(_pre_stage_positions)
+                simulation.minimizeEnergy(maxIterations=2000)
+                _check_state_finite(simulation, label=f"retry pre-step ({stage_label})")
                 simulation.context.setVelocitiesToTemperature(
                     max(50.0, stage_T * 0.5) * unit.kelvin
                 )
@@ -530,7 +545,7 @@ def run_dynamics(
             f"Timestep restored to {prod_timestep} fs, T={temperature_kelvin} K.")
 
         # ── Snapshot: post-NVT equilibration ──────────────────────────────
-        _nvt_state = simulation.context.getState(getPositions=True)
+        _nvt_state = simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
         _nvt_pos_nm = np.asarray(
             _nvt_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
             dtype=np.float64,
@@ -557,7 +572,7 @@ def run_dynamics(
         log("   NPT equilibration done, barostat removed.")
 
         # ── Snapshot: post-NPT equilibration ──────────────────────────────
-        _npt_state = simulation.context.getState(getPositions=True)
+        _npt_state = simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
         _npt_pos_nm = np.asarray(
             _npt_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
             dtype=np.float64,
