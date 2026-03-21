@@ -121,24 +121,14 @@ def parse_args() -> argparse.Namespace:
                         help="Water box padding in nm (default 1.0)")
     parser.add_argument("--ionic-strength",    type=float, default=0.15,
                         help="NaCl ionic strength in mol/L (default 0.15)")
-    parser.add_argument("--minimize-max-iterations", type=int, default=5000)
-    parser.add_argument("--nvt-steps",         type=int, default=50_000,
-                        help="NVT equilibration steps (default 50k = 100 ps @ 2 fs)")
-    parser.add_argument("--npt-steps",         type=int, default=50_000,
-                        help="NPT equilibration steps (default 50k = 100 ps @ 2 fs)")
     parser.add_argument("--production-steps",  type=int, default=2_500_000,
                         help="Production MD steps (default 2.5M = 5 ns @ 2 fs)")
     parser.add_argument("--timestep-fs",       type=float, default=2.0)
-    parser.add_argument("--nvt-timestep-fs",    type=float, default=1.0,
-                        help="Timestep (fs) used only during NVT equilibration (default 1.0 fs).")
     parser.add_argument("--temperature-kelvin", type=float, default=300.0)
-    parser.add_argument("--pressure-bar",      type=float, default=1.0)
     parser.add_argument("--report-interval-steps", type=int, default=5_000,
                         help="RMSD check interval in steps (default 5000 = 10 ps)")
     parser.add_argument("--rmsd-threshold-angstrom", type=float, default=1.5,
                         help="Backbone RMSD threshold (Å) to trigger frame extraction (default 1.5)")
-    parser.add_argument("--equil-restraint-k", type=float, default=2.0,
-                        help="Protein heavy-atom restraint k (kcal/mol/Å²) during NVT equil")
     parser.add_argument("--no-trajectory",     action="store_true", default=False,
                         help="Skip writing DCD trajectory (saves disk space)")
 
@@ -228,18 +218,12 @@ def main() -> None:
         ph=args.ph,
         box_padding_nm=args.box_padding_nm,
         ionic_strength_molar=args.ionic_strength,
-        minimize_max_iterations=args.minimize_max_iterations,
-        nvt_steps=args.nvt_steps,
-        npt_steps=args.npt_steps,
         production_steps=args.production_steps,
         temperature_kelvin=args.temperature_kelvin,
-        pressure_bar=args.pressure_bar,
         friction_per_ps=1.0,
         timestep_fs=args.timestep_fs,
-        nvt_timestep_fs=args.nvt_timestep_fs,
         report_interval_steps=args.report_interval_steps,
         rmsd_threshold_angstrom=args.rmsd_threshold_angstrom,
-        equil_restraint_k_kcal=args.equil_restraint_k,
         platform_name=args.platform_name,
         cuda_precision=args.cuda_precision,
         output_dir=outdir,
