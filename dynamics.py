@@ -297,6 +297,12 @@ def run_dynamics(
     forcefield = ForceField(*forcefield_files)
     modeller = Modeller(prepared_protein.topology, prepared_protein.positions)
 
+    # Clear any inherited periodic box vectors (e.g. from an incorrect CRYST1 record
+    # in the input PDB). This forces Modeller.addSolvent to automatically compute
+    # a bounding box that fully encloses the protein plus the requested padding,
+    # avoiding massive steric clashes when a too-small box is specified.
+    modeller.topology.setPeriodicBoxVectors(None)
+
     modeller.addSolvent(
         forcefield,
         model=_modeller_solvent_model(water_model),
@@ -312,7 +318,7 @@ def run_dynamics(
     log(f"   Protein atoms identified: {n_protein_atoms}")
 
     # Save solvated topology PDB (needed as DCD reference)
-    topo_pdb_path = outdir / "solvated_topology.pdb"
+    topo_pdb_path = outdir / "step2_solvated_full.pdb"
     _save_pdb(modeller.topology, modeller.positions, topo_pdb_path)
 
     # ── Snapshot: solvated system + protein-only (before minimization) ─────
