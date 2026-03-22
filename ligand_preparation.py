@@ -120,6 +120,28 @@ class PreparedLigandConformer:
 
 
 @dataclass(frozen=True)
+class SphereOverlapResult:
+    """Per-sphere compatibility result from ligand–pocket feature overlap scoring."""
+
+    sphere_id: int
+    sphere_labels: tuple[str, ...]
+    matched_ligand_label: str
+    ligand_point_index: int
+    distance: float
+    compatibility: int
+
+
+@dataclass(frozen=True)
+class PocketAlignPoint:
+    """Internal: pocket feature anchor for rigid-body alignment to a ligand."""
+
+    feature_id: str
+    label: str
+    coords: npt.NDArray[np.float64]
+    sphere_id: int
+
+
+@dataclass(frozen=True)
 class PreparedLigand:
     name: str
     canonical_smiles: str

@@ -6,12 +6,6 @@ import csv
 from pathlib import Path
 from typing import Any
 
-warnings.filterwarnings(
-    "ignore",
-    category=FutureWarning,
-    message=r".*torch\.distributed\.reduce_op.*",
-)
-
 import pocketeer as pt
 
 from ligand_preparation import prepare_ligand_from_smiles
@@ -19,6 +13,12 @@ from local_minimization import LocalMinimizationResult, minimize_overlay_pose
 from overlay import OverlayResult, rank_ligand_over_pockets, rank_ligand_over_pockets_multi
 from pocket_coloring import color_pockets
 from protein_preparation import prepare_protein
+
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r".*torch\.distributed\.reduce_op.*",
+)
 
 
 def parse_args() -> argparse.Namespace:

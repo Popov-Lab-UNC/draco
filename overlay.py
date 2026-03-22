@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
 from collections import defaultdict
 
 import numpy as np
@@ -10,10 +9,15 @@ import numpy.typing as npt
 
 from ligand_preparation import (
     LigandColorPoint,
+    PocketAlignPoint,
     PreparedLigand,
     PreparedLigandConformer,
+    SphereOverlapResult,
 )
 from pocket_coloring import PocketColoring, FEATURE_COMPAT
+
+# Private alias kept for readability in alignment helpers
+_PocketAlignPoint = PocketAlignPoint
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -37,16 +41,6 @@ _FEATURE_WEIGHTS: dict[str, float] = {
 
 
 @dataclass(frozen=True)
-class SphereOverlapResult:
-    sphere_id: int
-    sphere_labels: tuple[str, ...]
-    matched_ligand_label: str
-    ligand_point_index: int
-    distance: float
-    compatibility: int
-
-
-@dataclass(frozen=True)
 class OverlayResult:
     pocket_id: int
     ligand_name: str
@@ -62,14 +56,6 @@ class OverlayResult:
     translation: npt.NDArray[np.float64]
     transformed_all_atom_coords: npt.NDArray[np.float64]
     transformed_color_points: tuple[LigandColorPoint, ...]
-
-
-@dataclass(frozen=True)
-class _PocketAlignPoint:
-    feature_id: str
-    label: str
-    coords: npt.NDArray[np.float64]
-    sphere_id: int
 
 
 # ─────────────────────────────────────────────────────────────────────────────

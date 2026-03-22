@@ -59,12 +59,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-warnings.filterwarnings(
-    "ignore",
-    category=FutureWarning,
-    message=r".*torch\.distributed\.reduce_op.*",
-)
-
 import numpy as np
 
 from dynamics import DynamicsFrame, DynamicsResult, run_dynamics
@@ -91,6 +85,12 @@ except ImportError:  # pragma: no cover
     from simtk.openmm.app import (  # type: ignore
         ForceField, HBonds, Modeller, NoCutoff, PDBFile, Simulation,
     )
+
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r".*torch\.distributed\.reduce_op.*",
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

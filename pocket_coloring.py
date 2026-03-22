@@ -9,6 +9,13 @@ import biotite.structure as struc  # type: ignore
 import numpy as np
 import numpy.typing as npt
 
+from ligand_preparation import (
+    LigandColorPoint,
+    PocketAlignPoint,
+    PreparedLigandConformer,
+    SphereOverlapResult,
+)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Residue categories
@@ -365,14 +372,14 @@ def _score_sphere_overlap(
 # Alignment internals
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_align_points(pocket_coloring: PocketColoring) -> list[_PocketAlignPoint]:
-    points: list[_PocketAlignPoint] = []
+def _build_align_points(pocket_coloring: PocketColoring) -> list[PocketAlignPoint]:
+    points: list[PocketAlignPoint] = []
     for sphere in pocket_coloring.spheres:
         if not sphere.sphere_labels:
             continue
         for label in sphere.sphere_labels:
             points.append(
-                _PocketAlignPoint(
+                PocketAlignPoint(
                     feature_id=f"{sphere.sphere_id}:{label}",
                     label=label,
                     coords=sphere.center,
@@ -414,7 +421,7 @@ def _initial_alignment_seeds(
 
 def _match_for_kabsch(
     ligand_points: tuple[LigandColorPoint, ...],
-    align_points: list[_PocketAlignPoint],
+    align_points: list[PocketAlignPoint],
     rotation: npt.NDArray[np.float64],
     translation: npt.NDArray[np.float64],
     *,

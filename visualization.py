@@ -12,7 +12,7 @@ from overlay import OverlayResult
 
 
 with contextlib.suppress(ImportError, ModuleNotFoundError):
-    import py3Dmol  # type: ignore
+    pass  # type: ignore
 
 with contextlib.redirect_stdout(None), contextlib.redirect_stderr(None):
     try:

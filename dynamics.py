@@ -41,24 +41,22 @@ Public API
 """
 from __future__ import annotations
 
-import copy
 import io
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 import numpy.typing as npt
-import pocketeer as pt
-
 from protein_preparation import PreparedProtein, prepare_protein
+
+import biotite.structure.io.pdb as _biotite_pdb
 
 try:
     from openmm import (
         LangevinMiddleIntegrator,
         MonteCarloBarostat,
         Platform,
-        CustomExternalForce,
+        Vec3,
         unit,
     )
     from openmm.app import (
@@ -76,8 +74,8 @@ except ImportError:  # pragma: no cover
     from simtk.openmm import (  # type: ignore
         LangevinMiddleIntegrator,
         MonteCarloBarostat,
+        Vec3,
         Platform,
-        CustomExternalForce,
         unit,
     )
     from simtk.openmm.app import (  # type: ignore
@@ -273,7 +271,6 @@ def run_dynamics(
     # ── Step 1: Prepare protein (PDBFixer + H addition) ────────────────────
     log("── Step 1/4: Preparing protein (PDBFixer) …")
     prepared_protein = prepare_protein(protein_pdb_path, ph=ph)
-    base_atomarray = pt.load_structure(str(protein_pdb_path))
 
     # ── Snapshot: prepared protein (before solvation) ──────────────────────
     step1_pdb = outdir / "step1_prepared_protein.pdb"
@@ -358,7 +355,7 @@ def run_dynamics(
     log("   Minimisation complete.")
 
     # ── Snapshot: post-minimisation ────────────────────────────────────────
-    _min_state = simulation.context.getState(getPositions=True, enforcePeriodicBox=True)
+    _min_state = simulation.context.getState(positions=True, enforcePeriodicBox=True)
     _min_pos_nm = np.asarray(
         _min_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
         dtype=np.float64,
@@ -424,13 +421,17 @@ def run_dynamics(
         )
     )
 
-    # Reference Cα positions for RMSD computation (post-equilibration crystal coords)
-    eq_state = simulation.context.getState(getPositions=True)
+    # Build the protein-only topology once so frame writing doesn't reconstruct it
+    # on every extraction call (potentially thousands of times during production).
+    prot_top = _build_protein_topology(all_atoms, protein_atom_indices)
+
+    # Reference Cα positions for RMSD (snapshot right after equilibration).
+    eq_state = simulation.context.getState(positions=True)
     eq_positions_nm = np.asarray(
         eq_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
         dtype=np.float64,
     )
-    ref_ca_positions_nm = eq_positions_nm[ca_indices].copy()  # reference for RMSD
+    ref_ca_positions_nm = eq_positions_nm[ca_indices].copy()
 
     extracted_frames: list[DynamicsFrame] = []
     steps_run = 0
@@ -440,15 +441,15 @@ def run_dynamics(
         simulation.step(chunk)
         steps_run += chunk
 
-        current_time_ps = (steps_run * timestep_fs / 1000.0)
+        current_time_ps = steps_run * timestep_fs / 1000.0
 
-        state = simulation.context.getState(getPositions=True)
+        # Canonical OpenMM pattern: getState(positions=True) → getPositions()
+        state = simulation.context.getState(positions=True)
         positions_nm = np.asarray(
             state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
             dtype=np.float64,
         )
 
-        # Compute backbone RMSD from the last extracted frame's reference
         ca_positions_nm = positions_nm[ca_indices]
         rmsd_A = _rmsd(ca_positions_nm, ref_ca_positions_nm) * 10.0  # nm → Å
 
@@ -461,16 +462,18 @@ def run_dynamics(
                 f"RMSD={rmsd_report:.2f} Å  — extracting"
             )
 
-            # Extract protein-only positions and build a PDB string
             prot_pos_nm = positions_nm[protein_atom_indices]
-            protein_pdb_str, frame_atomarray = _extract_protein_frame(
-                all_atoms=all_atoms,
-                modeller=modeller,
-                protein_atom_indices=protein_atom_indices,
-                positions_nm=positions_nm,
-                base_atomarray=base_atomarray,
-                n_protein_atoms=n_protein_atoms,
-            )
+
+            # Write protein-only PDB using the pre-built topology and the
+            # canonical OpenMM PDBFile.writeFile pattern, then parse with
+            # biotite to get the AtomArray downstream stages need.
+            prot_pos_vec3 = [Vec3(x, y, z) for x, y, z in prot_pos_nm]
+            _buf = io.StringIO()
+            PDBFile.writeFile(prot_top, prot_pos_vec3 * unit.nanometer, _buf, keepIds=True)
+            protein_pdb_str = _buf.getvalue()
+            frame_atomarray = _biotite_pdb.PDBFile.read(
+                io.StringIO(protein_pdb_str)
+            ).get_structure(model=1)
 
             extracted_frames.append(
                 DynamicsFrame(
@@ -483,7 +486,6 @@ def run_dynamics(
                 )
             )
 
-            # Update reference for next RMSD comparison
             ref_ca_positions_nm = ca_positions_nm.copy()
 
     log(f"   Production complete. Extracted {len(extracted_frames)} conformational frames.")
@@ -547,66 +549,32 @@ def _build_simulation(
         return Simulation(modeller.topology, system, integrator)
 
 
-def _extract_protein_frame(
-    *,
+def _build_protein_topology(
     all_atoms: list,
-    modeller: Modeller,
     protein_atom_indices: list[int],
-    positions_nm: npt.NDArray[np.float64],
-    base_atomarray: object,
-    n_protein_atoms: int,
-) -> tuple[str, object]:
-    """Return (protein_pdb_string, biotite_atomarray) for the current frame.
+) -> Topology:
+    """Build and return an OpenMM Topology containing only protein atoms.
 
-    Strips water and ions; keeps only protein atoms.
+    Intended to be called once before the production loop and reused for every
+    frame write, rather than reconstructing the topology on each extraction.
     """
-    # Build a filtered atom list + position list for PDBFile.writeFile
     protein_idx_set = set(protein_atom_indices)
-
-    # Create a minimal topology for the protein-only atoms
-    prot_topology = Topology()
-    prot_positions_list = []
-    global_to_local: dict[int, int] = {}
-
+    prot_top = Topology()
     chain_map: dict[object, object] = {}
     res_map: dict[object, object] = {}
-
-    from openmm import Vec3
     for atom in all_atoms:
         if atom.index not in protein_idx_set:
             continue
-        # Map chains
         orig_chain = atom.residue.chain
         if orig_chain not in chain_map:
-            chain_map[orig_chain] = prot_topology.addChain(orig_chain.id)
-        # Map residues
+            chain_map[orig_chain] = prot_top.addChain(orig_chain.id)
         orig_res = atom.residue
         if orig_res not in res_map:
-            res_map[orig_res] = prot_topology.addResidue(
+            res_map[orig_res] = prot_top.addResidue(
                 orig_res.name, chain_map[orig_chain], orig_res.id
             )
-        prot_topology.addAtom(
-            atom.name, atom.element, res_map[orig_res]
-        )
-        local_idx = len(global_to_local)
-        global_to_local[atom.index] = local_idx
-        xyz_nm = positions_nm[atom.index]
-        prot_positions_list.append(
-            Vec3(xyz_nm[0], xyz_nm[1], xyz_nm[2])
-        )
-
-    buf = io.StringIO()
-    PDBFile.writeFile(prot_topology, prot_positions_list * unit.nanometer, buf, keepIds=True)
-    pdb_str = buf.getvalue()
-
-    # Build biotite AtomArray: copy the base array (protein only) and update coords
-    frame_arr = copy.copy(base_atomarray)
-    prot_positions_A = positions_nm[protein_atom_indices] * 10.0  # nm → Å
-    # base_atomarray has the same atom ordering as the prepared protein
-    arr_len = min(len(frame_arr), len(prot_positions_A))
-    frame_arr.coord = prot_positions_A[:arr_len].astype(np.float32)
-
-    return pdb_str, frame_arr
+        prot_top.addAtom(atom.name, atom.element, res_map[orig_res])
+    return prot_top
 
 
 def _save_pdb(topology: object, positions: object, path: Path) -> None:
@@ -622,32 +590,10 @@ def _save_protein_only_pdb(
     path: Path,
 ) -> None:
     """Write a protein-only PDB (no water/ions) for easy visualisation in PyMol."""
-    from openmm import Vec3
-
-    protein_idx_set = set(protein_atom_indices)
-    prot_topology = Topology()
-    prot_positions_list = []
-    chain_map: dict[object, object] = {}
-    res_map: dict[object, object] = {}
-
-    for atom in all_atoms:
-        if atom.index not in protein_idx_set:
-            continue
-        orig_chain = atom.residue.chain
-        if orig_chain not in chain_map:
-            chain_map[orig_chain] = prot_topology.addChain(orig_chain.id)
-        orig_res = atom.residue
-        if orig_res not in res_map:
-            res_map[orig_res] = prot_topology.addResidue(
-                orig_res.name, chain_map[orig_chain], orig_res.id
-            )
-        prot_topology.addAtom(atom.name, atom.element, res_map[orig_res])
-        
-        xyz_nm = positions_nm[atom.index]
-        prot_positions_list.append(Vec3(xyz_nm[0], xyz_nm[1], xyz_nm[2]))
-
+    prot_top = _build_protein_topology(all_atoms, protein_atom_indices)
+    prot_pos = [Vec3(*(positions_nm[i])) for i in protein_atom_indices]
     buf = io.StringIO()
-    PDBFile.writeFile(prot_topology, prot_positions_list * unit.nanometer, buf, keepIds=True)
+    PDBFile.writeFile(prot_top, prot_pos * unit.nanometer, buf, keepIds=True)
     path.write_text(buf.getvalue())
 
 
