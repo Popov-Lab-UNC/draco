@@ -4,8 +4,8 @@ Pipeline
 --------
                   ┌──────────────────────────────────────────────────────────┐
   6pbc-prepared   │               dynamics.py (this script calls it)          │
-  .pdb   +        │  PDBFixer → solvate → minimize → NVT equil → NPT equil  │
-  SMILES  ──────► │  → NVT production  →  RMSD-change detection              │
+  .pdb   +        │  prepare_protein → solvate (TIP3P-FB) → minimize →      │
+  SMILES  ──────► │  NVT production  →  Cα RMSD-change frame extraction      │
                   └─────────────────────────┬────────────────────────────────┘
                                             │  conformational frames
                                             ▼  (protein-only snapshots)
@@ -84,10 +84,10 @@ from protein_preparation import PreparedProtein, prepare_protein
 import pocketeer as pt
 
 try:
-    from openmm import LangevinIntegrator, Platform, unit
+    from openmm import LangevinMiddleIntegrator, Platform, unit
     from openmm.app import ForceField, HBonds, Modeller, NoCutoff, PDBFile, Simulation
 except ImportError:  # pragma: no cover
-    from simtk.openmm import LangevinIntegrator, Platform, unit  # type: ignore
+    from simtk.openmm import LangevinMiddleIntegrator, Platform, unit  # type: ignore
     from simtk.openmm.app import (  # type: ignore
         ForceField, HBonds, Modeller, NoCutoff, PDBFile, Simulation,
     )
@@ -121,10 +121,18 @@ def parse_args() -> argparse.Namespace:
                         help="Water box padding in nm (default 1.0)")
     parser.add_argument("--ionic-strength",    type=float, default=0.15,
                         help="NaCl ionic strength in mol/L (default 0.15)")
+    parser.add_argument("--nvt-steps",          type=int, default=50_000,
+                        help="NVT equilibration steps with restraints (default 50k = 100 ps @ 2 fs)")
+    parser.add_argument("--npt-steps",          type=int, default=50_000,
+                        help="NPT equilibration steps with barostat + restraints (default 50k = 100 ps @ 2 fs)")
     parser.add_argument("--production-steps",  type=int, default=2_500_000,
                         help="Production MD steps (default 2.5M = 5 ns @ 2 fs)")
     parser.add_argument("--timestep-fs",       type=float, default=2.0)
+    parser.add_argument("--friction-per-ps",    type=float, default=1.0,
+                        help="Langevin friction γ in 1/ps (default 1.0; matches dynamics.py)")
     parser.add_argument("--temperature-kelvin", type=float, default=300.0)
+    parser.add_argument("--water-model",        default="tip3pfb",
+                        help="Water model label for Modeller/FF (default tip3pfb; see dynamics.py)")
     parser.add_argument("--report-interval-steps", type=int, default=5_000,
                         help="RMSD check interval in steps (default 5000 = 10 ps)")
     parser.add_argument("--rmsd-threshold-angstrom", type=float, default=1.5,
@@ -218,9 +226,11 @@ def main() -> None:
         ph=args.ph,
         box_padding_nm=args.box_padding_nm,
         ionic_strength_molar=args.ionic_strength,
+        nvt_steps=args.nvt_steps,
+        npt_steps=args.npt_steps,
         production_steps=args.production_steps,
         temperature_kelvin=args.temperature_kelvin,
-        friction_per_ps=1.0,
+        friction_per_ps=args.friction_per_ps,
         timestep_fs=args.timestep_fs,
         report_interval_steps=args.report_interval_steps,
         rmsd_threshold_angstrom=args.rmsd_threshold_angstrom,
@@ -228,6 +238,7 @@ def main() -> None:
         cuda_precision=args.cuda_precision,
         output_dir=outdir,
         save_trajectory=not args.no_trajectory,
+        water_model=args.water_model,
         verbose=True,
     )
 
@@ -466,11 +477,6 @@ def _local_minimize(
 
     No induced-fit MD — this keeps each frame analysis fast.
     """
-    from openmm import LangevinIntegrator as _LangevinIntegrator
-    from local_minimization import (
-        KCAL_PER_MOL_A2_TO_KJ_PER_MOL_NM2,
-    )
-
     ligand_pdb = PDBFile(
         io.StringIO(
             conformer_to_pdb_block(
@@ -530,7 +536,7 @@ def _local_minimize(
         k_param_name="k_ligand_posres",
     )
 
-    integrator = _LangevinIntegrator(
+    integrator = LangevinMiddleIntegrator(
         temperature_kelvin * unit.kelvin,
         friction_per_ps / unit.picosecond,
         timestep_fs * unit.femtoseconds,

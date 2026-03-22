@@ -28,12 +28,12 @@ pixi run python test_dynamics.py \
   --ligand-smiles      "CN(CC1(CC1)c1ccc(F)cc1)C(=O)[C@H](Cc1csc2ccccc12)Nc1cc(ncn1)C(N)=O" \
   --output-dir         "test_dynamics_output" \
   --platform-name      CUDA \
-  --cuda-precision     double \
+  --cuda-precision     mixed \
   --box-padding-nm     1.0 \
   --ionic-strength     0.15 \
-  --minimize-max-iterations 10000 \
-  --nvt-steps          50000  \
-  --npt-steps          50000  \
+  --water-model        tip3pfb \
+  --nvt-steps          50000 \
+  --npt-steps          50000 \
   --production-steps   25000000 \
   --report-interval-steps 5000 \
   --rmsd-threshold-angstrom 1.5 \
@@ -44,8 +44,6 @@ pixi run python test_dynamics.py \
   --shell-radius-angstrom  8.0 \
   --protein-restraint-k    10.0 \
   --ligand-restraint-k     1.0 \
-  --equil-restraint-k      2.0 \
-  --nvt-timestep-fs        1.0 \
-  --minimize-pose-iterations 1000 \
+  --minimize-pose-iterations 10000 \
   --top-k 5 \
   --top-pdb "top5_poses.pdb"

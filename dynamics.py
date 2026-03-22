@@ -186,6 +186,8 @@ def run_dynamics(
     box_padding_nm: float = 1.0,
     ionic_strength_molar: float = 0.15,
     # Simulation lengths
+    nvt_steps: int = 50_000,        # 100 ps unrestrained NVT equilibration
+    npt_steps: int = 50_000,        # 100 ps NPT density equilibration
     production_steps: int = 2_500_000,  # 5 ns @ 2 fs
     # Integrator
     temperature_kelvin: float = 300.0,
@@ -204,7 +206,7 @@ def run_dynamics(
     water_model: str = _DEFAULT_WATER_MODEL,
     verbose: bool = True,
 ) -> DynamicsResult:
-    """Run explicit-solvent NVT/NPT MD and return conformational frames.
+    """Run explicit-solvent MD (minimize → NVT equil → NPT equil → NVT production).
 
     Parameters
     ----------
@@ -217,6 +219,12 @@ def run_dynamics(
         Distance (nm) between protein surface and box edge (default 1.0 nm).
     ionic_strength_molar:
         NaCl ionic strength in mol/L (default 0.15 M physiological).
+    nvt_steps:
+        Steps of unrestrained NVT equilibration after minimisation
+        (default 50 000 = 100 ps).  Set to 0 to skip.
+    npt_steps:
+        Steps of NPT equilibration with a MonteCarloBarostat (1 atm)
+        (default 50 000 = 100 ps).  Set to 0 to skip.
     production_steps:
         Steps of unrestrained NVT production MD (default 2.5M = 5 ns).
     temperature_kelvin:
@@ -261,7 +269,6 @@ def run_dynamics(
     log = _Logger(verbose)
 
     timestep_fs = float(timestep_fs)
-    steps_per_ps = 1000.0 / timestep_fs
 
     # ── Step 1: Prepare protein (PDBFixer + H addition) ────────────────────
     log("── Step 1/4: Preparing protein (PDBFixer) …")
@@ -331,8 +338,8 @@ def run_dynamics(
     ]
     log(f"   Cα atoms for RMSD tracking: {len(ca_indices)}")
 
-    # ── Step 4: Build simulation and minimise ──────────────────────────────
-    log("── Step 4/4: Energy minimisation and Production MD …")
+    # ── Step 4: Minimise, equilibrate, then production ─────────────────────
+    log("── Step 4/4: Energy minimisation, equilibration, and production MD …")
 
     integrator = LangevinMiddleIntegrator(
         temperature_kelvin * unit.kelvin,
@@ -343,8 +350,10 @@ def run_dynamics(
         modeller, system, integrator, platform_name, cuda_precision, log
     )
     simulation.context.setPositions(modeller.positions)
-    simulation.context.setVelocitiesToTemperature(temperature_kelvin * unit.kelvin)
 
+    # Energy minimisation: run until the default gradient tolerance is met.
+    # No iteration cap — we need the water shell to fully relax so dynamics
+    # does not immediately blow up with NaN coordinates.
     simulation.minimizeEnergy()
     log("   Minimisation complete.")
 
@@ -360,6 +369,29 @@ def run_dynamics(
     _save_protein_only_pdb(all_atoms, protein_atom_indices, _min_pos_nm, step4_prot)
     log(f"   Snapshot saved: {step4_full}  (full solvated)")
     log(f"   Snapshot saved: {step4_prot}  (protein only)")
+
+    # Velocities must be assigned *after* minimisation so the initial kinetic
+    # energy is drawn from a physically sensible Boltzmann distribution.
+    simulation.context.setVelocitiesToTemperature(temperature_kelvin * unit.kelvin)
+
+    # ── NVT equilibration ──────────────────────────────────────────────────
+    if nvt_steps > 0:
+        nvt_time_ps = nvt_steps * timestep_fs / 1000.0
+        log(f"   NVT equilibration ({nvt_steps} steps = {nvt_time_ps:.1f} ps) …")
+        simulation.step(nvt_steps)
+        log("   NVT equilibration complete.")
+
+    # ── NPT equilibration ──────────────────────────────────────────────────
+    if npt_steps > 0:
+        npt_time_ps = npt_steps * timestep_fs / 1000.0
+        log(f"   NPT equilibration ({npt_steps} steps = {npt_time_ps:.1f} ps, 1 atm) …")
+        barostat = MonteCarloBarostat(1.0 * unit.atmosphere, temperature_kelvin * unit.kelvin)
+        baro_force_idx = system.addForce(barostat)
+        simulation.context.reinitialize(preserveState=True)
+        simulation.step(npt_steps)
+        system.removeForce(baro_force_idx)
+        simulation.context.reinitialize(preserveState=True)
+        log("   NPT equilibration complete. Barostat removed for NVT production.")
 
     # ── Production MD with conformational-change detection ─────────
     production_time_ps = production_steps * timestep_fs / 1000.0
