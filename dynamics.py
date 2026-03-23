@@ -44,6 +44,7 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import numpy.typing as npt
@@ -202,6 +203,7 @@ def run_dynamics(
     save_trajectory: bool = True,
     forcefield_files: tuple[str, ...] = _DEFAULT_FORCEFIELD,
     water_model: str = _DEFAULT_WATER_MODEL,
+    frame_callback: Callable[[DynamicsFrame], None] | None = None,
     verbose: bool = True,
 ) -> DynamicsResult:
     """Run explicit-solvent MD (minimize → NVT equil → NPT equil → NVT production).
@@ -235,7 +237,8 @@ def run_dynamics(
         How often (in steps) to check for conformational change (default 5000 = 10 ps).
     rmsd_threshold_angstrom:
         Backbone Cα RMSD threshold in Å; a new frame is extracted whenever
-        drift from the last extracted frame exceeds this value (default 1.5 Å).
+        its minimum Kabsch RMSD to ALL previously saved frames exceeds this
+        value (default 1.5 Å).
     platform_name:
         OpenMM platform ('CUDA', 'OpenCL', 'CPU').
     cuda_precision:
@@ -252,6 +255,9 @@ def run_dynamics(
         ``amber14/tip3pfb.xml``).  Passed to ``Modeller.addSolvent`` after
         mapping known aliases (e.g. *tip3pfb* → *tip3p* for placement), because
         OpenMM only ships pre-equilibrated boxes for a fixed set of models.
+    frame_callback:
+        Optional callback called with each extracted DynamicsFrame.
+        Allows concurrent processing of frames as they are generated.
     verbose:
         Print progress messages (default True).
 
@@ -425,13 +431,10 @@ def run_dynamics(
     # on every extraction call (potentially thousands of times during production).
     prot_top = _build_protein_topology(all_atoms, protein_atom_indices)
 
-    # Reference Cα positions for RMSD (snapshot right after equilibration).
-    eq_state = simulation.context.getState(positions=True)
-    eq_positions_nm = np.asarray(
-        eq_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
-        dtype=np.float64,
-    )
-    ref_ca_positions_nm = eq_positions_nm[ca_indices].copy()
+    # Historical Cα positions for novelty check.
+    # We always save frame 0. Subsequent frames are saved if their Kabsch RMSD
+    # to ALL previously saved frames is >= threshold.
+    saved_ca_positions: list[npt.NDArray[np.float64]] = []
 
     extracted_frames: list[DynamicsFrame] = []
     steps_run = 0
@@ -443,7 +446,6 @@ def run_dynamics(
 
         current_time_ps = steps_run * timestep_fs / 1000.0
 
-        # Canonical OpenMM pattern: getState(positions=True) → getPositions()
         state = simulation.context.getState(positions=True)
         positions_nm = np.asarray(
             state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
@@ -451,22 +453,30 @@ def run_dynamics(
         )
 
         ca_positions_nm = positions_nm[ca_indices]
-        rmsd_A = _rmsd(ca_positions_nm, ref_ca_positions_nm) * 10.0  # nm → Å
 
-        is_first_frame = len(extracted_frames) == 0
-        if is_first_frame or rmsd_A >= rmsd_threshold_angstrom:
-            rmsd_report = 0.0 if is_first_frame else rmsd_A
+        # Novelty check: compare current Cα to all saved Cα sets.
+        if not saved_ca_positions:
+            min_rmsd_A = float("inf")
+        else:
+            # We use Kabsch RMSD to properly account for rotation/translation
+            # that might accumulate over long simulations.
+            rmsds = [
+                _kabsch_rmsd(ca_positions_nm, ref_ca) * 10.0
+                for ref_ca in saved_ca_positions
+            ]
+            min_rmsd_A = min(rmsds)
+
+        is_novel = len(saved_ca_positions) == 0 or min_rmsd_A >= rmsd_threshold_angstrom
+
+        if is_novel:
+            rmsd_report = 0.0 if not saved_ca_positions else min_rmsd_A
             log(
                 f"   → Frame {len(extracted_frames):4d}  "
                 f"t={current_time_ps:8.1f} ps  "
-                f"RMSD={rmsd_report:.2f} Å  — extracting"
+                f"minRMSD={rmsd_report:.2f} Å  — novel"
             )
 
             prot_pos_nm = positions_nm[protein_atom_indices]
-
-            # Write protein-only PDB using the pre-built topology and the
-            # canonical OpenMM PDBFile.writeFile pattern, then parse with
-            # biotite to get the AtomArray downstream stages need.
             prot_pos_vec3 = [Vec3(x, y, z) for x, y, z in prot_pos_nm]
             _buf = io.StringIO()
             PDBFile.writeFile(prot_top, prot_pos_vec3 * unit.nanometer, _buf, keepIds=True)
@@ -475,18 +485,23 @@ def run_dynamics(
                 io.StringIO(protein_pdb_str)
             ).get_structure(model=1)
 
-            extracted_frames.append(
-                DynamicsFrame(
-                    frame_index=len(extracted_frames),
-                    simulation_time_ps=current_time_ps,
-                    rmsd_from_prev_angstrom=rmsd_report,
-                    protein_pdb_string=protein_pdb_str,
-                    protein_positions_nm=prot_pos_nm,
-                    atomarray=frame_atomarray,
-                )
+            frame = DynamicsFrame(
+                frame_index=len(extracted_frames),
+                simulation_time_ps=current_time_ps,
+                rmsd_from_prev_angstrom=rmsd_report,
+                protein_pdb_string=protein_pdb_str,
+                protein_positions_nm=prot_pos_nm,
+                atomarray=frame_atomarray,
             )
+            extracted_frames.append(frame)
+            saved_ca_positions.append(ca_positions_nm.copy())
 
-            ref_ca_positions_nm = ca_positions_nm.copy()
+            if frame_callback:
+                frame_callback(frame)
+        else:
+            # Optionally log rejections if threshold is high to help users tune.
+            if verbose and steps_run % (report_interval_steps * 10) == 0:
+                 pass # Too chatty for standard runs, but useful for debugging.
 
     log(f"   Production complete. Extracted {len(extracted_frames)} conformational frames.")
 
@@ -605,6 +620,33 @@ def _rmsd(
     if a.shape != b.shape or a.size == 0:
         return 0.0
     return float(np.sqrt(np.mean(np.sum((a - b) ** 2, axis=1))))
+
+
+def _kabsch_rmsd(
+    p: npt.NDArray[np.float64],
+    q: npt.NDArray[np.float64],
+) -> float:
+    """Kabsch-aligned RMSD between two point sets P and Q of shape (N, 3)."""
+    if p.shape != q.shape or p.size == 0:
+        return 0.0
+
+    # 1. Center the sets
+    p_centered = p - np.mean(p, axis=0)
+    q_centered = q - np.mean(q, axis=0)
+
+    # 2. Compute Covariance matrix
+    c = np.dot(p_centered.T, q_centered)
+
+    # 3. Compute optimal rotation via SVD
+    v, s, w_t = np.linalg.svd(c)
+    d = np.sign(np.linalg.det(v) * np.linalg.det(w_t))
+    e = np.diag([1.0, 1.0, d])
+    r = np.dot(v, np.dot(e, w_t))
+
+    # 4. Rotate P onto Q
+    p_rotated = np.dot(p_centered, r)
+
+    return _rmsd(p_rotated, q_centered)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
