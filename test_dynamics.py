@@ -51,9 +51,14 @@ Usage
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import heapq
 import io
+import os
+import threading
+import time
+import multiprocessing
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -157,6 +162,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k",   type=int, default=5,
                         help="Number of best-energy poses to save (default 5)")
     parser.add_argument("--top-pdb", default="top5_poses.pdb")
+
+    # ── Debug / Testing ─────────────────────────────────────────────────────
+    parser.add_argument("--dry-run", action="store_true", default=False,
+                        help="Skip actual analysis and return dummy results for concurrency testing")
     return parser.parse_args()
 
 
@@ -191,11 +200,8 @@ class _TopKHeap:
     _counter: int = 0
 
     def push(self, result: _FramePoseResult) -> None:
-        energy = (
-            result.interaction_energy_kj_per_mol
-            if result.interaction_energy_kj_per_mol is not None
-            else result.final_energy_kj_per_mol
-        )
+        val = result.interaction_energy_kj_per_mol
+        energy: float = val if val is not None else result.final_energy_kj_per_mol
         entry = (energy, self._counter, result)
         self._counter += 1
         if len(self._heap) < self.k:
@@ -212,48 +218,204 @@ class _TopKHeap:
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Parallel Worker Logic
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _worker_init() -> None:
+    """Initializer for ProcessPoolExecutor workers."""
+    # 1. Force each worker to use only 1 CPU thread for OpenMM CPU platform.
+    #    Without this, 15 workers in a 16-core Slurm allocation would each
+    #    try to spin up 16 threads, leading to severe oversubscription.
+    os.environ["OPENMM_CPU_THREADS"] = "1"
+
+    # 2. Pre-import heavy modules to avoid overhead on first task.
+    try:
+        import openmm
+        import rdkit
+        import pocketeer
+        import protein_preparation
+    except ImportError:
+        pass
+
+
+def _process_frame_worker(
+    frame_index: int,
+    frame_time_ps: float,
+    protein_pdb_string: str,
+    prepared_ligand: PreparedLigand,
+    # Parameters from args
+    pocket_score_threshold: float,
+    poses_per_pocket: int,
+    overlay_dedupe_rmsd: float,
+    shell_radius_angstrom: float,
+    protein_restraint_k: float,
+    ligand_restraint_k: float,
+    minimize_pose_iterations: int,
+    compute_ie: bool,
+    dry_run: bool = False,
+) -> list[_FramePoseResult]:
+    """Process a single frame: pocketeer → overlay → local minimization.
+
+    Executed in a sub-process via ProcessPoolExecutor.
+    """
+    if dry_run:
+        # Concurrency smoke-test: simulate work and return a dummy result.
+        time.sleep(0.5)
+        return [_FramePoseResult(
+            frame_index=frame_index,
+            frame_time_ps=frame_time_ps,
+            pocket_id=1,
+            pocket_score=10.0,
+            conformer_id=0,
+            gaussian_fit_score=0.99,
+            initial_energy_kj_per_mol=0.0,
+            final_energy_kj_per_mol=-100.0,
+            interaction_energy_kj_per_mol=-50.0 if compute_ie else None,
+            ligand_heavy_atom_rmsd_angstrom=0.1,
+            protein_atoms_flexible=10,
+            protein_atoms_restrained=100,
+            ligand_atoms_restrained=20,
+            minimized_complex_pdb=protein_pdb_string, # dummy
+            status="ok"
+        )]
+
+    # 1. Parse structure from PDB string
+    #    We use any available platform (likely CPU since CUDA is used by main)
+    #    for pocketeer/overlay setup.
+    import io
+    import pocketeer as pt
+    import biotite.structure.io.pdb as _biotite_pdb
+
+    frame_atomarray = _biotite_pdb.PDBFile.read(
+        io.StringIO(protein_pdb_string)
+    ).get_structure(model=1)
+
+    pockets = pt.find_pockets(frame_atomarray)
+    pockets = [
+        p for p in pockets
+        if float(getattr(p, "score", 0.0)) > pocket_score_threshold
+    ]
+    if not pockets:
+        return []
+
+    pocket_score_map = {
+        int(getattr(p, "pocket_id")): float(getattr(p, "score", 0.0)) for p in pockets
+    }
+
+    # 3. Color pockets
+    colored_pockets = color_pockets(frame_atomarray, pockets)
+
+    # 4. Overlay ligand conformers
+    dedupe = overlay_dedupe_rmsd if overlay_dedupe_rmsd > 0.0 else None
+    if poses_per_pocket <= 1:
+        overlay_results = rank_ligand_over_pockets(prepared_ligand, colored_pockets)
+    else:
+        overlay_results = rank_ligand_over_pockets_multi(
+            prepared_ligand,
+            colored_pockets,
+            poses_per_pocket=poses_per_pocket,
+            dedupe_heavy_atom_rmsd=dedupe,
+        )
+
+    positive_poses = [r for r in overlay_results if r.gaussian_fit_score > 0]
+    if not positive_poses:
+        return []
+
+    # 5. Build PreparedProtein for this frame (full preparation needed in worker)
+    frame_protein = _protein_from_pdb_string(protein_pdb_string)
+
+    # 6. Local minimization (CRITICAL: Force CPU platform)
+    results = []
+    for pose in positive_poses:
+        try:
+            minim = _local_minimize(
+                frame_protein=frame_protein,
+                overlay_result=pose,
+                shell_radius_angstrom=shell_radius_angstrom,
+                protein_restraint_k=protein_restraint_k,
+                ligand_restraint_k=ligand_restraint_k,
+                max_iterations=minimize_pose_iterations,
+                platform_name="CPU",  # Force CPU to avoid GPU contention
+                cuda_precision="mixed",
+                compute_ie=compute_ie,
+            )
+            ie = minim.interaction_energy_kj_per_mol
+            results.append(_FramePoseResult(
+                frame_index=frame_index,
+                frame_time_ps=frame_time_ps,
+                pocket_id=pose.pocket_id,
+                pocket_score=pocket_score_map.get(pose.pocket_id, float("nan")),
+                conformer_id=pose.conformer_id,
+                gaussian_fit_score=pose.gaussian_fit_score,
+                initial_energy_kj_per_mol=minim.initial_energy_kj_per_mol,
+                final_energy_kj_per_mol=minim.final_energy_kj_per_mol,
+                interaction_energy_kj_per_mol=ie,
+                ligand_heavy_atom_rmsd_angstrom=minim.ligand_heavy_atom_rmsd_angstrom,
+                protein_atoms_flexible=minim.protein_atoms_flexible,
+                protein_atoms_restrained=minim.protein_atoms_restrained,
+                ligand_atoms_restrained=minim.ligand_atoms_restrained,
+                minimized_complex_pdb=minim.minimized_complex_pdb,
+            ))
+        except Exception as exc:
+            results.append(_FramePoseResult(
+                frame_index=frame_index,
+                frame_time_ps=frame_time_ps,
+                pocket_id=pose.pocket_id,
+                pocket_score=pocket_score_map.get(pose.pocket_id, float("nan")),
+                conformer_id=pose.conformer_id,
+                gaussian_fit_score=pose.gaussian_fit_score,
+                initial_energy_kj_per_mol=0.0,
+                final_energy_kj_per_mol=0.0,
+                interaction_energy_kj_per_mol=None,
+                ligand_heavy_atom_rmsd_angstrom=0.0,
+                protein_atoms_flexible=0,
+                protein_atoms_restrained=0,
+                ligand_atoms_restrained=0,
+                minimized_complex_pdb="",
+                status="error",
+                error=str(exc)
+            ))
+    return results
+
+
 def main() -> None:
     args = parse_args()
     outdir = Path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
 
+    # ── Resource Allocation ──────────────────────────────────────────────────
+    num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
+    # Dedicate 1 CPU for the main MD thread (which mainly orchestrates the GPU),
+    # and the rest for parallel frame analysis on CPU.
+    num_workers = max(1, num_cpus - 1)
+
+    print("\n" + "═" * 70)
+    print("CONCURRENT RESOURCE ALLOCATION")
+    print(f"  Available CPUs (Slurm/OS): {num_cpus}")
+    print(f"  Main MD process:           Dedicating 1 CPU thread + 1 {args.platform_name} device")
+    print(f"  Analysis Workers:          Dedicating {num_workers} processes (1 thread each)")
+    print("═" * 70)
+
     # ── [1/4] Explicit-solvent MD ────────────────────────────────────────────
     print("\n" + "═" * 70)
     print("[1/4]  Explicit-solvent MD  (dynamics engine)")
     print("═" * 70)
-    dynamics_result: DynamicsResult = run_dynamics(
-        args.protein_pdb,
-        ph=args.ph,
-        box_padding_nm=args.box_padding_nm,
-        ionic_strength_molar=args.ionic_strength,
-        nvt_steps=args.nvt_steps,
-        npt_steps=args.npt_steps,
-        production_steps=args.production_steps,
-        temperature_kelvin=args.temperature_kelvin,
-        friction_per_ps=args.friction_per_ps,
-        timestep_fs=args.timestep_fs,
-        report_interval_steps=args.report_interval_steps,
-        rmsd_threshold_angstrom=args.rmsd_threshold_angstrom,
-        platform_name=args.platform_name,
-        cuda_precision=args.cuda_precision,
-        output_dir=outdir,
-        save_trajectory=not args.no_trajectory,
-        water_model=args.water_model,
-        verbose=True,
-    )
 
-    print(
-        f"\n  ✓ MD complete:  {dynamics_result.simulation_time_ps:.1f} ps simulated, "
-        f"{len(dynamics_result.frames)} conformational frames extracted."
-    )
-    if not dynamics_result.frames:
-        print("  No frames extracted — nothing to analyse. Exiting.")
-        return
+    # Shared state for analysis
+    results_lock = threading.Lock()
+    top_heap = _TopKHeap(k=args.top_k)
+    all_rows: list[dict[str, Any]] = []
+    
+    # We open the CSV here to allow real-time appends in the callback
+    summary_csv_path = outdir / "summary.csv"
+    csv_fh = summary_csv_path.open("w", newline="")
+    csv_writer = csv.DictWriter(csv_fh, fieldnames=_FIELDNAMES)
+    csv_writer.writeheader()
+    csv_fh.flush()
 
-    # ── [2/4] Prepare ligand conformers (once, reused for all frames) ────────
-    print("\n" + "═" * 70)
-    print("[2/4]  Preparing ligand conformers")
-    print("═" * 70)
+    # Prep ligand once (needed for all frames)
+    print(f"\n[2/4]  Preparing ligand {args.ligand_name} …")
     prepared_ligand: PreparedLigand = prepare_ligand_from_smiles(
         args.ligand_smiles,
         name=args.ligand_name,
@@ -261,124 +423,133 @@ def main() -> None:
     )
     print(f"  {len(prepared_ligand.conformers)} conformers generated.")
 
-    # ── [3/4] Per-frame pocketeer + overlay + minimization ─────────────────
     print("\n" + "═" * 70)
-    print(f"[3/4]  Per-frame analysis  ({len(dynamics_result.frames)} frames)")
+    print(f"[3/4]  Concurrent analysis")
     print("═" * 70)
 
-    top_heap = _TopKHeap(k=args.top_k)
-    all_rows: list[dict[str, Any]] = []
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=num_workers,
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=_worker_init
+    ) as executor:
 
-    for frame in dynamics_result.frames:
-        print(
-            f"\n  ── Frame {frame.frame_index:4d}  "
-            f"t={frame.simulation_time_ps:8.1f} ps  "
-            f"RMSD={frame.rmsd_from_prev_angstrom:.2f} Å ──"
-        )
-
-        # 3a. Find pockets on this snapshot
-        pockets = pt.find_pockets(frame.atomarray)
-        pockets = [
-            p for p in pockets
-            if float(getattr(p, "score", 0.0)) > args.pocket_score_threshold
-        ]
-        print(f"     Pockets above threshold: {len(pockets)}")
-        if not pockets:
-            continue
-
-        pocket_score_map = {
-            int(p.pocket_id): float(getattr(p, "score", 0.0)) for p in pockets
-        }
-
-        # 3b. Color pockets
-        colored_pockets = color_pockets(frame.atomarray, pockets)
-
-        # 3c. Overlay ligand conformers
-        dedupe = args.overlay_dedupe_rmsd if args.overlay_dedupe_rmsd > 0.0 else None
-        if args.poses_per_pocket <= 1:
-            overlay_results = rank_ligand_over_pockets(prepared_ligand, colored_pockets)
-        else:
-            overlay_results = rank_ligand_over_pockets_multi(
-                prepared_ligand,
-                colored_pockets,
-                poses_per_pocket=args.poses_per_pocket,
-                dedupe_heavy_atom_rmsd=dedupe,
-            )
-
-        positive_poses = [r for r in overlay_results if r.gaussian_fit_score > 0]
-        print(f"     Positive overlay poses:  {len(positive_poses)}")
-        if not positive_poses:
-            continue
-
-        # 3d. Build a PreparedProtein from this frame's PDB string
-        #     (re-use prepared topology — just substitute positions)
-        frame_protein = _protein_from_frame(
-            frame=frame,
-            base_prepared_protein=dynamics_result.prepared_protein,
-        )
-        if frame_protein is None:
-            # Fallback: re-prepare from the frame PDB string directly
-            frame_protein = _protein_from_pdb_string(frame.protein_pdb_string)
-
-        # 3e. Local minimization (no induced-fit)
-        for pose_idx, pose in enumerate(positive_poses, start=1):
+        def on_frame_done(future: concurrent.futures.Future):
             try:
-                minim = _local_minimize(
-                    frame_protein=frame_protein,
-                    overlay_result=pose,
-                    shell_radius_angstrom=args.shell_radius_angstrom,
-                    protein_restraint_k=args.protein_restraint_k,
-                    ligand_restraint_k=args.ligand_restraint_k,
-                    max_iterations=args.minimize_pose_iterations,
-                    platform_name=args.platform_name,
-                    cuda_precision=args.cuda_precision,
-                    compute_ie=not args.no_interaction_energy,
-                )
-                ie = minim.interaction_energy_kj_per_mol
-                print(
-                    f"     pose {pose_idx:3d}: pocket={pose.pocket_id} "
-                    f"gfit={pose.gaussian_fit_score:.3f}  "
-                    f"ΔE_int={'%+.1f' % ie if ie is not None else 'N/A':>10s} kJ/mol  "
-                    f"lig_rmsd={minim.ligand_heavy_atom_rmsd_angstrom:.2f} Å"
-                )
-                result = _FramePoseResult(
-                    frame_index=frame.frame_index,
-                    frame_time_ps=frame.simulation_time_ps,
-                    pocket_id=pose.pocket_id,
-                    pocket_score=pocket_score_map.get(pose.pocket_id, float("nan")),
-                    conformer_id=pose.conformer_id,
-                    gaussian_fit_score=pose.gaussian_fit_score,
-                    initial_energy_kj_per_mol=minim.initial_energy_kj_per_mol,
-                    final_energy_kj_per_mol=minim.final_energy_kj_per_mol,
-                    interaction_energy_kj_per_mol=ie,
-                    ligand_heavy_atom_rmsd_angstrom=minim.ligand_heavy_atom_rmsd_angstrom,
-                    protein_atoms_flexible=minim.protein_atoms_flexible,
-                    protein_atoms_restrained=minim.protein_atoms_restrained,
-                    ligand_atoms_restrained=minim.ligand_atoms_restrained,
-                    minimized_complex_pdb=minim.minimized_complex_pdb,
-                )
-                top_heap.push(result)
-                all_rows.append(_to_row(result))
-
+                frame_results = future.result()
+                with results_lock:
+                    for r in frame_results:
+                        if r.status == "ok":
+                            top_heap.push(r)
+                            row = _to_row(r)
+                        else:
+                            print(f"     Frame {r.frame_index} pocket {r.pocket_id} FAILED: {r.error}")
+                            row = {
+                                "status": "error",
+                                "frame_index": r.frame_index,
+                                "frame_time_ps": f"{r.frame_time_ps:.3f}",
+                                "pocket_id": r.pocket_id,
+                                "pocket_score": f"{r.pocket_score:.3f}",
+                                "gaussian_fit_score": f"{r.gaussian_fit_score:.4f}",
+                                "conformer_id": r.conformer_id,
+                                "error": r.error
+                            }
+                        all_rows.append(row)
+                        csv_writer.writerow(row)
+                    csv_fh.flush() # Ensure it hits disk immediately
             except Exception as exc:
-                print(
-                    f"     pose {pose_idx:3d}: pocket={pose.pocket_id} "
-                    f"— FAILED: {exc}"
-                )
-                all_rows.append(
-                    _error_row(frame, pose,
-                               pocket_score_map.get(pose.pocket_id, float("nan")),
-                               str(exc))
-                )
+                print(f"  [ERROR] Worker crashed processing frame: {exc}")
+
+        def frame_callback(frame: DynamicsFrame) -> None:
+            # 1. Save frame PDB immediately for user/PyMol
+            frame_dir = outdir / "frames"
+            frame_dir.mkdir(exist_ok=True)
+            (frame_dir / f"frame_{frame.frame_index:04d}.pdb").write_text(frame.protein_pdb_string)
+
+            # 2. Submit to worker pool
+            future = executor.submit(
+                _process_frame_worker,
+                frame_index=frame.frame_index,
+                frame_time_ps=frame.simulation_time_ps,
+                protein_pdb_string=frame.protein_pdb_string,
+                prepared_ligand=prepared_ligand,
+                pocket_score_threshold=args.pocket_score_threshold,
+                poses_per_pocket=args.poses_per_pocket,
+                overlay_dedupe_rmsd=args.overlay_dedupe_rmsd,
+                shell_radius_angstrom=args.shell_radius_angstrom,
+                protein_restraint_k=args.protein_restraint_k,
+                ligand_restraint_k=args.ligand_restraint_k,
+                minimize_pose_iterations=args.minimize_pose_iterations,
+                compute_ie=not args.no_interaction_energy,
+                dry_run=args.dry_run,
+            )
+            future.add_done_callback(on_frame_done)
+
+        dynamics_result: DynamicsResult = run_dynamics(
+            args.protein_pdb,
+            ph=args.ph,
+            box_padding_nm=args.box_padding_nm,
+            ionic_strength_molar=args.ionic_strength,
+            nvt_steps=args.nvt_steps,
+            npt_steps=args.npt_steps,
+            production_steps=args.production_steps,
+            temperature_kelvin=args.temperature_kelvin,
+            friction_per_ps=args.friction_per_ps,
+            timestep_fs=args.timestep_fs,
+            report_interval_steps=args.report_interval_steps,
+            rmsd_threshold_angstrom=args.rmsd_threshold_angstrom,
+            platform_name=args.platform_name,
+            cuda_precision=args.cuda_precision,
+            output_dir=outdir,
+            save_trajectory=not args.no_trajectory,
+            water_model=args.water_model,
+            frame_callback=frame_callback,
+            verbose=True,
+        )
+
+        print("\n  Main MD complete. Waiting for remaining analysis workers …")
+        # Executor context manager will wait for all tasks on __exit__
+
+    csv_fh.close()
+
+    print(
+        f"\n  ✓ All stages complete: {dynamics_result.simulation_time_ps:.1f} ps simulated, "
+        f"{len(dynamics_result.frames)} frames generated, {len(all_rows)} poses analysed."
+    )
 
     # ── [4/4] Write outputs ──────────────────────────────────────────────────
     print("\n" + "═" * 70)
-    print("[4/4]  Writing outputs")
+    print("[4/4]  Finalizing outputs")
     print("═" * 70)
 
-    summary_csv = outdir / "summary.csv"
-    _write_csv(summary_csv, all_rows)
-    print(f"  Summary CSV     : {summary_csv}  ({len(all_rows)} rows)")
+    print(f"  Summary CSV     : {summary_csv_path}  ({len(all_rows)} rows)")
+
+    top_poses = top_heap.sorted_best()
+    if top_poses:
+        top_pdb_path = outdir / args.top_pdb
+        _write_multimodel_pdb(top_pdb_path, top_poses)
+        print(f"  Top-{args.top_k} PDB      : {top_pdb_path}  ({len(top_poses)} models)")
+
+        for rank, r in enumerate(top_poses, start=1):
+            ie_tag = (
+                f"{r.interaction_energy_kj_per_mol:.1f}"
+                if r.interaction_energy_kj_per_mol is not None
+                else "noE"
+            )
+            fname = (
+                f"top{rank:02d}_frame{r.frame_index:04d}_"
+                f"pocket{r.pocket_id:03d}_"
+                f"ie{ie_tag.replace('-', 'n')}_kJmol.pdb"
+            )
+            (outdir / fname).write_text(r.minimized_complex_pdb)
+            print(f"  Written         : {outdir / fname}")
+    else:
+        print("  No successful poses – nothing to write.")
+
+    if dynamics_result.trajectory_dcd:
+        print(f"  Trajectory DCD  : {dynamics_result.trajectory_dcd}")
+        print(f"  Topology PDB    : {dynamics_result.topology_pdb}")
+
+    print("\n  Done.")
 
     top_poses = top_heap.sorted_best()
     if top_poses:
