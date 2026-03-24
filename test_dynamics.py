@@ -50,12 +50,23 @@ Usage
 """
 from __future__ import annotations
 
+import os
+
+# Set thread limits BEFORE importing rdkit, numpy, openmm, py3dmol, pytorch etc.
+# Without this, 15 concurrent workers on 16 cores will spin up 15*16 = 240 threads,
+# causing severe CPU oversubscription, thrashing, and effectively freezing the pipeline.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["OPENMM_CPU_THREADS"] = "1"
+
 import argparse
 import concurrent.futures
 import csv
 import heapq
 import io
-import os
 import threading
 import time
 import multiprocessing
@@ -196,22 +207,30 @@ class _FramePoseResult:
 @dataclass
 class _TopKHeap:
     k: int
+    # Min-heap of (-energy, tie_break, result): root = worst (least negative) among kept.
     _heap: list[tuple[float, int, _FramePoseResult]] = field(default_factory=list)
     _counter: int = 0
 
     def push(self, result: _FramePoseResult) -> None:
         val = result.interaction_energy_kj_per_mol
         energy: float = val if val is not None else result.final_energy_kj_per_mol
-        entry = (energy, self._counter, result)
+        neg_e = -energy
+        entry = (neg_e, self._counter, result)
         self._counter += 1
         if len(self._heap) < self.k:
             heapq.heappush(self._heap, entry)
-        elif energy < self._heap[0][0]:
+        elif energy < -self._heap[0][0]:
             heapq.heapreplace(self._heap, entry)
 
     def sorted_best(self) -> list[_FramePoseResult]:
         """Most → least negative energy."""
-        return [r for _, _, r in sorted(self._heap)]
+        return [r for _, _, r in sorted(self._heap, key=lambda t: t[0], reverse=True)]
+
+    def current_best(self) -> _FramePoseResult | None:
+        """Rank-1 pose in the rolling top-k (same ordering as sorted_best)."""
+        if not self._heap:
+            return None
+        return self.sorted_best()[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -423,9 +442,19 @@ def main() -> None:
     )
     print(f"  {len(prepared_ligand.conformers)} conformers generated.")
 
+    # Same preparation as MD step 1 (PDBFixer + H); used for concurrent pipeline on input pose.
+    print("  Preparing initial protein for concurrent pipeline (matches MD step 1) …")
+    initial_prepared = prepare_protein(args.protein_pdb, ph=args.ph)
+    _initial_buf = io.StringIO()
+    PDBFile.writeFile(initial_prepared.topology, initial_prepared.positions, _initial_buf)
+    initial_pdb_string = _initial_buf.getvalue()
+
     print("\n" + "═" * 70)
     print(f"[3/4]  Concurrent analysis")
     print("═" * 70)
+
+    # Tracks best ranking energy seen so far (more negative = better); updated when rank-1 improves.
+    rolling_best_energy: list[float | None] = [None]
 
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=num_workers,
@@ -441,6 +470,35 @@ def main() -> None:
                         if r.status == "ok":
                             top_heap.push(r)
                             row = _to_row(r)
+                            ie_str = (
+                                f"{r.interaction_energy_kj_per_mol:.1f}"
+                                if r.interaction_energy_kj_per_mol is not None
+                                else "noE"
+                            )
+                            print(
+                                f"  [pipeline] OK  frame={r.frame_index}  t={r.frame_time_ps:.3f} ps  "
+                                f"pocket={r.pocket_id}  IE={ie_str} kJ/mol"
+                            )
+                            best = top_heap.current_best()
+                            if best is not None and args.top_k > 0:
+                                e_rank = _energy_for_topk_ranking(best)
+                                prev = rolling_best_energy[0]
+                                if prev is None or e_rank < prev:
+                                    rolling_best_energy[0] = e_rank
+                                    if best.interaction_energy_kj_per_mol is not None:
+                                        top_e_str = (
+                                            f"IE={best.interaction_energy_kj_per_mol:.1f} kJ/mol"
+                                        )
+                                    else:
+                                        top_e_str = (
+                                            f"E_final={best.final_energy_kj_per_mol:.1f} kJ/mol "
+                                            "(no IE)"
+                                        )
+                                    print(
+                                        f"  [top-{args.top_k}] new best rank-1: {top_e_str} | "
+                                        f"frame={best.frame_index} pocket={best.pocket_id} "
+                                        f"conformer={best.conformer_id}"
+                                    )
                         else:
                             print(f"     Frame {r.frame_index} pocket {r.pocket_id} FAILED: {r.error}")
                             row = {
@@ -459,18 +517,16 @@ def main() -> None:
             except Exception as exc:
                 print(f"  [ERROR] Worker crashed processing frame: {exc}")
 
-        def frame_callback(frame: DynamicsFrame) -> None:
-            # 1. Save frame PDB immediately for user/PyMol
-            frame_dir = outdir / "frames"
-            frame_dir.mkdir(exist_ok=True)
-            (frame_dir / f"frame_{frame.frame_index:04d}.pdb").write_text(frame.protein_pdb_string)
-
-            # 2. Submit to worker pool
+        def submit_pipeline_job(
+            protein_pdb_string: str,
+            frame_index: int,
+            frame_time_ps: float,
+        ) -> None:
             future = executor.submit(
                 _process_frame_worker,
-                frame_index=frame.frame_index,
-                frame_time_ps=frame.simulation_time_ps,
-                protein_pdb_string=frame.protein_pdb_string,
+                frame_index=frame_index,
+                frame_time_ps=frame_time_ps,
+                protein_pdb_string=protein_pdb_string,
                 prepared_ligand=prepared_ligand,
                 pocket_score_threshold=args.pocket_score_threshold,
                 poses_per_pocket=args.poses_per_pocket,
@@ -483,6 +539,33 @@ def main() -> None:
                 dry_run=args.dry_run,
             )
             future.add_done_callback(on_frame_done)
+
+        # Force worker processes to spawn + import heavy deps before MD starts,
+        # so the first extracted frame is not delayed by cold-start cost.
+        print("  Pre-warming analysis worker processes …")
+        warmup_futures = [executor.submit(time.sleep, 0) for _ in range(num_workers)]
+        concurrent.futures.wait(warmup_futures)
+        print(f"  Worker pool ready ({num_workers} processes).")
+
+        # Run full pipeline on the input (pre-solvation) prepared protein concurrently with MD setup/run.
+        frame_dir = outdir / "frames"
+        frame_dir.mkdir(exist_ok=True)
+        (frame_dir / "frame_initial_input.pdb").write_text(initial_pdb_string)
+        print("  Submitted initial (pre-MD) protein to analysis pipeline (frame_index=-1).")
+        submit_pipeline_job(initial_pdb_string, frame_index=-1, frame_time_ps=0.0)
+
+        def frame_callback(frame: DynamicsFrame) -> None:
+            # 1. Save frame PDB immediately for user/PyMol
+            (frame_dir / f"frame_{frame.frame_index:04d}.pdb").write_text(
+                frame.protein_pdb_string
+            )
+
+            # 2. Submit to worker pool
+            submit_pipeline_job(
+                frame.protein_pdb_string,
+                frame_index=frame.frame_index,
+                frame_time_ps=frame.simulation_time_ps,
+            )
 
         dynamics_result: DynamicsResult = run_dynamics(
             args.protein_pdb,
@@ -522,34 +605,6 @@ def main() -> None:
     print("═" * 70)
 
     print(f"  Summary CSV     : {summary_csv_path}  ({len(all_rows)} rows)")
-
-    top_poses = top_heap.sorted_best()
-    if top_poses:
-        top_pdb_path = outdir / args.top_pdb
-        _write_multimodel_pdb(top_pdb_path, top_poses)
-        print(f"  Top-{args.top_k} PDB      : {top_pdb_path}  ({len(top_poses)} models)")
-
-        for rank, r in enumerate(top_poses, start=1):
-            ie_tag = (
-                f"{r.interaction_energy_kj_per_mol:.1f}"
-                if r.interaction_energy_kj_per_mol is not None
-                else "noE"
-            )
-            fname = (
-                f"top{rank:02d}_frame{r.frame_index:04d}_"
-                f"pocket{r.pocket_id:03d}_"
-                f"ie{ie_tag.replace('-', 'n')}_kJmol.pdb"
-            )
-            (outdir / fname).write_text(r.minimized_complex_pdb)
-            print(f"  Written         : {outdir / fname}")
-    else:
-        print("  No successful poses – nothing to write.")
-
-    if dynamics_result.trajectory_dcd:
-        print(f"  Trajectory DCD  : {dynamics_result.trajectory_dcd}")
-        print(f"  Topology PDB    : {dynamics_result.topology_pdb}")
-
-    print("\n  Done.")
 
     top_poses = top_heap.sorted_best()
     if top_poses:
@@ -781,6 +836,12 @@ def _local_minimize(
 # ─────────────────────────────────────────────────────────────────────────────
 # I/O helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _energy_for_topk_ranking(r: _FramePoseResult) -> float:
+    """Scalar used for top-k ordering (must match _TopKHeap.push)."""
+    v = r.interaction_energy_kj_per_mol
+    return v if v is not None else r.final_energy_kj_per_mol
+
 
 _FIELDNAMES = [
     "status", "frame_index", "frame_time_ps",
