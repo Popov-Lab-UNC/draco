@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
 from dataclasses import dataclass
@@ -234,6 +236,107 @@ def load_prepared_ligand(
 ) -> PreparedLigand:
     path = Path(input_path)
     return PreparedLigand.from_dict(json.loads(path.read_text()))
+
+
+def load_compound_csv(
+    csv_path: str | os.PathLike[str],
+    *,
+    num_conformers: int = 20,
+    prune_rms_threshold: float = 0.5,
+    random_seed: int = 0xF00D,
+) -> tuple[list[PreparedLigand], list[PreparedLigand]]:
+    """Load a compound CSV and return (actives, inactives) as PreparedLigands.
+
+    CSV format (required columns):
+        name,smiles,active
+        compound_A,CCOc1ccc(...)cc1,1
+        inactive_1,CCCCCC,0
+
+    - ``name``: compound identifier
+    - ``smiles``: SMILES string
+    - ``active``: 1 = active, 0 = inactive
+
+    Parameters
+    ----------
+    csv_path:
+        Path to the CSV file.
+    num_conformers / prune_rms_threshold / random_seed:
+        Forwarded to ``prepare_ligand_from_smiles``.
+
+    Returns
+    -------
+    tuple[list[PreparedLigand], list[PreparedLigand]]
+        ``(actives, inactives)``
+
+    Raises
+    ------
+    ValueError
+        If required columns are missing or a SMILES cannot be parsed.
+    """
+    path = Path(csv_path)
+    actives: list[PreparedLigand] = []
+    inactives: list[PreparedLigand] = []
+
+    with path.open(newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        required = {"name", "smiles", "active"}
+        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+            raise ValueError(
+                f"Compound CSV {path} must have columns: {required}. "
+                f"Found: {reader.fieldnames}"
+            )
+        for row in reader:
+            name = row["name"].strip()
+            smiles = row["smiles"].strip()
+            is_active = str(row["active"]).strip() in ("1", "true", "True", "yes")
+            prepared = prepare_ligand_from_smiles(
+                smiles,
+                name=name,
+                num_conformers=num_conformers,
+                prune_rms_threshold=prune_rms_threshold,
+                random_seed=random_seed,
+            )
+            if is_active:
+                actives.append(prepared)
+            else:
+                inactives.append(prepared)
+
+    return actives, inactives
+
+
+def write_ligand_sdf(
+    prepared_ligand: PreparedLigand,
+    output_path: str | os.PathLike[str],
+) -> Path:
+    """Write all conformers of a PreparedLigand to a multi-entry SDF file.
+
+    GNINA reads multi-conformer SDF natively; each conformer is written as a
+    separate SDF entry so GNINA can choose the best starting pose.
+
+    Parameters
+    ----------
+    prepared_ligand:
+        A ``PreparedLigand`` with one or more conformers.
+    output_path:
+        Path to write the output ``.sdf`` file.
+
+    Returns
+    -------
+    Path
+        The resolved path of the written file.
+    """
+    out = Path(output_path)
+    sdf_parts: list[str] = []
+    for conformer in prepared_ligand.conformers:
+        # mol_block is already a V2000 MOL block; just append the SDF separator
+        block = conformer.mol_block.strip()
+        if not block.endswith("M  END"):
+            # Ensure M  END is present
+            block = block + "\nM  END"
+        sdf_parts.append(block + "\n$$$$\n")
+
+    out.write_text("".join(sdf_parts))
+    return out
 
 
 def conformer_to_pdb_block(

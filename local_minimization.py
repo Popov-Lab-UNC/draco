@@ -26,9 +26,10 @@ except ImportError:  # pragma: no cover
         Simulation,
     )
 
-
 KCAL_PER_MOL_A2_TO_KJ_PER_MOL_NM2 = 418.4
 
+# Cache for OpenMM template generator to avoid repeating AM1-BCC parameterization on the same ligand.
+_TEMPLATE_GENERATOR_CACHE = {}
 
 @dataclass(frozen=True)
 class LocalMinimizationResult:
@@ -396,13 +397,17 @@ def _register_ligand_template(
     AMBER ff14SB.  Falls back to GAFF-2.11 if openff-toolkit is unavailable.
 
     """
+    cache_key = openff_forcefield
+    if cache_key in _TEMPLATE_GENERATOR_CACHE:
+        forcefield.registerTemplateGenerator(_TEMPLATE_GENERATOR_CACHE[cache_key].generator)
+        return
+
     ligand_mol = Chem.MolFromMolBlock(overlay_result.conformer.mol_block, removeHs=False)
     if ligand_mol is None:
         raise ValueError("Failed to build RDKit molecule from ligand mol_block")
 
-    conf = ligand_mol.GetConformer()
-    for idx, xyz in enumerate(overlay_result.transformed_all_atom_coords):
-        conf.SetAtomPosition(int(idx), tuple(float(v) for v in xyz))
+    # The Generator only cares about the topology + charges of the molecule to generate the template XML.
+    # Therefore, we only need to construct it once per ligand, not once for every conformer's 3D coordinates.
 
     try:
         from openff.toolkit.topology import Molecule  # type: ignore
@@ -413,6 +418,7 @@ def _register_ligand_template(
             molecules=[off_mol],
             forcefield=openff_forcefield,
         )
+        _TEMPLATE_GENERATOR_CACHE[cache_key] = generator
         forcefield.registerTemplateGenerator(generator.generator)
         return
     except Exception as exc:
@@ -425,6 +431,7 @@ def _register_ligand_template(
 
         off_mol = Molecule.from_rdkit(ligand_mol, allow_undefined_stereo=True)
         generator = GAFFTemplateGenerator(molecules=[off_mol], forcefield="gaff-2.11")
+        _TEMPLATE_GENERATOR_CACHE["gaff-2.11"] = generator
         forcefield.registerTemplateGenerator(generator.generator)
         return
     except Exception as exc:

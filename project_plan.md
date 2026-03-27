@@ -44,17 +44,17 @@ Bowman et al. (2026) recently benchmarked AI-based methods (AlphaFlow, BioEmu, P
 
 ---
 
-### The Alpha-Sphere Pipeline (Primary Method)
+### The Alpha-Sphere + GNINA Docking Pipeline (Primary Method)
 
-This is the core method for Paper 1. It uses fast, pure geometry to screen MD conformations against SAR data without running expensive docking at every frame.
+This is the core method for Paper 1. It combines physics-based conformational sampling with fast GPU-accelerated docking to identify SAR-consistent protein conformations and validated binding poses.
 
 #### Overview
 
-The pipeline has **two parallel preparation tracks** that converge at a **geometric matching step**:
+The pipeline has **two parallel preparation tracks** that converge at a **docking step**:
 
-- **Track A (Protein side):** Run MD → extract frames → cluster → detect pockets via alpha-sphere tessellation → color spheres with physicochemical properties
-- **Track B (Ligand side):** Take active and inactive compounds → generate 3D conformers → extract pharmacophore point clouds (H-bond donors/acceptors, hydrophobes, aromatics, charges)
-- **Convergence:** For each clustered protein conformation, align the active pharmacophore clouds against the alpha-sphere pocket representation. Compute a SAR-discrimination score. Rank conformations.
+- **Track A (Protein side):** Run MD → extract frames → cluster → detect pockets via alpha-sphere tessellation → define docking boxes from pocket geometry
+- **Track B (Ligand side):** Take active and inactive compounds → prepare for docking (RDKit conformer generation → SDF output)
+- **Convergence:** For each (conformation, pocket) pair, dock all actives and inactives using GNINA (GPU-accelerated, CNN-scored docking). Compute SAR-discrimination scores from docking results. Rank conformations.
 
 #### Step 1: Conformational Sampling via Parallel MD
 
@@ -78,66 +78,64 @@ For each cluster centroid, run pocket detection using [Pocketeer](https://pocket
 
 This produces a set of alpha-sphere clouds for each conformation, where each cloud represents a potential binding pocket. A single Pocketeer call takes ~10–50 ms per frame, making it feasible to screen thousands of conformations.
 
-#### Step 3: Physicochemical Coloring of Alpha-Spheres
+#### Step 3: Docking Box Definition from Alpha-Sphere Geometry
 
-Raw alpha-spheres capture pocket geometry (shape/volume) but not chemistry. To enable pharmacophore matching, we map the surrounding protein environment onto each sphere:
+For each detected pocket, compute the docking box parameters directly from the alpha-sphere cloud:
 
-- For each alpha-sphere center, identify the protein atoms within a 4 Å shell
-- Classify the local environment as: **H-bond donor**, **H-bond acceptor**, **hydrophobic**, **aromatic**, **charged (+/-)**, or **mixed**
-- Assign a feature label to each sphere → produces a **colored 3D point cloud** that acts as a "pseudoligand" representing what a complementary ligand should look like at that position
+- **Center:** Centroid of the alpha-sphere centers
+- **Size:** Range of alpha-sphere coordinates along each axis + padding (~4 Å per side)
 
-#### Step 4: Ligand Pharmacophore Preparation
+This replaces the previous pharmacophore coloring step. The alpha-sphere cloud implicitly encodes the pocket shape and volume; the docking engine handles chemistry internally.
+
+> **Note:** Physicochemical coloring of alpha-spheres (H-bond donor/acceptor, hydrophobic, aromatic classification) is retained as an **interpretability layer** for downstream SAR explanation, but is no longer load-bearing for pose generation.
+
+#### Step 4: Ligand Preparation for Docking
 
 For the active and inactive compound sets:
 
-1. **Generate 3D conformers** using RDKit's ETKDG (e.g. 50 conformers per molecule)
-2. **Extract pharmacophore features** from each conformer: H-bond donors, H-bond acceptors, hydrophobic centroids, aromatic ring centers, positive/negative ionizable groups
-3. **Represent each conformer as a labeled 3D point cloud** (same feature vocabulary as the alpha-sphere coloring)
+1. **Generate 3D conformers** using RDKit's ETKDG (e.g. 20 conformers per molecule)
+2. **Write SDF files** for each compound (GNINA reads SDF/MOL2 natively)
+3. **Cache preparations** — this needs to be done once per compound series
 
-This needs to be done once and cached.
+#### Step 5: SAR-Discriminative Docking via GNINA
 
-#### Step 5: SAR-Discriminative Scoring (Enrichment-Based)
+For each (conformation, pocket) pair, dock **all** actives and inactives using [GNINA](https://github.com/gnina/gnina) (GPU-accelerated molecular docking with CNN rescoring):
 
-For each (conformation, pocket) pair, compute an **enrichment-based SAR-discrimination score**:
+1. **Docking:** For each compound, dock into the pocket defined by the alpha-sphere docking box. GNINA performs Monte Carlo sampling + local optimization, naturally respecting molecular topology (no ring-threading or steric violation artifacts).
 
-1. **Alignment:** For each ligand conformer, find the best rigid-body alignment of its pharmacophore point cloud to the colored alpha-sphere cloud using fast registration (Kabsch algorithm or KDTree nearest-neighbor matching). The alignment maximizes the number of feature-matched pairs (e.g. ligand H-bond donor ↔ pocket H-bond acceptor sphere) within a distance tolerance.
+2. **Scoring:** GNINA provides both a Vina-like empirical score and a CNN-based binding affinity prediction. Use the **CNN affinity score** as the primary ranking metric.
 
-2. **Fit score per molecule:** For each molecule *m*, take the best-scoring conformer alignment:
-   
-   `fit(m, conf) = Σ_i w_i · exp(-d_i² / 2σ²)`
-   
-   where *d_i* is the distance between matched pharmacophore feature *i* and its nearest complementary alpha-sphere, *w_i* weights by feature importance (e.g. H-bonds > hydrophobes), and *σ* controls the distance tolerance (~1.5 Å).
+3. **SAR-Discriminative Ranking:** For each conformation, rank all molecules (actives + inactives) by their best docking score. Compute the **AUC-ROC** or **Enrichment Factor at 1%**. A conformation is good if actives rank high (strong predicted binding) and inactives rank low.
 
-3. **Enrichment-based discrimination:** Rank all molecules (actives + inactives) by their fit scores. Compute the **AUC-ROC** or **Enrichment Factor at 1%** for the ranking. A conformation is good if actives rank high and inactives rank low.
+   `SAR_score(conf) = AUC( {dock_score(active_i, conf)}, {dock_score(inactive_j, conf)} )`
 
-   `SAR_score(conf) = AUC( {fit(active_i, conf)}, {fit(inactive_j, conf)} )`
+4. **Rank conformations** by SAR_score. The top-ranked conformations are those whose pocket geometry is maximally consistent with the SAR.
 
-4. **Rank conformations** by SAR_score. The top-ranked conformations are those whose pocket geometry is maximally consistent with the SAR — i.e., the pocket shape and chemistry complement the actives but not the inactives.
+**Performance estimate:** GNINA takes ~1–5 seconds per ligand per pocket on a GPU (`--exhaustiveness 8`). For 20 actives + 80 inactives × 100 conformations × 2 pockets/conformation ≈ 20,000–100,000 docking runs ≈ 11–55 GPU-hours, tractable on a cluster.
 
-#### Step 6: Local Protein Minimization Around Overlaid Ligand (OpenMM)
+#### Step 6: Final Protein-Ligand Relaxation (OpenMM)
 
-After selecting a high-scoring overlay pose for a given conformation, run a **local protein-ligand minimization** to relax steric clashes and sidechain geometry before expensive validation.
+After selecting the top-K (conformation, pose) pairs from the docking results, run a **local protein-ligand minimization** to produce physically relaxed structures suitable for downstream use.
 
-Recommended protocol:
+Protocol:
 
-1. **Build complex:** Place the overlaid ligand coordinates into the protein conformation selected by the geometric scoring stage.
-2. **Define a local shell:** Select protein atoms within ~6-10 A of any ligand atom as the flexible region.
-3. **Restrain the rest of the system:** Apply positional restraints (e.g. harmonic, 5-20 kcal/mol/A^2 equivalent) to protein atoms outside the shell so minimization remains local and does not distort global conformation.
-4. **Keep ligand near overlay pose:** Optionally apply weak restraints to ligand heavy atoms to preserve the intended pharmacophore alignment while allowing clash relief.
-5. **Energy minimize:** Use OpenMM (`LangevinIntegrator` + `Simulation.minimizeEnergy`) for short local relaxation (typically hundreds to a few thousand minimization iterations).
-6. **Quality checks:** Record minimized energy, ligand heavy-atom RMSD from the original overlay, and key contact preservation. Reject poses that drift excessively or lose critical SAR-defining contacts.
+1. **Build complex:** Combine the docked ligand pose from GNINA with the protein conformation.
+2. **Define a local shell:** Select protein atoms within ~6–10 Å of any ligand atom as the flexible region.
+3. **Restrain the rest of the system:** Apply positional restraints (e.g. harmonic, 5–20 kcal/mol/Å² equivalent) to protein atoms outside the shell so minimization remains local and does not distort global conformation.
+4. **Energy minimize:** Use OpenMM (`LangevinIntegrator` + `Simulation.minimizeEnergy`) for short local relaxation (hundreds to a few thousand iterations).
+5. **Quality checks:** Record minimized energy, ligand heavy-atom RMSD from the docked pose, and key contact preservation. Reject poses that drift excessively.
 
-This gives a physically relaxed structure that is still close to the geometry identified by SAR-discriminative overlay.
+Because the docked poses from GNINA are already sterically valid and chemically reasonable, this minimization step is gentle refinement — not clash resolution — and is unlikely to produce the topological artifacts (ring-threading, atom interpenetration) that plagued the previous overlay→minimization approach.
 
-#### Step 7: Validation via Full Docking
+#### Step 7: Validation & Comparison
 
-Take the top-K conformations (e.g. K = 5-10) and run full molecular docking (AutoDock-GPU or Vina) of all actives and inactives into each. Compute:
+Compute validation metrics on the top-K conformations:
 
-- AUC-ROC for active/inactive discrimination
+- AUC-ROC for active/inactive discrimination (from GNINA docking scores)
 - Enrichment factor at 1%, 5%, 10%
 - Comparison against baselines: rigid docking into the input structure, ensemble docking into multiple PDB conformers (if available), and blind pocket detection (Fpocket/Pocketeer on the apo structure alone)
 
-This validates whether the geometric triage correctly identified SAR-consistent conformations.
+This validates whether the pipeline correctly identified SAR-consistent conformations.
 
 ---
 
@@ -187,7 +185,7 @@ If more complex feature extraction is required, Geometric Deep Learning tools (l
 
 ---
 
-### Workflow Diagram: Core Alpha-Sphere Pipeline
+### Workflow Diagram: Alpha-Sphere + GNINA Pipeline
 
 ```mermaid
 flowchart TB
@@ -199,8 +197,7 @@ flowchart TB
 
     subgraph PREP["Ligand Preparation"]
         CONF_GEN["Generate 3D Conformers<br/>(RDKit ETKDG)"]
-        PHARM_ACT["Extract Pharmacophore<br/>Point Clouds - Actives"]
-        PHARM_INACT["Extract Pharmacophore<br/>Point Clouds - Inactives"]
+        SDF_OUT["Write SDF Files<br/>(GNINA input format)"]
     end
 
     subgraph MD_SAMPLING["Conformational Sampling"]
@@ -209,24 +206,22 @@ flowchart TB
         CLUSTER["On-the-Fly Clustering<br/>(RMSD-based, cross-replica)"]
     end
 
-    subgraph POCKET_DETECTION["Pocket Detection"]
+    subgraph POCKET_DETECTION["Pocket Detection + Docking Box"]
         POCKETEER["Run Pocketeer<br/>(Alpha-Sphere Tessellation)"]
-        FEAT["Physicochemical Coloring<br/>(H-bond, hydrophobic, aromatic)"]
+        DOCKBOX["Define Docking Boxes<br/>from Alpha-Sphere Cloud<br/>(centroid + extent + padding)"]
     end
 
-    subgraph SAR_SCORING["SAR-Discriminative Scoring"]
-        ALIGN_ACT["Align Active Pharmacophores<br/>to Alpha-Sphere Clouds"]
-        ALIGN_INACT["Align Inactive Pharmacophores<br/>to Alpha-Sphere Clouds"]
-        DISC_SCORE["Compute Discrimination Score<br/>AUC-ROC or Enrichment Factor"]
+    subgraph GNINA_DOCKING["GNINA Docking + SAR Scoring"]
+        DOCK_ACT["Dock Actives<br/>(GNINA, CNN + Vina scoring)"]
+        DOCK_INACT["Dock Inactives<br/>(GNINA, CNN + Vina scoring)"]
+        SAR_SCORE["Compute SAR Discrimination<br/>AUC-ROC on CNN Scores"]
         RANK["Rank Conformations<br/>by SAR Discrimination"]
     end
 
-    subgraph VALIDATION["Validation"]
-        TOP_CONF["Select Top-K<br/>Conformations"]
-        DOCK_ACT["Dock Actives<br/>(AutoDock-GPU / Vina)"]
-        DOCK_INACT["Dock Inactives<br/>(AutoDock-GPU / Vina)"]
-        AUC["Compute AUC /<br/>Enrichment Factor"]
-        COMPARE["Compare vs. Baselines<br/>(rigid apo, ensemble, IFD)"]
+    subgraph REFINEMENT["Final Relaxation"]
+        TOP_CONF["Select Top-K<br/>(conformation, pose) pairs"]
+        MINIMIZE["Local Protein-Ligand<br/>Minimization (OpenMM)"]
+        QC["Quality Checks<br/>(energy, contacts, RMSD)"]
     end
 
     subgraph OUTPUTS["Outputs"]
@@ -238,35 +233,41 @@ flowchart TB
 
     ACTIVES --> CONF_GEN
     INACTIVES --> CONF_GEN
-    CONF_GEN --> PHARM_ACT
-    CONF_GEN --> PHARM_INACT
+    CONF_GEN --> SDF_OUT
 
     PDB --> MD
     MD --> FRAMES
     FRAMES --> CLUSTER
     CLUSTER --> POCKETEER
-    POCKETEER --> FEAT
+    POCKETEER --> DOCKBOX
 
-    PHARM_ACT --> ALIGN_ACT
-    PHARM_INACT --> ALIGN_INACT
-    FEAT --> ALIGN_ACT
-    FEAT --> ALIGN_INACT
-    ALIGN_ACT --> DISC_SCORE
-    ALIGN_INACT --> DISC_SCORE
-    DISC_SCORE --> RANK
+    SDF_OUT --> DOCK_ACT
+    SDF_OUT --> DOCK_INACT
+    DOCKBOX --> DOCK_ACT
+    DOCKBOX --> DOCK_INACT
+    DOCK_ACT --> SAR_SCORE
+    DOCK_INACT --> SAR_SCORE
+    SAR_SCORE --> RANK
 
     RANK --> TOP_CONF
-    TOP_CONF --> DOCK_ACT
-    TOP_CONF --> DOCK_INACT
-    DOCK_ACT --> AUC
-    DOCK_INACT --> AUC
-    AUC --> COMPARE
+    TOP_CONF --> MINIMIZE
+    MINIMIZE --> QC
 
-    TOP_CONF --> BEST_CONF
+    QC --> BEST_CONF
     DOCK_ACT --> POSES
-    COMPARE --> EXPLAIN
+    SAR_SCORE --> EXPLAIN
     BEST_CONF --> RECEPTOR
 ```
+
+### Deprecated Steps (retained for reference / interpretability)
+
+The following components from the original pipeline have been deprecated for pose generation but may still be used for interpretability and SAR explanation:
+
+- **Physicochemical Coloring of Alpha-Spheres** (`pocket_coloring.py`): Mapping protein environment features onto alpha-sphere clouds. Useful for explaining *why* a pocket discriminates actives from inactives, but no longer needed for the docking workflow.
+- **Pharmacophore Overlay** (`overlay.py`): Rigid-body alignment of ligand pharmacophore clouds to alpha-sphere clouds. Replaced by GNINA docking which performs proper conformational search.
+- **Local Minimization** (`local_minimization.py`): OpenMM minimization of overlaid poses. The overlay→minimize approach produced topological artifacts (ring-threading, atom interpenetration) because energy minimization cannot resolve topological violations. Now replaced by:
+  1. GNINA docking (which naturally avoids such artifacts via Monte Carlo sampling)
+  2. A final gentle minimization step applied only to physically valid docked poses
 
 ### Extended Vision: ML Feedback Loop (Future Work)
 
