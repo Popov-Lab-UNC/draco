@@ -86,8 +86,8 @@ from gnina_docking import (
     docking_box_from_pocket, dock_ligands_to_pocket,
 )
 from ligand_preparation import (
-    PreparedLigand, prepare_ligand_from_smiles,
-    load_compound_csv, write_ligand_sdf,
+    PreparedLigand, prepare_ligand_from_smiles, prepare_protonation_states,
+    load_compound_csv, write_ligand_sdf, write_ligands_for_docking,
 )
 from final_refinement import RefinementResult, refine_docked_pose
 from sar_scoring import SARScoreResult, compute_sar_discrimination
@@ -269,9 +269,10 @@ def _dock_frame_worker(
     frame_time_ps: float,
     protein_pdb_path: str,       # path to temp PDB file for this frame
     protein_pdb_string: str,     # PDB text (kept for passing forward)
-    ligand_sdf_paths: dict[str, str],  # {name: sdf_path_str}
-    active_names: list[str],
-    inactive_names: list[str],
+    ligand_sdf_paths: dict[str, str],  # {state_name: sdf_path_str}
+    name_map: dict[str, str],          # {state_name: parent_ligand_name}
+    active_names: list[str],           # parent-level active names
+    inactive_names: list[str],         # parent-level inactive names
     pocket_score_threshold: float,
     gnina_binary: str,
     exhaustiveness: int,
@@ -279,18 +280,22 @@ def _dock_frame_worker(
     cnn_scoring: str,
     gnina_seed: int,
     dry_run: bool,
+    gnina_output_dir: str | None = None,
 ) -> list[_FramePoseResult]:
     """Worker: Detect pockets, dock all ligands with GNINA, compute SAR score.
 
-    Returns one _FramePoseResult per (pocket, best_ligand) pair.
-    In CSV (SAR) mode: ranked by AUC-ROC over actives vs inactives.
-    In single-compound mode: ranked by CNN affinity of that compound.
+    All protonation states of each parent ligand are docked. Scores are
+    aggregated to report the **best score per parent ligand** for SAR
+    discrimination and single-compound ranking.
+
+    Returns one _FramePoseResult per (pocket, parent_ligand) pair.
     """
     import io, tempfile
     import biotite.structure.io.pdb as _biotite_pdb
     import pocketeer as pt
     from gnina_docking import docking_box_from_pocket, dock_ligands_to_pocket
     from sar_scoring import compute_sar_discrimination
+    from gnina_docking import PocketDockResult
 
     if dry_run:
         return []
@@ -316,15 +321,27 @@ def _dock_frame_worker(
     results: list[_FramePoseResult] = []
     sar_mode = bool(active_names or inactive_names)
 
+    # Build the set of state-level active/inactive names from the name_map
+    active_state_names = {sn for sn, pn in name_map.items() if pn in set(active_names)}
+    inactive_state_names = {sn for sn, pn in name_map.items() if pn in set(inactive_names)}
+
     for pocket_idx, pocket in enumerate(pockets):
         pocket_id = int(getattr(pocket, "pocket_id", pocket_idx))
         pocket_score = float(getattr(pocket, "score", 0.0))
+
+        # Create per-pocket output dir for GNINA
+        if gnina_output_dir:
+            pocket_out = __import__('pathlib').Path(gnina_output_dir) / f"frame{frame_index:04d}_pocket{pocket_id}"
+            pocket_out.mkdir(parents=True, exist_ok=True)
+            out_dir_str = str(pocket_out)
+        else:
+            out_dir_str = None
+
         try:
             box = docking_box_from_pocket(pocket)
-            ligand_paths = {name: path for name, path in ligand_sdf_paths.items()}
             pocket_dock = dock_ligands_to_pocket(
                 protein_pdb_path,
-                {n: __import__('pathlib').Path(p) for n, p in ligand_paths.items()},
+                {n: __import__('pathlib').Path(p) for n, p in ligand_sdf_paths.items()},
                 box,
                 pocket_id=pocket_id,
                 gnina_binary=gnina_binary,
@@ -333,6 +350,8 @@ def _dock_frame_worker(
                 cnn_scoring=cnn_scoring,
                 seed=gnina_seed,
                 cpu=1,
+                output_dir=out_dir_str,
+                write_gnina_logs=True,
             )
         except Exception as exc:
             import traceback
@@ -344,24 +363,51 @@ def _dock_frame_worker(
             ))
             continue
 
+        # ── Aggregate best score per parent ligand ─────────────────────────
+        # pocket_dock.results keys are state-level names (e.g. "LIG_s0").
+        # We group by parent name and pick the best CNN affinity per parent.
+        parent_best: dict[str, tuple[float, float]] = {}  # parent -> (best_cnn, best_vina)
+        for state_name, poses in pocket_dock.results.items():
+            if not poses:
+                continue
+            parent = name_map.get(state_name, state_name)
+            best_cnn = poses[0].cnn_affinity
+            best_vina = poses[0].vina_score
+            if parent not in parent_best or best_cnn < parent_best[parent][0]:
+                parent_best[parent] = (best_cnn, best_vina)
+
         if sar_mode:
-            # One result per pocket summarising the SAR score
+            # Build a virtual PocketDockResult with best-per-parent scores
+            # for SAR discrimination. We create a synthetic results dict
+            # mapping parent names to the best poses from any state.
+            parent_results: dict[str, list] = {}
+            for state_name, poses in pocket_dock.results.items():
+                parent = name_map.get(state_name, state_name)
+                if parent not in parent_results:
+                    parent_results[parent] = []
+                parent_results[parent].extend(poses)
+
+            # Build a synthetic PocketDockResult for SAR scoring at parent level
+            parent_dock = PocketDockResult(
+                pocket_id=pocket_id,
+                docking_box=box,
+                results=parent_results,
+            )
             sar = compute_sar_discrimination(
                 frame_index=frame_index,
-                pocket_result=pocket_dock,
+                pocket_result=parent_dock,
                 active_names=set(active_names),
                 inactive_names=set(inactive_names),
                 score_key="cnn_affinity",
             )
             # Best-scoring active as the representative pose
             best_active = min(
-                active_names,
-                key=lambda n: pocket_dock.best_score(n, "cnn_affinity"),
+                [n for n in active_names if n in parent_best],
+                key=lambda n: parent_best[n][0],
                 default="",
             )
-            best_poses = pocket_dock.results.get(best_active, [])
-            best_cnn = best_poses[0].cnn_affinity if best_poses else 0.0
-            best_vina = best_poses[0].vina_score if best_poses else 0.0
+            best_cnn = parent_best.get(best_active, (0.0, 0.0))[0]
+            best_vina = parent_best.get(best_active, (0.0, 0.0))[1]
             results.append(_FramePoseResult(
                 frame_index=frame_index, frame_time_ps=frame_time_ps,
                 pocket_id=pocket_id, pocket_score=pocket_score,
@@ -371,17 +417,13 @@ def _dock_frame_worker(
                 status="ok",
             ))
         else:
-            # Single compound mode: one result per pocket
-            all_names = list(ligand_sdf_paths.keys())
-            for name in all_names:
-                best_poses = pocket_dock.results.get(name, [])
-                if not best_poses:
-                    continue
+            # Single compound mode: one result per pocket per parent ligand
+            for parent, (best_cnn, best_vina) in parent_best.items():
                 results.append(_FramePoseResult(
                     frame_index=frame_index, frame_time_ps=frame_time_ps,
-                    pocket_id=pocket_id, pocket_score=pocket_score, ligand_name=name,
-                    cnn_affinity=best_poses[0].cnn_affinity,
-                    vina_score=best_poses[0].vina_score,
+                    pocket_id=pocket_id, pocket_score=pocket_score, ligand_name=parent,
+                    cnn_affinity=best_cnn,
+                    vina_score=best_vina,
                     auc_roc=None, status="ok",
                 ))
 
@@ -462,29 +504,40 @@ def main() -> None:
     print(f"\n[2/4]  Preparing ligands …")
     ligands_dir = outdir / "ligands"
     ligands_dir.mkdir(exist_ok=True)
+    gnina_output_dir = outdir / "gnina_output"
+    gnina_output_dir.mkdir(exist_ok=True)
+
+    # name_map: state_name → parent_ligand_name
+    name_map: dict[str, str] = {}
 
     if args.compound_csv:
-        actives, inactives = load_compound_csv(
-            args.compound_csv, num_conformers=args.num_conformers
+        actives, inactives, name_map = load_compound_csv(
+            args.compound_csv, num_conformers=args.num_conformers,
         )
         all_compounds = actives + inactives
-        active_names = [l.name for l in actives]
-        inactive_names = [l.name for l in inactives]
-        print(f"  Loaded {len(actives)} actives, {len(inactives)} inactives from {args.compound_csv}")
+        # active_names / inactive_names are PARENT-level names
+        active_names = sorted({name_map[l.name] for l in actives})
+        inactive_names = sorted({name_map[l.name] for l in inactives})
+        n_act_states = len(actives)
+        n_inact_states = len(inactives)
+        print(f"  Loaded {len(active_names)} actives ({n_act_states} states), "
+              f"{len(inactive_names)} inactives ({n_inact_states} states) from {args.compound_csv}")
     else:
-        single = prepare_ligand_from_smiles(
-            args.ligand_smiles, name=args.ligand_name, num_conformers=args.num_conformers
+        states = prepare_protonation_states(
+            args.ligand_smiles, name=args.ligand_name,
+            num_conformers=args.num_conformers,
         )
-        all_compounds = [single]
+        all_compounds = states
+        for s in states:
+            name_map[s.name] = args.ligand_name
         active_names = []
         inactive_names = []
-        print(f"  Single compound mode: {args.ligand_name} ({len(single.conformers)} conformers)")
+        n_confs = sum(len(s.conformers) for s in states)
+        print(f"  Single compound mode: {args.ligand_name} "
+              f"({len(states)} protonation state(s), {n_confs} total conformers)")
 
-    # Write SDF files once; pass paths to workers
-    ligand_sdf_paths: dict[str, str] = {}
-    for lig in all_compounds:
-        sdf_path = write_ligand_sdf(lig, ligands_dir / f"{lig.name}.sdf")
-        ligand_sdf_paths[lig.name] = str(sdf_path)
+    # Write SDF files once; pass absolute paths to workers
+    ligand_sdf_paths = write_ligands_for_docking(all_compounds, ligands_dir)
     print(f"  Written {len(ligand_sdf_paths)} SDF files to {ligands_dir}/")
 
     # Prepare initial protein structure
@@ -500,6 +553,8 @@ def main() -> None:
 
     # Tracks best ranking energy seen so far (more negative = better); updated when rank-1 improves.
     rolling_best_energy: list[float | None] = [None]
+    tasks_cv = threading.Condition()
+    active_tasks = [0]
 
     with concurrent.futures.ProcessPoolExecutor(
         max_workers=num_workers,
@@ -581,6 +636,7 @@ def main() -> None:
                     protein_pdb_path=protein_pdb_path,
                     protein_pdb_string=protein_pdb_string,
                     ligand_sdf_paths=ligand_sdf_paths,
+                    name_map=name_map,
                     active_names=active_names,
                     inactive_names=inactive_names,
                     pocket_score_threshold=args.pocket_score_threshold,
@@ -590,6 +646,7 @@ def main() -> None:
                     cnn_scoring=args.cnn_scoring,
                     gnina_seed=args.gnina_seed,
                     dry_run=args.dry_run,
+                    gnina_output_dir=str(gnina_output_dir),
                 )
                 future.add_done_callback(on_dock_done)
             except Exception:
@@ -725,7 +782,7 @@ def main() -> None:
                 f"pocket{r.pocket_id:03d}_"
                 f"ie{ie_tag.replace('-', 'n')}_kJmol.pdb"
             )
-            (outdir / fname).write_text(r.minimized_complex_pdb)
+            (outdir / fname).write_text(r.refined_complex_pdb)
             print(f"  Written         : {outdir / fname}")
     else:
         print("  No successful poses – nothing to write.")
@@ -981,30 +1038,6 @@ def _to_row(r: _FramePoseResult) -> dict[str, Any]:
     }
 
 
-def _error_row(
-    frame: DynamicsFrame,
-    pose: OverlayResult,
-    pocket_score: float,
-    error: str,
-) -> dict[str, Any]:
-    return {
-        "status": "error",
-        "frame_index": frame.frame_index,
-        "frame_time_ps": f"{frame.simulation_time_ps:.3f}",
-        "pocket_id": pose.pocket_id,
-        "pocket_score": f"{pocket_score:.3f}",
-        "gaussian_fit_score": f"{pose.gaussian_fit_score:.4f}",
-        "conformer_id": pose.conformer_id,
-        "initial_energy_kj_per_mol": "",
-        "final_energy_kj_per_mol": "",
-        "interaction_energy_kj_per_mol": "",
-        "ligand_heavy_atom_rmsd_angstrom": "",
-        "protein_atoms_flexible": "",
-        "protein_atoms_restrained": "",
-        "ligand_atoms_restrained": "",
-        "error": error,
-    }
-
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w", newline="") as fh:
@@ -1026,11 +1059,12 @@ def _write_multimodel_pdb(path: Path, results: list[_FramePoseResult]) -> None:
             f"FRAME {r.frame_index} "
             f"TIME_PS {r.frame_time_ps:.3f} "
             f"POCKET_ID {r.pocket_id} "
-            f"GAUSSIAN_FIT {r.gaussian_fit_score:.4f} "
+            f"CNN_AFFINITY {r.cnn_affinity:.4f} "
+            f"VINA_SCORE {r.vina_score:.4f} "
             f"INTERACTION_ENERGY_KJ_MOL {ie_str} "
             f"FINAL_ENERGY_KJ_MOL {r.final_energy_kj_per_mol:.2f}"
         )
-        for line in r.minimized_complex_pdb.splitlines():
+        for line in r.refined_complex_pdb.splitlines():
             if line.strip() in {"END", "ENDMDL", "MODEL"}:
                 continue
             lines.append(line)

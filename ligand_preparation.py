@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,8 @@ from rdkit.Chem import AllChem, ChemicalFeatures, rdMolDescriptors
 from rdkit.Chem.rdchem import Mol
 from rdkit.Chem.SaltRemover import SaltRemover
 from rdkit import RDConfig
+
+_log = logging.getLogger(__name__)
 
 # Instantiate globally to compile salt SMARTS patterns only once
 _SALT_REMOVER = SaltRemover()
@@ -171,6 +174,50 @@ class PreparedLigand:
         )
 
 
+def protonate_smiles(
+    smiles: str,
+    *,
+    ph_min: float = 6.4,
+    ph_max: float = 8.4,
+    max_variants: int = 8,
+    precision: float = 1.0,
+) -> list[str]:
+    """Generate protonation states of a SMILES at a given pH range using Dimorphite-DL.
+
+    Parameters
+    ----------
+    smiles:
+        Input SMILES string.
+    ph_min / ph_max:
+        pH range (default 6.4–8.4 for physiological).
+    max_variants:
+        Maximum number of protonation variants to return.
+    precision:
+        pKa precision for Dimorphite-DL (default 1.0).
+
+    Returns
+    -------
+    list[str]
+        List of protonated SMILES strings. If Dimorphite-DL fails or returns
+        nothing, falls back to the original SMILES.
+    """
+    try:
+        from dimorphite_dl import protonate_smiles as _dimorphite_protonate
+        result = _dimorphite_protonate(
+            smiles,
+            ph_min=ph_min,
+            ph_max=ph_max,
+            max_variants=max_variants,
+            precision=precision,
+            label_states=False,
+        )
+        if result:
+            return list(result)
+    except Exception as exc:
+        _log.warning("Dimorphite-DL failed for '%s': %s. Using original SMILES.", smiles, exc)
+    return [smiles]
+
+
 def prepare_ligand_from_smiles(
     smiles: str,
     *,
@@ -196,6 +243,78 @@ def prepare_ligand_from_smiles(
         optimize=optimize,
         max_iterations=max_iterations,
     )
+
+
+def prepare_protonation_states(
+    smiles: str,
+    *,
+    name: str,
+    ph_min: float = 6.4,
+    ph_max: float = 8.4,
+    max_variants: int = 8,
+    num_conformers: int = 20,
+    prune_rms_threshold: float = 0.5,
+    random_seed: int = 0xF00D,
+    optimize: bool = True,
+    max_iterations: int = 200,
+) -> list[PreparedLigand]:
+    """Protonate a SMILES with Dimorphite-DL, then prepare each state.
+
+    Each protonation state gets its own ``PreparedLigand`` with a name like
+    ``'{name}_s0'``, ``'{name}_s1'``, etc.  If only one state is produced
+    the name is kept as-is (no suffix).
+
+    Parameters
+    ----------
+    smiles:
+        Input SMILES.
+    name:
+        Base compound name.
+    ph_min / ph_max / max_variants:
+        Forwarded to ``protonate_smiles``.
+    num_conformers / prune_rms_threshold / random_seed / optimize / max_iterations:
+        Forwarded to conformer generation.
+
+    Returns
+    -------
+    list[PreparedLigand]
+        One ``PreparedLigand`` per protonation state.
+    """
+    protonated = protonate_smiles(
+        smiles, ph_min=ph_min, ph_max=ph_max,
+        max_variants=max_variants,
+    )
+    results: list[PreparedLigand] = []
+    use_suffix = len(protonated) > 1
+    for idx, prot_smi in enumerate(protonated):
+        state_name = f"{name}_s{idx}" if use_suffix else name
+        try:
+            prep = prepare_ligand_from_smiles(
+                prot_smi,
+                name=state_name,
+                num_conformers=num_conformers,
+                prune_rms_threshold=prune_rms_threshold,
+                random_seed=random_seed,
+                optimize=optimize,
+                max_iterations=max_iterations,
+            )
+            results.append(prep)
+        except Exception as exc:
+            _log.warning(
+                "Failed to prepare protonation state %d ('%s') of '%s': %s",
+                idx, prot_smi, name, exc,
+            )
+    if not results:
+        # Fallback: prepare original SMILES without protonation
+        _log.warning("All protonation states failed for '%s'. Using original SMILES.", name)
+        results.append(prepare_ligand_from_smiles(
+            smiles, name=name,
+            num_conformers=num_conformers,
+            prune_rms_threshold=prune_rms_threshold,
+            random_seed=random_seed,
+            optimize=optimize, max_iterations=max_iterations,
+        ))
+    return results
 
 
 def prepare_ligand_from_file(
@@ -244,38 +363,43 @@ def load_compound_csv(
     num_conformers: int = 20,
     prune_rms_threshold: float = 0.5,
     random_seed: int = 0xF00D,
-) -> tuple[list[PreparedLigand], list[PreparedLigand]]:
-    """Load a compound CSV and return (actives, inactives) as PreparedLigands.
+    protonate: bool = True,
+    ph_min: float = 6.4,
+    ph_max: float = 8.4,
+) -> tuple[list[PreparedLigand], list[PreparedLigand], dict[str, str]]:
+    """Load a compound CSV and return (actives, inactives, name_map).
+
+    When ``protonate=True`` (default), each compound is protonated with
+    Dimorphite-DL, producing potentially multiple ``PreparedLigand`` objects
+    per row.  The returned ``name_map`` maps each state-level name (e.g.
+    ``'compound_A_s0'``) back to the parent compound name (``'compound_A'``).
 
     CSV format (required columns):
         name,smiles,active
         compound_A,CCOc1ccc(...)cc1,1
         inactive_1,CCCCCC,0
 
-    - ``name``: compound identifier
-    - ``smiles``: SMILES string
-    - ``active``: 1 = active, 0 = inactive
-
     Parameters
     ----------
     csv_path:
         Path to the CSV file.
     num_conformers / prune_rms_threshold / random_seed:
-        Forwarded to ``prepare_ligand_from_smiles``.
+        Forwarded to ligand preparation.
+    protonate:
+        If True, use Dimorphite-DL to enumerate protonation states.
+    ph_min / ph_max:
+        pH range for protonation (only used if ``protonate=True``).
 
     Returns
     -------
-    tuple[list[PreparedLigand], list[PreparedLigand]]
-        ``(actives, inactives)``
-
-    Raises
-    ------
-    ValueError
-        If required columns are missing or a SMILES cannot be parsed.
+    tuple[list[PreparedLigand], list[PreparedLigand], dict[str, str]]
+        ``(actives, inactives, name_map)``  where ``name_map`` maps
+        ``state_name → parent_name``.
     """
     path = Path(csv_path)
     actives: list[PreparedLigand] = []
     inactives: list[PreparedLigand] = []
+    name_map: dict[str, str] = {}  # state_name → parent_name
 
     with path.open(newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
@@ -289,19 +413,31 @@ def load_compound_csv(
             name = row["name"].strip()
             smiles = row["smiles"].strip()
             is_active = str(row["active"]).strip() in ("1", "true", "True", "yes")
-            prepared = prepare_ligand_from_smiles(
-                smiles,
-                name=name,
-                num_conformers=num_conformers,
-                prune_rms_threshold=prune_rms_threshold,
-                random_seed=random_seed,
-            )
-            if is_active:
-                actives.append(prepared)
-            else:
-                inactives.append(prepared)
 
-    return actives, inactives
+            if protonate:
+                states = prepare_protonation_states(
+                    smiles, name=name,
+                    ph_min=ph_min, ph_max=ph_max,
+                    num_conformers=num_conformers,
+                    prune_rms_threshold=prune_rms_threshold,
+                    random_seed=random_seed,
+                )
+            else:
+                states = [prepare_ligand_from_smiles(
+                    smiles, name=name,
+                    num_conformers=num_conformers,
+                    prune_rms_threshold=prune_rms_threshold,
+                    random_seed=random_seed,
+                )]
+
+            for prep in states:
+                name_map[prep.name] = name
+                if is_active:
+                    actives.append(prep)
+                else:
+                    inactives.append(prep)
+
+    return actives, inactives, name_map
 
 
 def write_ligand_sdf(
@@ -312,6 +448,9 @@ def write_ligand_sdf(
 
     GNINA reads multi-conformer SDF natively; each conformer is written as a
     separate SDF entry so GNINA can choose the best starting pose.
+
+    The molecule name (first line of each MOL block) is set to the ligand
+    name, and SD properties ``_Name`` and ``SMILES`` are included.
 
     Parameters
     ----------
@@ -326,17 +465,48 @@ def write_ligand_sdf(
         The resolved path of the written file.
     """
     out = Path(output_path)
-    sdf_parts: list[str] = []
+    writer = Chem.SDWriter(str(out))
     for conformer in prepared_ligand.conformers:
-        # mol_block is already a V2000 MOL block; just append the SDF separator
-        block = conformer.mol_block.strip()
-        if not block.endswith("M  END"):
-            # Ensure M  END is present
-            block = block + "\nM  END"
-        sdf_parts.append(block + "\n$$$$\n")
-
-    out.write_text("".join(sdf_parts))
+        mol = Chem.MolFromMolBlock(conformer.mol_block, removeHs=False)
+        if mol is None:
+            _log.warning(
+                "Failed to reconstruct mol from mol_block for conformer %d of '%s'. Skipping.",
+                conformer.conformer_id, prepared_ligand.name,
+            )
+            continue
+        mol.SetProp("_Name", prepared_ligand.name)
+        mol.SetProp("SMILES", prepared_ligand.canonical_smiles)
+        writer.write(mol)
+    writer.close()
     return out
+
+
+def write_ligands_for_docking(
+    compounds: list[PreparedLigand],
+    ligands_dir: str | os.PathLike[str],
+) -> dict[str, str]:
+    """Write all prepared ligands as SDF files for GNINA docking.
+
+    Parameters
+    ----------
+    compounds:
+        List of ``PreparedLigand`` objects (may include multiple protonation
+        states per parent compound).
+    ligands_dir:
+        Directory to write SDF files into.
+
+    Returns
+    -------
+    dict[str, str]
+        Mapping ``{state_name: absolute_sdf_path}``.
+    """
+    out_dir = Path(ligands_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, str] = {}
+    for lig in compounds:
+        sdf_path = write_ligand_sdf(lig, out_dir / f"{lig.name}.sdf")
+        paths[lig.name] = str(sdf_path.resolve())
+    return paths
 
 
 def conformer_to_pdb_block(

@@ -156,10 +156,13 @@ def _get_pocket_sphere_centers(pocket) -> npt.NDArray[np.float64]:
     Pocketeer may expose these via different attribute names depending on
     version; we try a few known names.
     """
-    # Pocketeer >= 0.3: pocket.sphere_centers (Å)
-    for attr in ("sphere_centers", "alpha_sphere_centers", "centers"):
+    # Pocketeer >= 0.3: pocket.sphere_centers (Å) or pocket.spheres (list of AlphaSphere)
+    for attr in ("sphere_centers", "alpha_sphere_centers", "centers", "spheres"):
         val = getattr(pocket, attr, None)
         if val is not None:
+            if attr == "spheres" and isinstance(val, list):
+                # val is list[AlphaSphere], each with a .center attribute (Å)
+                return np.stack([s.center for s in val], axis=0)
             arr = np.asarray(val, dtype=np.float64)
             if arr.ndim == 2 and arr.shape[1] == 3:
                 return arr
@@ -194,6 +197,8 @@ def dock_ligand(
     seed: int = 0,
     cpu: int = 1,
     timeout_seconds: int = 300,
+    output_dir: str | Path | None = None,
+    write_gnina_logs: bool = True,
 ) -> list[GninaDockResult]:
     """Dock a single ligand SDF into a pocket using GNINA.
 
@@ -224,6 +229,13 @@ def dock_ligand(
         Number of CPU threads for GNINA (default 1; GPU does the heavy work).
     timeout_seconds:
         Wall-clock timeout for the GNINA subprocess (default 300 s).
+    output_dir:
+        If provided, GNINA will write its output SDF into this directory and
+        (optionally) persist stdout/stderr logs there. If not provided, GNINA
+        is run in a temporary directory and outputs are discarded after parsing.
+    write_gnina_logs:
+        If True (default), write GNINA stdout/stderr to files when ``output_dir``
+        is provided.
 
     Returns
     -------
@@ -231,16 +243,37 @@ def dock_ligand(
         Docked poses, sorted best→worst by CNN affinity.
         Empty list if GNINA fails or produces no poses.
     """
-    protein_pdb_path = Path(protein_pdb_path)
-    ligand_sdf_path = Path(ligand_sdf_path)
+    protein_pdb_path = Path(protein_pdb_path).resolve()
+    ligand_sdf_path = Path(ligand_sdf_path).resolve()
     name = ligand_name or ligand_sdf_path.stem
 
     import shlex
     gnina_cmd = shlex.split(gnina_binary)
     _check_gnina(gnina_cmd[0])
 
-    with tempfile.TemporaryDirectory(prefix="draco_gnina_") as tmpdir:
-        out_sdf = Path(tmpdir) / "docked.sdf"
+    if output_dir is None:
+        tmp_ctx = tempfile.TemporaryDirectory(prefix="draco_gnina_")
+        workdir = Path(tmp_ctx.name).resolve()
+        cleanup_ctx = tmp_ctx
+    else:
+        cleanup_ctx = None
+        workdir = Path(output_dir).resolve()
+        workdir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        out_sdf = workdir / f"{name}.gnina.sdf"
+        stdout_path = workdir / f"{name}.gnina.stdout.log"
+        stderr_path = workdir / f"{name}.gnina.stderr.log"
+
+        # When running through Apptainer, we must bind-mount all directories
+        # that GNINA needs to read from or write to.
+        if _is_apptainer_cmd(gnina_cmd):
+            bind_dirs = _collect_bind_dirs(
+                protein_pdb_path, ligand_sdf_path, out_sdf,
+            )
+            # Insert --bind flags right after the Apptainer subcommand.
+            # The typical pattern is: apptainer run [--nv] [--bind ...] image.sif
+            gnina_cmd = _inject_apptainer_binds(gnina_cmd, bind_dirs)
 
         cmd = gnina_cmd + [
             "--receptor", str(protein_pdb_path),
@@ -257,7 +290,6 @@ def dock_ligand(
             "--cnn_scoring", cnn_scoring,
             "--seed", str(seed),
             "--cpu", str(cpu),
-            "--quiet",
         ]
 
         _log.debug("GNINA cmd: %s", " ".join(cmd))
@@ -278,19 +310,35 @@ def dock_ligand(
                 "Make sure gnina is installed and on PATH."
             )
 
+        if output_dir is not None and write_gnina_logs:
+            try:
+                stdout_path.write_text(proc.stdout or "")
+                stderr_path.write_text(proc.stderr or "")
+            except OSError as e:
+                _log.warning("Failed writing GNINA logs in '%s': %s", str(workdir), str(e))
+
         if proc.returncode != 0:
             err_str = proc.stderr[:500] if proc.stderr else ""
+            out_str = proc.stdout[:500] if proc.stdout else ""
             _log.warning(
-                "GNINA returned exit code %d for ligand '%s'.\nstderr: %s",
-                proc.returncode, name, err_str,
+                "GNINA returned exit code %d for ligand '%s'.\nstdout: %s\nstderr: %s",
+                proc.returncode, name, out_str, err_str,
             )
             return []
 
         if not out_sdf.exists() or out_sdf.stat().st_size == 0:
-            _log.warning("GNINA produced no output SDF for ligand '%s'", name)
+            _log.warning(
+                "GNINA produced no output SDF for ligand '%s'.\n"
+                "  cmd: %s\n  stdout: %s\n  stderr: %s",
+                name, " ".join(cmd),
+                (proc.stdout or "")[:300], (proc.stderr or "")[:300],
+            )
             return []
 
         return _parse_gnina_sdf(out_sdf.read_text(), ligand_name=name)
+    finally:
+        if cleanup_ctx is not None:
+            cleanup_ctx.cleanup()
 
 
 def dock_ligands_to_pocket(
@@ -397,9 +445,65 @@ def _check_gnina(gnina_binary: str) -> None:
     """Raise RuntimeError if the gnina binary is not findable."""
     import shlex
     binary = shlex.split(gnina_binary)[0]
+    # If using Apptainer, check for apptainer instead of gnina
+    if binary in ("apptainer", "singularity"):
+        if shutil.which(binary) is None:
+            raise RuntimeError(
+                f"Container runtime '{binary}' not found on PATH. "
+                "Load it with 'module load apptainer' or install it."
+            )
+        return
     if shutil.which(binary) is None and not Path(binary).is_file():
         raise RuntimeError(
             f"GNINA binary not found: '{binary}'. "
             "Install gnina (e.g. conda install -c conda-forge gnina) "
             "and make sure it is on PATH."
         )
+
+
+def _is_apptainer_cmd(cmd: list[str]) -> bool:
+    """Check if the command is an Apptainer/Singularity invocation."""
+    if not cmd:
+        return False
+    base = Path(cmd[0]).name
+    return base in ("apptainer", "singularity")
+
+
+def _collect_bind_dirs(*paths: Path) -> set[str]:
+    """Collect unique parent directories that need to be bind-mounted."""
+    dirs: set[str] = set()
+    for p in paths:
+        resolved = p.resolve()
+        parent = str(resolved.parent)
+        dirs.add(parent)
+    return dirs
+
+
+def _inject_apptainer_binds(
+    cmd: list[str],
+    bind_dirs: set[str],
+) -> list[str]:
+    """Insert --bind flags into an Apptainer command.
+
+    The command is expected to look like:
+        apptainer run [--nv] [existing-flags...] image.sif
+    We insert --bind flags before the .sif image path.
+    """
+    # Find the .sif file position
+    sif_idx = None
+    for i, tok in enumerate(cmd):
+        if tok.endswith(".sif"):
+            sif_idx = i
+            break
+
+    if sif_idx is None:
+        # Can't find .sif — just prepend bind flags after cmd[1] (the subcommand)
+        insert_at = 2 if len(cmd) > 1 else 1
+    else:
+        insert_at = sif_idx
+
+    bind_args: list[str] = []
+    for d in sorted(bind_dirs):
+        bind_args.extend(["--bind", d])
+
+    return cmd[:insert_at] + bind_args + cmd[insert_at:]
