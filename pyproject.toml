@@ -10,6 +10,9 @@ dependencies = [
     "py3Dmol",
 ]
 
+[project.scripts]
+draco = "draco.main:main"
+
 [tool.setuptools.packages.find]
 include = ["draco*"]
 

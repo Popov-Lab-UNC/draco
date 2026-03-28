@@ -17,7 +17,7 @@ try:
 except ImportError:  # pragma: no cover
     _PDBFIXER_AVAILABLE = False
 
-_DEFAULT_FORCEFIELD_FILES = ("amber14-all.xml", "amber14/tip3pfb.xml")
+from constants import DEFAULT_PH, DEFAULT_FORCEFIELD_FILES
 
 
 @dataclass(frozen=True)
@@ -33,8 +33,8 @@ def prepare_protein(
     protein_pdb_path: str | Path,
     *,
     add_hydrogens: bool = True,
-    ph: float = 7.4,
-    forcefield_files: tuple[str, ...] = _DEFAULT_FORCEFIELD_FILES,
+    ph: float = DEFAULT_PH,
+    forcefield_files: tuple[str, ...] = DEFAULT_FORCEFIELD_FILES,
 ) -> PreparedProtein:
     """Repair a protein PDB with PDBFixer and return a PreparedProtein.
 
