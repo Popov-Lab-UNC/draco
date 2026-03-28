@@ -7,14 +7,14 @@ from collections import defaultdict
 import numpy as np
 import numpy.typing as npt
 
-from draco.ligand_preparation import (
+from ligand_preparation import (
     LigandColorPoint,
     PocketAlignPoint,
     PreparedLigand,
     PreparedLigandConformer,
     SphereOverlapResult,
 )
-from deprecated.pocket_coloring import PocketColoring, FEATURE_COMPAT
+from pocket_coloring import PocketColoring, FEATURE_COMPAT
 
 # Private alias kept for readability in alignment helpers
 _PocketAlignPoint = PocketAlignPoint

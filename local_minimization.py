@@ -8,9 +8,9 @@ import numpy as np
 import numpy.typing as npt
 from rdkit import Chem
 
-from draco.ligand_preparation import conformer_to_pdb_block
-from deprecated.overlay import OverlayResult
-from draco.protein_preparation import PreparedProtein
+from ligand_preparation import conformer_to_pdb_block
+from overlay import OverlayResult
+from protein_preparation import PreparedProtein
 
 try:
     from openmm import CustomExternalForce, LangevinIntegrator, Platform, unit
