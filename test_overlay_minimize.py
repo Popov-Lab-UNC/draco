@@ -8,11 +8,11 @@ from typing import Any
 
 import pocketeer as pt
 
-from draco.ligand_preparation import prepare_ligand_from_smiles
-from deprecated.local_minimization import LocalMinimizationResult, minimize_overlay_pose
-from deprecated.overlay import OverlayResult, rank_ligand_over_pockets, rank_ligand_over_pockets_multi
-from deprecated.pocket_coloring import color_pockets
-from draco.protein_preparation import prepare_protein
+from ligand_preparation import prepare_ligand_from_smiles
+from local_minimization import LocalMinimizationResult, minimize_overlay_pose
+from overlay import OverlayResult, rank_ligand_over_pockets, rank_ligand_over_pockets_multi
+from pocket_coloring import color_pockets
+from protein_preparation import prepare_protein
 
 warnings.filterwarnings(
     "ignore",

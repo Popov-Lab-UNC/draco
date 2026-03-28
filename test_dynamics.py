@@ -1,4 +1,4 @@
-"""main.py – End-to-end Draco pipeline: MD + GNINA docking.
+"""test_dynamics.py – End-to-end Draco pipeline: MD + GNINA docking.
 
 Pipeline
 --------
@@ -37,13 +37,13 @@ Pipeline
                               └─────────────────────────┘
 
 Usage (SAR series mode):
-    draco \
+    pixi run python test_dynamics.py \\
         --protein-pdb 6pbc-prepared.pdb \\
         --compound-csv compounds.csv \\
         --output-dir dynamics_gnina_output
 
 Usage (single-compound mode):
-    draco \
+    pixi run python test_dynamics.py \\
         --protein-pdb 6pbc-prepared.pdb \\
         --ligand-smiles "CN(CC1(CC1)c1ccc(F)cc1)C(=O)..." \\
         --output-dir dynamics_gnina_single
@@ -53,6 +53,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 
 # Set thread limits BEFORE importing rdkit, numpy, openmm, py3dmol, pytorch etc.
 # Without this, 15 concurrent workers on 16 cores will spin up 15*16 = 240 threads,
@@ -69,34 +70,38 @@ import concurrent.futures
 import csv
 import heapq
 import io
+import threading
+import time
 import multiprocessing
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 
 from dynamics import DynamicsFrame, DynamicsResult, run_dynamics
 from gnina_docking import (
+    DockingBox, GninaDockResult, PocketDockResult,
     docking_box_from_pocket, dock_ligands_to_pocket,
 )
 from ligand_preparation import (
-    prepare_ligand_from_smiles,
+    PreparedLigand, prepare_ligand_from_smiles,
     load_compound_csv, write_ligand_sdf,
 )
-from final_refinement import refine_docked_pose
-from sar_scoring import compute_sar_discrimination
+from final_refinement import RefinementResult, refine_docked_pose
+from sar_scoring import SARScoreResult, compute_sar_discrimination
 from protein_preparation import PreparedProtein, prepare_protein
 
 import pocketeer as pt
 
 try:
-    from openmm import unit
-    from openmm.app import PDBFile
+    from openmm import LangevinMiddleIntegrator, Platform, unit
+    from openmm.app import ForceField, HBonds, Modeller, NoCutoff, PDBFile, Simulation
 except ImportError:  # pragma: no cover
-    from simtk.openmm import unit  # type: ignore
+    from simtk.openmm import LangevinMiddleIntegrator, Platform, unit  # type: ignore
     from simtk.openmm.app import (  # type: ignore
-        PDBFile,
+        ForceField, HBonds, Modeller, NoCutoff, PDBFile, Simulation,
     )
 
 warnings.filterwarnings(
@@ -168,12 +173,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protein-restraint-k",   type=float, default=10.0)
     parser.add_argument("--refine-iterations",     type=int,   default=500)
     parser.add_argument("--no-interaction-energy", action="store_true", default=False)
-
-    # ── Resources ─────────────────────────────────────────────────────────────
-    parser.add_argument("--n-cpus", type=int, default=None,
-                        help="Number of CPUs to use. Defaults to all available.")
-    parser.add_argument("--n-gpus", type=int, default=None,
-                        help="Number of GPUs to use. Defaults to 1 if available.")
 
     # ── Output ────────────────────────────────────────────────────────────────
     parser.add_argument("--top-k",   type=int, default=5)
@@ -256,6 +255,13 @@ class _TopKHeap:
 def _worker_init() -> None:
     """Initializer for ProcessPoolExecutor workers."""
     os.environ["OPENMM_CPU_THREADS"] = "1"
+    try:
+        import openmm
+        import rdkit
+        import pocketeer
+        import protein_preparation
+    except ImportError:
+        pass
 
 
 def _dock_frame_worker(
@@ -273,7 +279,6 @@ def _dock_frame_worker(
     cnn_scoring: str,
     gnina_seed: int,
     dry_run: bool,
-    worker_gpu_id: int | None = None,
 ) -> list[_FramePoseResult]:
     """Worker: Detect pockets, dock all ligands with GNINA, compute SAR score.
 
@@ -281,8 +286,11 @@ def _dock_frame_worker(
     In CSV (SAR) mode: ranked by AUC-ROC over actives vs inactives.
     In single-compound mode: ranked by CNN affinity of that compound.
     """
-    import io
+    import io, tempfile
     import biotite.structure.io.pdb as _biotite_pdb
+    import pocketeer as pt
+    from gnina_docking import docking_box_from_pocket, dock_ligands_to_pocket
+    from sar_scoring import compute_sar_discrimination
 
     if dry_run:
         return []
@@ -314,9 +322,6 @@ def _dock_frame_worker(
         try:
             box = docking_box_from_pocket(pocket)
             ligand_paths = {name: path for name, path in ligand_sdf_paths.items()}
-            if worker_gpu_id is not None:
-                os.environ["CUDA_VISIBLE_DEVICES"] = str(worker_gpu_id)
-
             pocket_dock = dock_ligands_to_pocket(
                 protein_pdb_path,
                 {n: __import__('pathlib').Path(p) for n, p in ligand_paths.items()},
@@ -393,6 +398,7 @@ def _refine_pose_worker(
     compute_ie: bool,
 ) -> _FramePoseResult:
     """Worker: Locally minimise one GNINA-docked pose with OpenMM."""
+    from final_refinement import refine_docked_pose
     ref = refine_docked_pose(
         protein_pdb_path,
         docked_sdf_block,
@@ -423,25 +429,14 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
 
     # ── Resource Allocation ──────────────────────────────────────────────────
-    if args.n_cpus is not None:
-        num_cpus = args.n_cpus
-    else:
-        num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
-
-    if args.n_gpus is not None:
-        num_gpus = args.n_gpus
-    else:
-        # Simple heuristic to detect GPUs, could be extended. Assuming 1 for now if CUDA is platform.
-        num_gpus = 1 if args.platform_name.upper() == "CUDA" else 0
-
+    num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
     # Dedicate 1 CPU for the main MD thread (which mainly orchestrates the GPU),
     # and the rest for parallel frame analysis on CPU.
     num_workers = max(1, num_cpus - 1)
 
     print("\n" + "═" * 70)
     print("CONCURRENT RESOURCE ALLOCATION")
-    print(f"  Available CPUs:            {num_cpus}")
-    print(f"  Available GPUs:            {num_gpus}")
+    print(f"  Available CPUs (Slurm/OS): {num_cpus}")
     print(f"  Main MD process:           Dedicating 1 CPU thread + 1 {args.platform_name} device")
     print(f"  Analysis Workers:          Dedicating {num_workers} processes (1 thread each)")
     print("═" * 70)
@@ -453,8 +448,6 @@ def main() -> None:
 
     # Shared state for analysis
     results_lock = threading.Lock()
-    tasks_cv = threading.Condition()
-    active_tasks = [0]
     top_heap = _TopKHeap(k=args.top_k)
     all_rows: list[dict[str, Any]] = []
     
@@ -466,7 +459,7 @@ def main() -> None:
     csv_fh.flush()
 
     # ── Ligand preparation ───────────────────────────────────────────────────
-    print("\n[2/4]  Preparing ligands …")
+    print(f"\n[2/4]  Preparing ligands …")
     ligands_dir = outdir / "ligands"
     ligands_dir.mkdir(exist_ok=True)
 
@@ -475,8 +468,8 @@ def main() -> None:
             args.compound_csv, num_conformers=args.num_conformers
         )
         all_compounds = actives + inactives
-        active_names = [lig.name for lig in actives]
-        inactive_names = [lig.name for lig in inactives]
+        active_names = [l.name for l in actives]
+        inactive_names = [l.name for l in inactives]
         print(f"  Loaded {len(actives)} actives, {len(inactives)} inactives from {args.compound_csv}")
     else:
         single = prepare_ligand_from_smiles(
@@ -502,7 +495,7 @@ def main() -> None:
     initial_pdb_string = _initial_buf.getvalue()
 
     print("\n" + "═" * 70)
-    print("[3/4]  Concurrent analysis")
+    print(f"[3/4]  Concurrent analysis")
     print("═" * 70)
 
     # Tracks best ranking energy seen so far (more negative = better); updated when rank-1 improves.
@@ -572,8 +565,6 @@ def main() -> None:
                     if active_tasks[0] == 0:
                         tasks_cv.notify_all()
 
-        # Helper to assign round-robin GPUs to workers
-        gpu_counter = [0]
         def submit_pipeline_job(
             protein_pdb_string: str,
             protein_pdb_path: str,
@@ -583,12 +574,6 @@ def main() -> None:
             with tasks_cv:
                 active_tasks[0] += 1
             try:
-                worker_gpu_id = None
-                if num_gpus > 0:
-                    with results_lock:
-                        worker_gpu_id = gpu_counter[0] % num_gpus
-                        gpu_counter[0] += 1
-
                 future = executor.submit(
                     _dock_frame_worker,
                     frame_index=frame_index,
@@ -605,7 +590,6 @@ def main() -> None:
                     cnn_scoring=args.cnn_scoring,
                     gnina_seed=args.gnina_seed,
                     dry_run=args.dry_run,
-                    worker_gpu_id=worker_gpu_id,
                 )
                 future.add_done_callback(on_dock_done)
             except Exception:
@@ -741,7 +725,7 @@ def main() -> None:
                 f"pocket{r.pocket_id:03d}_"
                 f"ie{ie_tag.replace('-', 'n')}_kJmol.pdb"
             )
-            (outdir / fname).write_text(r.refined_complex_pdb)
+            (outdir / fname).write_text(r.minimized_complex_pdb)
             print(f"  Written         : {outdir / fname}")
     else:
         print("  No successful poses – nothing to write.")
@@ -795,6 +779,160 @@ def _protein_from_pdb_string(pdb_string: str) -> PreparedProtein:
         Path(tmp_path).unlink(missing_ok=True)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-pose local minimization (no induced-fit)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _local_minimize(
+    *,
+    frame_protein: PreparedProtein,
+    overlay_result: OverlayResult,
+    shell_radius_angstrom: float,
+    protein_restraint_k: float,
+    ligand_restraint_k: float,
+    max_iterations: int,
+    platform_name: str,
+    cuda_precision: str,
+    compute_ie: bool,
+    protein_forcefield_files: tuple[str, ...] = ("amber14-all.xml", "amber14/tip3pfb.xml"),
+    openff_forcefield: str = "openff-2.3.0",
+    ligand_residue_name: str = "LIG",
+    temperature_kelvin: float = 300.0,
+    friction_per_ps: float = 1.0,
+    timestep_fs: float = 2.0,
+) -> LocalMinimizationResult:
+    """Run local energy minimization of one overlay pose at one MD frame.
+
+    No induced-fit MD — this keeps each frame analysis fast.
+    """
+    ligand_pdb = PDBFile(
+        io.StringIO(
+            conformer_to_pdb_block(
+                overlay_result.conformer,
+                overlay_result.transformed_all_atom_coords,
+                residue_name=ligand_residue_name,
+                chain_id="L",
+                residue_id=1,
+            )
+        )
+    )
+
+    modeller = Modeller(frame_protein.topology, frame_protein.positions)
+    modeller.add(ligand_pdb.topology, ligand_pdb.positions)
+
+    forcefield = ForceField(*protein_forcefield_files)
+    _register_ligand_template(
+        forcefield, overlay_result, openff_forcefield=openff_forcefield
+    )
+
+    system = forcefield.createSystem(
+        modeller.topology, nonbondedMethod=NoCutoff, constraints=HBonds
+    )
+
+    topo_atoms = list(modeller.topology.atoms())
+    positions_nm = np.asarray(
+        modeller.positions.value_in_unit(unit.nanometer), dtype=np.float64
+    )
+
+    ligand_idxs = [
+        a.index for a in topo_atoms if a.residue.name == ligand_residue_name
+    ]
+    if not ligand_idxs:
+        raise ValueError(f"Ligand residue '{ligand_residue_name}' not found in topology")
+
+    protein_idxs = [
+        a.index for a in topo_atoms
+        if a.residue.name != ligand_residue_name and a.element is not None
+    ]
+
+    restrained_prot, flexible_prot = _partition_protein_atoms_by_shell(
+        positions_nm=positions_nm,
+        protein_atom_indices=protein_idxs,
+        ligand_atom_indices=ligand_idxs,
+        shell_radius_angstrom=shell_radius_angstrom,
+    )
+    n_prot_restrained = _add_positional_restraints(
+        system=system, positions_nm=positions_nm,
+        atom_indices=restrained_prot,
+        k_kcal_per_mol_a2=protein_restraint_k,
+        k_param_name="k_protein_posres",
+    )
+    n_lig_restrained = _add_positional_restraints(
+        system=system, positions_nm=positions_nm,
+        atom_indices=ligand_idxs,
+        k_kcal_per_mol_a2=ligand_restraint_k,
+        k_param_name="k_ligand_posres",
+    )
+
+    integrator = LangevinMiddleIntegrator(
+        temperature_kelvin * unit.kelvin,
+        friction_per_ps / unit.picosecond,
+        timestep_fs * unit.femtoseconds,
+    )
+    try:
+        platform = Platform.getPlatformByName(platform_name)
+        props: dict[str, str] = {}
+        if platform_name.upper() in {"CUDA", "OPENCL"}:
+            props["Precision"] = cuda_precision
+        simulation = Simulation(modeller.topology, system, integrator, platform, props)
+    except Exception:
+        simulation = Simulation(modeller.topology, system, integrator)
+
+    simulation.context.setPositions(modeller.positions)
+
+    init_state = simulation.context.getState(getEnergy=True, getPositions=True)
+    init_energy = float(
+        init_state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+    )
+    init_pos_nm = np.asarray(
+        init_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+        dtype=np.float64,
+    )
+
+    simulation.minimizeEnergy(maxIterations=max_iterations)
+
+    final_state = simulation.context.getState(getEnergy=True, getPositions=True)
+    final_energy = float(
+        final_state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
+    )
+    final_pos_nm = np.asarray(
+        final_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
+        dtype=np.float64,
+    )
+
+    heavy_rel = list(overlay_result.conformer.heavy_atom_indices)
+    heavy_abs = [ligand_idxs[i] for i in heavy_rel if i < len(ligand_idxs)]
+    lig_rmsd = _rmsd(
+        init_pos_nm[heavy_abs] * 10.0,
+        final_pos_nm[heavy_abs] * 10.0,
+    )
+
+    ie: float | None = None
+    if compute_ie:
+        ie = _compute_interaction_energy(
+            simulation=simulation,
+            ligand_atom_indices=ligand_idxs,
+            protein_atom_indices=protein_idxs,
+            final_energy_kj_per_mol=final_energy,
+        )
+
+    final_out = io.StringIO()
+    PDBFile.writeFile(modeller.topology, final_state.getPositions(), final_out, keepIds=True)
+
+    return LocalMinimizationResult(
+        initial_energy_kj_per_mol=init_energy,
+        final_energy_kj_per_mol=final_energy,
+        ligand_heavy_atom_rmsd_angstrom=lig_rmsd,
+        protein_atoms_flexible=len(flexible_prot),
+        protein_atoms_restrained=n_prot_restrained,
+        ligand_atoms_restrained=n_lig_restrained,
+        minimized_positions_angstrom=final_pos_nm * 10.0,
+        minimized_complex_pdb=final_out.getvalue(),
+        interaction_energy_kj_per_mol=ie,
+        induced_fit_ligand_rmsd_angstrom=None,
+        induced_fit_final_energy_kj_per_mol=None,
+        induced_fit_complex_pdb=None,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -843,7 +981,29 @@ def _to_row(r: _FramePoseResult) -> dict[str, Any]:
     }
 
 
-# _error_row removed as it referenced deprecated OverlayResult
+def _error_row(
+    frame: DynamicsFrame,
+    pose: OverlayResult,
+    pocket_score: float,
+    error: str,
+) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "frame_index": frame.frame_index,
+        "frame_time_ps": f"{frame.simulation_time_ps:.3f}",
+        "pocket_id": pose.pocket_id,
+        "pocket_score": f"{pocket_score:.3f}",
+        "gaussian_fit_score": f"{pose.gaussian_fit_score:.4f}",
+        "conformer_id": pose.conformer_id,
+        "initial_energy_kj_per_mol": "",
+        "final_energy_kj_per_mol": "",
+        "interaction_energy_kj_per_mol": "",
+        "ligand_heavy_atom_rmsd_angstrom": "",
+        "protein_atoms_flexible": "",
+        "protein_atoms_restrained": "",
+        "ligand_atoms_restrained": "",
+        "error": error,
+    }
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -866,10 +1026,11 @@ def _write_multimodel_pdb(path: Path, results: list[_FramePoseResult]) -> None:
             f"FRAME {r.frame_index} "
             f"TIME_PS {r.frame_time_ps:.3f} "
             f"POCKET_ID {r.pocket_id} "
+            f"GAUSSIAN_FIT {r.gaussian_fit_score:.4f} "
             f"INTERACTION_ENERGY_KJ_MOL {ie_str} "
             f"FINAL_ENERGY_KJ_MOL {r.final_energy_kj_per_mol:.2f}"
         )
-        for line in r.refined_complex_pdb.splitlines():
+        for line in r.minimized_complex_pdb.splitlines():
             if line.strip() in {"END", "ENDMDL", "MODEL"}:
                 continue
             lines.append(line)
