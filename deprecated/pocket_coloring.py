@@ -9,7 +9,7 @@ import biotite.structure as struc  # type: ignore
 import numpy as np
 import numpy.typing as npt
 
-from ligand_preparation import (
+from draco.ligand_preparation import (
     LigandColorPoint,
     PocketAlignPoint,
     PreparedLigandConformer,

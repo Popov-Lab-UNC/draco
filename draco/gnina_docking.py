@@ -22,9 +22,7 @@ GNINA output SDF properties parsed:
 """
 from __future__ import annotations
 
-import io
 import logging
-import os
 import shutil
 import subprocess
 import tempfile
@@ -34,6 +32,13 @@ from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+
+from constants import (
+    DEFAULT_DOCKING_PADDING_ANGSTROM,
+    DEFAULT_DOCKING_MIN_SIZE_ANGSTROM,
+    DEFAULT_GNINA_BINARY,
+    DEFAULT_GNINA_TIMEOUT_SECONDS,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -112,8 +117,8 @@ class PocketDockResult:
 def docking_box_from_pocket(
     pocket,
     *,
-    padding_angstrom: float = 4.0,
-    min_size_angstrom: float = 15.0,
+    padding_angstrom: float = DEFAULT_DOCKING_PADDING_ANGSTROM,
+    min_size_angstrom: float = DEFAULT_DOCKING_MIN_SIZE_ANGSTROM,
 ) -> DockingBox:
     """Derive a GNINA docking box from a Pocketeer pocket object.
 
@@ -190,10 +195,10 @@ def dock_ligand(
     exhaustiveness: int = 8,
     num_modes: int = 9,
     cnn_scoring: str = "rescore",
-    gnina_binary: str = "gnina",
+    gnina_binary: str = DEFAULT_GNINA_BINARY,
     seed: int = 0,
     cpu: int = 1,
-    timeout_seconds: int = 300,
+    timeout_seconds: int = DEFAULT_GNINA_TIMEOUT_SECONDS,
 ) -> list[GninaDockResult]:
     """Dock a single ligand SDF into a pocket using GNINA.
 

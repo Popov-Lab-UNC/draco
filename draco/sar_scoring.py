@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Sequence
 
 import numpy as np
 import numpy.typing as npt

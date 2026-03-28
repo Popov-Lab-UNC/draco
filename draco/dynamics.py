@@ -94,25 +94,18 @@ except ImportError:  # pragma: no cover
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-KCAL_PER_MOL_A2_TO_KJ_PER_MOL_NM2: float = 418.4
-_DEFAULT_FORCEFIELD = ("amber14-all.xml", "amber14/tip3pfb.xml")
-_DEFAULT_WATER_MODEL = "tip3pfb"  # chemistry model; placement via Modeller (see below)
-
-# Ion / water residue names that should be excluded when identifying protein atoms.
-_SOLVENT_ION_RESNAMES: set[str] = {
-    "HOH", "WAT", "TIP3", "SPC", "T3P", "T4P", "T5P",
-    "NA", "CL", "Na+", "Cl-", "NA+", "CL-",
-    "K", "K+", "MG", "CA", "ZN", "FE",
-}
-
-# OpenMM Modeller.addSolvent only accepts tip3p, spce, tip4pew, tip5p, swm4ndp.
-# TIP3P-FB uses the same 3-site geometry as TIP3P; parameters come from the FF XML.
-_MODELLER_SOLVENT_MODEL_ALIASES: dict[str, str] = {"tip3pfb": "tip3p"}
+from constants import (
+    DEFAULT_FORCEFIELD_FILES,
+    DEFAULT_WATER_MODEL,
+    DEFAULT_PH,
+    SOLVENT_ION_RESNAMES,
+    MODELLER_SOLVENT_MODEL_ALIASES,
+)
 
 
 def _modeller_solvent_model(water_model: str) -> str:
     """Return the ``model=`` string required by ``Modeller.addSolvent``."""
-    return _MODELLER_SOLVENT_MODEL_ALIASES.get(water_model, water_model)
+    return MODELLER_SOLVENT_MODEL_ALIASES.get(water_model, water_model)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -180,7 +173,7 @@ class DynamicsResult:
 def run_dynamics(
     protein_pdb_path: str | Path,
     *,
-    ph: float = 7.4,
+    ph: float = DEFAULT_PH,
     # Solvation
     box_padding_nm: float = 1.0,
     ionic_strength_molar: float = 0.15,
@@ -201,8 +194,8 @@ def run_dynamics(
     # I/O
     output_dir: str | Path | None = None,
     save_trajectory: bool = True,
-    forcefield_files: tuple[str, ...] = _DEFAULT_FORCEFIELD,
-    water_model: str = _DEFAULT_WATER_MODEL,
+    forcefield_files: tuple[str, ...] = DEFAULT_FORCEFIELD_FILES,
+    water_model: str = DEFAULT_WATER_MODEL,
     frame_callback: Callable[[DynamicsFrame], None] | None = None,
     verbose: bool = True,
 ) -> DynamicsResult:
@@ -529,7 +522,7 @@ def _identify_protein_atoms(all_atoms: list) -> list[int]:
         if a.element is None:
             continue
         res_name = a.residue.name.strip().upper()
-        if res_name in _SOLVENT_ION_RESNAMES:
+        if res_name in SOLVENT_ION_RESNAMES:
             continue
         chain_id = a.residue.chain.id
         # OpenMM places water/ions on chain "W" or similar; skip if the
