@@ -29,7 +29,7 @@ cd /work/users/s/h/shuhang/draco
 OUTPUT_DIR="test_dynamics_output_2"
 
 pixi run draco \
-  --compile-results-only \
+  --steps pocket scoring \
   --protein-pdb        "6WAU.pdb" \
   --ligand-smiles      "BrC1=NN(C)C2=C1C(N3CC[C@@H](NC4CCC4)CCC3)=NC(N5CCC(F)(F)C5)=N2" \
   --gnina-binary       "apptainer run --nv /work/users/s/h/shuhang/gnina_build/gnina.sif" \
@@ -50,6 +50,5 @@ pixi run draco \
   --shell-radius-angstrom  8.0 \
   --protein-restraint-k    10.0 \
   --refine-iterations      500 \
-  --skip-refinement \
   --top-k 5 \
   --top-pdb "top5_poses.cif"

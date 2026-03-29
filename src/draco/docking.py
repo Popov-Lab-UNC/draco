@@ -1,10 +1,10 @@
-"""gnina_docking.py – GNINA docking wrapper for the Draco pipeline.
+"""docking.py – GNINA docking wrapper for the Draco pipeline.
 
 Role in the Pipeline
 --------------------
 Sits between Pocketeer pocket detection and SAR scoring:
 
-    dynamics.py → pocketeer → gnina_docking → sar_scoring → final_refinement
+    dynamics.py → pocketeer → docking → sar_scoring → final_refinement
 
 This module provides:
   1. DockingBox – derived from a Pocketeer pocket's alpha-sphere cloud.

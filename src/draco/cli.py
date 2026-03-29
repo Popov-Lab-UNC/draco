@@ -39,7 +39,7 @@ Pipeline
 Usage (SAR series mode):
     draco --protein-pdb 6pbc-prepared.pdb \\
         --compound-csv compounds.csv \\
-        --output-dir dynamics_gnina_output
+        --output-dir dynamics_docking_output
 
 Usage (single-compound mode):
     draco --protein-pdb 6pbc-prepared.pdb \\
@@ -79,7 +79,7 @@ from typing import Any
 import numpy as np
 
 from draco.dynamics import DynamicsFrame, DynamicsResult, run_dynamics
-from draco.gnina_docking import (
+from draco.docking import (
     DockingBox, GninaDockResult, PocketDockResult,
     docking_box_from_pocket, dock_ligands_to_pocket,
 )
@@ -131,7 +131,7 @@ def parse_args() -> argparse.Namespace:
         help="Single ligand SMILES. Poses ranked by CNN affinity (no SAR scoring)."
     )
     parser.add_argument("--ligand-name", default="LIG", help="Name for --ligand-smiles compound")
-    parser.add_argument("--output-dir",  default="dynamics_gnina_output")
+    parser.add_argument("--output-dir",  default="dynamics_docking_output")
     parser.add_argument("--ph",          type=float, default=7.4)
 
     # ── MD / dynamics ────────────────────────────────────────────────────────
@@ -179,12 +179,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protein-restraint-k",   type=float, default=10.0)
     parser.add_argument("--refine-iterations",     type=int,   default=500)
     parser.add_argument("--no-interaction-energy", action="store_true", default=False)
-    parser.add_argument(
-        "--skip-refinement",
-        action="store_true",
-        default=False,
-        help="Skip OpenMM refinement and write top poses directly from GNINA docking + frame PDB.",
-    )
 
     # ── Output ────────────────────────────────────────────────────────────────
     parser.add_argument("--top-k",   type=int, default=5)
@@ -192,9 +186,15 @@ def parse_args() -> argparse.Namespace:
 
     # ── Debug ─────────────────────────────────────────────────────────────────
     parser.add_argument("--dry-run",            action="store_true", default=False)
-    parser.add_argument("--analyze-frames-only", action="store_true", default=False)
-    parser.add_argument("--compile-results-only", action="store_true", default=False,
-                        help="Skip MD and docking. Compile top poses directly from existing GNINA output.")
+
+    # ── Steps ─────────────────────────────────────────────────────────────────
+    parser.add_argument(
+        "--steps",
+        nargs="+",
+        default=["dynamics", "pocket", "docking", "scoring", "refinement"],
+        choices=["dynamics", "pocket", "docking", "scoring", "refinement"],
+        help="Specify which steps of the pipeline to run. Defaults to all.",
+    )
     return parser.parse_args()
 
 
@@ -296,9 +296,9 @@ def _dock_frame_worker(
     cnn_scoring: str,
     gnina_seed: int,
     dry_run: bool,
-    gnina_output_dir: str | None = None,
+    docking_output_dir: str | None = None,
     gnina_timeout_seconds: int | None = None,
-    compile_results_only: bool = False,
+    steps: list[str] | None = None,
 ) -> list[_FramePoseResult]:
     """Worker: Detect pockets, dock all ligands with GNINA, compute SAR score.
 
@@ -311,30 +311,49 @@ def _dock_frame_worker(
     import io, tempfile
     import biotite.structure.io.pdb as _biotite_pdb
     import pocketeer as pt
-    from draco.gnina_docking import docking_box_from_pocket, dock_ligands_to_pocket
+    from draco.docking import docking_box_from_pocket, dock_ligands_to_pocket
     from draco.sar_scoring import compute_sar_discrimination
-    from draco.gnina_docking import PocketDockResult
+    from draco.docking import PocketDockResult
 
     if dry_run:
         return []
 
-    try:
-        frame_atomarray = _biotite_pdb.PDBFile.read(
-            io.StringIO(protein_pdb_string)
-        ).get_structure(model=1)
-        pockets = pt.find_pockets(frame_atomarray)
-        pockets = [p for p in pockets
-                   if float(getattr(p, "score", 0.0)) > pocket_score_threshold]
-        if not pockets:
-            return []
-    except Exception as exc:
-        import traceback
-        return [_FramePoseResult(
-            frame_index=frame_index, frame_time_ps=frame_time_ps,
-            pocket_id=-1, pocket_score=0.0, ligand_name="",
-            cnn_affinity=0.0, vina_score=0.0, auc_roc=None,
-            status="error", error=f"Pocketeer failed: {exc}\n{traceback.format_exc()}"
-        )]
+    if steps is None:
+        steps = ["dynamics", "pocket", "docking", "scoring", "refinement"]
+
+    pockets = []
+    if "pocket" in steps:
+        try:
+            frame_atomarray = _biotite_pdb.PDBFile.read(
+                io.StringIO(protein_pdb_string)
+            ).get_structure(model=1)
+            pockets = pt.find_pockets(frame_atomarray)
+            pockets = [p for p in pockets
+                       if float(getattr(p, "score", 0.0)) > pocket_score_threshold]
+            if not pockets:
+                return []
+        except Exception as exc:
+            import traceback
+            return [_FramePoseResult(
+                frame_index=frame_index, frame_time_ps=frame_time_ps,
+                pocket_id=-1, pocket_score=0.0, ligand_name="",
+                cnn_affinity=0.0, vina_score=0.0, auc_roc=None,
+                status="error", error=f"Pocketeer failed: {exc}\n{traceback.format_exc()}"
+            )]
+    else:
+        # If we skipped pockets but need to do docking, we can't really proceed
+        # unless docking is also skipped (meaning we just read results).
+        # Actually, if we just read results, we might need pocket info.
+        # But wait, if we are loading existing docking output, we still need pocket_id.
+        # Let's see how compile-results-only handled it: it still ran pt.find_pockets!
+        # Since pocketeer is fast, we will just error if they skip pocket but want docking/scoring
+        # without pockets. Actually, wait. If they skip pocket, how do we get pockets?
+        # We'll just run pocketeer if docking or scoring is requested, OR we can raise an error.
+        # Let's raise an error if they try to do docking or scoring without pockets.
+        if "docking" in steps or "scoring" in steps:
+            # Actually, the user requirement is: "throw error if something is not there, for example, the frames needed for pocket finding"
+            # We'll raise an error if pocket is missing but we are here.
+            raise ValueError("The 'pocket' step is required for 'docking' or 'scoring'.")
 
     results: list[_FramePoseResult] = []
     sar_mode = bool(active_names or inactive_names)
@@ -348,8 +367,8 @@ def _dock_frame_worker(
         pocket_score = float(getattr(pocket, "score", 0.0))
 
         # Create per-pocket output dir for GNINA
-        if gnina_output_dir:
-            pocket_out = __import__('pathlib').Path(gnina_output_dir) / f"frame{frame_index:04d}_pocket{pocket_id}"
+        if docking_output_dir:
+            pocket_out = __import__('pathlib').Path(docking_output_dir) / f"frame{frame_index:04d}_pocket{pocket_id}"
             pocket_out.mkdir(parents=True, exist_ok=True)
             out_dir_str = str(pocket_out)
         else:
@@ -358,16 +377,16 @@ def _dock_frame_worker(
         try:
             box = docking_box_from_pocket(pocket)
             
-            if compile_results_only and out_dir_str:
-                import draco.gnina_docking as gnina_docking
-                pocket_dock = gnina_docking.PocketDockResult(pocket_id=pocket_id, docking_box=box)
+            if "docking" not in steps and out_dir_str:
+                import draco.docking as docking
+                pocket_dock = docking.PocketDockResult(pocket_id=pocket_id, docking_box=box)
                 for name, sdf_path in ligand_sdf_paths.items():
                     out_sdf = Path(out_dir_str) / f"{name}.gnina.sdf"
                     if out_sdf.exists():
-                        pocket_dock.results[name] = gnina_docking._parse_gnina_sdf(out_sdf.read_text(), ligand_name=name)
+                        pocket_dock.results[name] = docking._parse_gnina_sdf(out_sdf.read_text(), ligand_name=name)
                     else:
                         pocket_dock.results[name] = []
-            else:
+            elif "docking" in steps:
                 pocket_dock = dock_ligands_to_pocket(
                     protein_pdb_path,
                     {n: __import__('pathlib').Path(p) for n, p in ligand_sdf_paths.items()},
@@ -383,6 +402,8 @@ def _dock_frame_worker(
                     output_dir=out_dir_str,
                     write_gnina_logs=True,
                 )
+            else:
+                pocket_dock = PocketDockResult(pocket_id=pocket_id, docking_box=box)
         except Exception as exc:
             import traceback
             results.append(_FramePoseResult(
@@ -424,13 +445,17 @@ def _dock_frame_worker(
                 docking_box=box,
                 results=parent_results,
             )
-            sar = compute_sar_discrimination(
-                frame_index=frame_index,
-                pocket_result=parent_dock,
-                active_names=set(active_names),
-                inactive_names=set(inactive_names),
-                score_key="cnn_affinity",
-            )
+            auc_roc = None
+            if "scoring" in steps:
+                sar = compute_sar_discrimination(
+                    frame_index=frame_index,
+                    pocket_result=parent_dock,
+                    active_names=set(active_names),
+                    inactive_names=set(inactive_names),
+                    score_key="cnn_affinity",
+                )
+                auc_roc = sar.auc_roc
+
             # Best-scoring active as the representative pose (highest pK)
             best_active = max(
                 [n for n in active_names if n in parent_best],
@@ -445,7 +470,7 @@ def _dock_frame_worker(
                 pocket_id=pocket_id, pocket_score=pocket_score,
                 ligand_name=best_active,
                 cnn_affinity=best_cnn, vina_score=best_vina,
-                auc_roc=sar.auc_roc,
+                auc_roc=auc_roc,
                 docked_sdf_block=best_sdf,
                 status="ok",
             ))
@@ -539,8 +564,8 @@ def main() -> None:
     print(f"\n[2/4]  Preparing ligands …")
     ligands_dir = outdir / "ligands"
     ligands_dir.mkdir(exist_ok=True)
-    gnina_output_dir = outdir / "gnina_output"
-    gnina_output_dir.mkdir(exist_ok=True)
+    docking_output_dir = outdir / "docking_output"
+    docking_output_dir.mkdir(exist_ok=True)
 
     # name_map: state_name → parent_ligand_name
     name_map: dict[str, str] = {}
@@ -683,9 +708,9 @@ def main() -> None:
                     cnn_scoring=args.cnn_scoring,
                     gnina_seed=args.gnina_seed,
                     dry_run=args.dry_run,
-                    gnina_output_dir=str(gnina_output_dir),
+                    docking_output_dir=str(docking_output_dir),
                     gnina_timeout_seconds=args.gnina_timeout_seconds,
-                    compile_results_only=args.compile_results_only,
+                    steps=args.steps,
                 )
                 future.add_done_callback(on_dock_done)
             except Exception:
@@ -702,8 +727,8 @@ def main() -> None:
         # bottleneck, resulting in an indefinite hang on startup.
         print(f"  Worker pool created ({num_workers} processes). Workers will spin up on demand.")
 
-        if args.analyze_frames_only or args.compile_results_only:
-            print(f"\n  [MD Skipped] {'--compile-results-only' if args.compile_results_only else '--analyze-frames-only'} is active.")
+        if "dynamics" not in args.steps:
+            print(f"\n  [MD Skipped] 'dynamics' step is omitted. Loading existing frames.")
             frame_dir = outdir / "frames"
             if not frame_dir.exists():
                 print(f"  Error: Frame directory {frame_dir} not found.")
@@ -807,7 +832,7 @@ def main() -> None:
     top_poses = top_heap.sorted_best()
     if top_poses:
         frame_dir = outdir / "frames"
-        if args.skip_refinement:
+        if "refinement" not in args.steps:
             print("\n  Writing top-k docking poses without refinement ...")
         else:
             print("\n  Refining top-k poses ...")
@@ -819,7 +844,7 @@ def main() -> None:
             else:
                 frame_pdb = str(frame_dir / f"frame_{r.frame_index:04d}.pdb")
 
-            if args.skip_refinement:
+            if "refinement" not in args.steps:
                 print(f"    Using docked rank {i} (frame {r.frame_index}, pocket {r.pocket_id}) ...")
                 try:
                     complex_pdb, complex_cif = _build_complex_from_frame_and_docked_pose(
@@ -863,7 +888,7 @@ def main() -> None:
             print(f"  Top-{args.top_k} CIF      : {top_cif_path}  ({len(top_poses)} blocks)")
             print(f"  Top-{args.top_k} output   : per-rank CIF files ({len(top_poses)} models)")
             for rank, r in enumerate(top_poses, start=1):
-                if args.skip_refinement:
+                if "refinement" not in args.steps:
                     fname = (
                         f"top{rank:02d}_frame{r.frame_index:04d}_"
                         f"pocket{r.pocket_id:03d}_docked_only.cif"
@@ -888,7 +913,7 @@ def main() -> None:
                 (outdir / fname).write_text(cif_text)
                 print(f"  Written         : {outdir / fname}")
         else:
-            if args.skip_refinement:
+            if "refinement" not in args.steps:
                 print("  Docked-pose export failed for all top poses; no CIF models written.")
             else:
                 print("  Refinement failed for all top poses; no refined CIF models written.")

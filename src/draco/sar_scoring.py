@@ -2,7 +2,7 @@
 
 Role in the Pipeline
 --------------------
-    gnina_docking → sar_scoring → final_refinement
+    docking → sar_scoring → final_refinement
 
 This module takes docking results for a full SAR compound series (actives +
 inactives) docked into a single (conformation, pocket) pair, and computes
@@ -29,7 +29,7 @@ from typing import Sequence
 import numpy as np
 import numpy.typing as npt
 
-from draco.gnina_docking import GninaDockResult, PocketDockResult
+from draco.docking import GninaDockResult, PocketDockResult
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,7 +97,7 @@ def compute_sar_discrimination(
         Index of the MD conformation (frame) being scored.
     pocket_result:
         Docking results for all compounds in this pocket (from
-        ``gnina_docking.dock_ligands_to_pocket``).
+        ``docking.dock_ligands_to_pocket``).
     active_names:
         Set of compound names that are actives.
     inactive_names:
