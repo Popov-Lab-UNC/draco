@@ -48,7 +48,6 @@ pixi run draco \
   --shell-radius-angstrom  8.0 \
   --protein-restraint-k    10.0 \
   --refine-iterations      500 \
-  --skip-refinement \
+  --steps pocket docking scoring \
   --top-k 5 \
-  --top-pdb "top5_poses.cif" \
-  --analyze-frames-only
+  --top-pdb "top5_poses.cif"

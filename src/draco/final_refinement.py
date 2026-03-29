@@ -2,7 +2,7 @@
 
 Role in the Pipeline
 --------------------
-    gnina_docking → sar_scoring → final_refinement
+    docking → sar_scoring → final_refinement
 
 Applied only to the top-K (conformation, pose) pairs selected after SAR
 scoring. Because GNINA-docked poses are already sterically valid (Monte
