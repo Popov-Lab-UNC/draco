@@ -18,7 +18,15 @@ the full binary path via ``gnina_binary``).
 GNINA output SDF properties parsed:
   - minimizedAffinity  → vina_score (kcal/mol, Vina-like)
   - CNNscore           → cnn_score  (pose quality, 0–1)
-  - CNNaffinity        → cnn_affinity (predicted binding affinity, kcal/mol)
+  - CNNaffinity        → cnn_affinity (predicted affinity in **pK** units; higher = tighter binding)
+
+CNN affinity vs Vina (discrepancy to avoid)
+--------------------------------------------
+``CNNaffinity`` is **not** in the same units as ``minimizedAffinity``. The latter
+is a Vina-like score in kcal/mol where more negative is better; the former is a
+**pK-scale** CNN prediction where **higher is better** (GNINA authors:
+https://github.com/gnina/gnina/issues/259). Draco ranks ``cnn_affinity`` with
+that convention; do not sort it like an energy score.
 """
 from __future__ import annotations
 
@@ -81,7 +89,7 @@ class GninaDockResult:
     """GNINA CNN pose score (0–1). Higher = more pose-like."""
 
     cnn_affinity: float
-    """GNINA CNN predicted binding affinity (kcal/mol). More negative = better."""
+    """GNINA CNN predicted binding affinity in pK units (higher = tighter binding)."""
 
     pose_sdf_block: str
     """The full SDF block for this pose (can be written back to disk)."""
@@ -97,12 +105,14 @@ class PocketDockResult:
     """Maps ligand_name → list of GninaDockResult (ranked best→worst)."""
 
     def best_score(self, ligand_name: str, score_key: str = "cnn_affinity") -> float:
-        """Return the best score for a ligand (most negative = best)."""
+        """Return the best score for a ligand (direction depends on ``score_key``)."""
         poses = self.results.get(ligand_name)
         if not poses:
             return 0.0
         scores = [getattr(p, score_key) for p in poses]
-        return min(scores)  # most negative = best binding
+        if score_key in ("cnn_affinity", "cnn_score"):
+            return max(scores)
+        return min(scores)  # vina_score: more negative = better
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -112,7 +122,7 @@ class PocketDockResult:
 def docking_box_from_pocket(
     pocket,
     *,
-    padding_angstrom: float = 4.0,
+    padding_angstrom: float = 5.0,
     min_size_angstrom: float = 15.0,
 ) -> DockingBox:
     """Derive a GNINA docking box from a Pocketeer pocket object.
@@ -126,7 +136,7 @@ def docking_box_from_pocket(
     pocket:
         A Pocketeer ``Pocket`` object (has ``.atom_coords`` or equivalent).
     padding_angstrom:
-        Extra space added to each side of the bounding box (default 4 Å).
+        Extra space added to each side of the bounding box (default 5 Å).
     min_size_angstrom:
         Minimum box dimension in any axis (default 15 Å).
 
@@ -196,7 +206,7 @@ def dock_ligand(
     gnina_binary: str = "gnina",
     seed: int = 0,
     cpu: int = 1,
-    timeout_seconds: int = 300,
+    timeout_seconds: int | None = None,
     output_dir: str | Path | None = None,
     write_gnina_logs: bool = True,
 ) -> list[GninaDockResult]:
@@ -228,7 +238,8 @@ def dock_ligand(
     cpu:
         Number of CPU threads for GNINA (default 1; GPU does the heavy work).
     timeout_seconds:
-        Wall-clock timeout for the GNINA subprocess (default 300 s).
+        Wall-clock timeout for the GNINA subprocess in seconds, or ``None``
+        (default) to wait until GNINA exits with no limit.
     output_dir:
         If provided, GNINA will write its output SDF into this directory and
         (optionally) persist stdout/stderr logs there. If not provided, GNINA
@@ -302,7 +313,10 @@ def dock_ligand(
                 timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired:
-            _log.warning("GNINA timed out after %d s for ligand '%s'", timeout_seconds, name)
+            assert timeout_seconds is not None  # subprocess only times out if timeout is set
+            _log.warning(
+                "GNINA timed out after %d s for ligand '%s'", timeout_seconds, name
+            )
             return []
         except FileNotFoundError:
             raise RuntimeError(
@@ -390,16 +404,22 @@ def _parse_gnina_sdf(sdf_text: str, *, ligand_name: str) -> list[GninaDockResult
     GNINA writes one SDF entry per pose. Each entry has SD properties:
       > <minimizedAffinity>   (Vina score, kcal/mol)
       > <CNNscore>            (CNN pose quality, 0–1)
-      > <CNNaffinity>         (CNN affinity, kcal/mol)
+      > <CNNaffinity>         (CNN affinity, pK units; higher = tighter binding)
     """
     results: list[GninaDockResult] = []
     # Split by the $$$$ record separator
     blocks = [b.strip() for b in sdf_text.split("$$$$") if b.strip()]
 
     for rank, block in enumerate(blocks, start=1):
-        vina = _parse_sdf_property(block, "minimizedAffinity")
-        cnn_score = _parse_sdf_property(block, "CNNscore")
-        cnn_aff = _parse_sdf_property(block, "CNNaffinity")
+        vina = _parse_sdf_property(block, "minimizedAffinity", required=True)
+        cnn_score = _parse_sdf_property(block, "CNNscore", required=True)
+        cnn_aff = _parse_sdf_property(block, "CNNaffinity", required=True)
+
+        # GNINA output can occasionally contain a trailing/truncated SDF record
+        # (e.g. interrupted write). Treat such records as invalid instead of
+        # assigning 0.0 scores, which would incorrectly dominate ranking.
+        if vina is None or cnn_score is None or cnn_aff is None:
+            continue
 
         results.append(
             GninaDockResult(
@@ -412,12 +432,17 @@ def _parse_gnina_sdf(sdf_text: str, *, ligand_name: str) -> list[GninaDockResult
             )
         )
 
-    # Sort best → worst by CNN affinity (most negative = best)
-    results.sort(key=lambda r: r.cnn_affinity)
+    # Sort best → worst by CNN affinity (pK: higher = better)
+    results.sort(key=lambda r: r.cnn_affinity, reverse=True)
     return results
 
 
-def _parse_sdf_property(block: str, prop_name: str) -> float:
+def _parse_sdf_property(
+    block: str,
+    prop_name: str,
+    *,
+    required: bool = False,
+) -> float | None:
     """Extract a numeric SD property from an SDF record block.
 
     Looks for lines of the form::
@@ -426,6 +451,8 @@ def _parse_sdf_property(block: str, prop_name: str) -> float:
         <float_value>
 
     Returns 0.0 if the property is missing or cannot be parsed.
+    If ``required`` is True, returns ``None`` when the property is missing or
+    unparsable.
     """
     lines = block.splitlines()
     for i, line in enumerate(lines):
@@ -433,8 +460,8 @@ def _parse_sdf_property(block: str, prop_name: str) -> float:
             try:
                 return float(lines[i + 1].strip())
             except ValueError:
-                pass
-    return 0.0
+                return None if required else 0.0
+    return None if required else 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────

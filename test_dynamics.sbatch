@@ -49,4 +49,5 @@ pixi run python test_dynamics.py \
   --protein-restraint-k    10.0 \
   --refine-iterations      500 \
   --top-k 5 \
-  --top-pdb "top5_poses.pdb"
+  --top-pdb "top5_poses.pdb" \
+  --analyze-frames-only

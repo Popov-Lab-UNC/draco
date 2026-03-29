@@ -186,7 +186,7 @@ def _refine_impl(
     protein_pdb = PDBFile(str(protein_pdb_path))
 
     # ── 2. Parse ligand from SDF block ────────────────────────────────────────
-    ligand_mol, ligand_pdb = _sdf_block_to_openmm(
+    ligand_mol, ligand_top, ligand_pos = _sdf_block_to_openmm_native(
         docked_ligand_sdf_block,
         residue_name=ligand_residue_name,
         chain_id=ligand_chain_id,
@@ -195,7 +195,7 @@ def _refine_impl(
 
     # ── 3. Build combined topology ─────────────────────────────────────────────
     modeller = Modeller(protein_pdb.topology, protein_pdb.positions)
-    modeller.add(ligand_pdb.topology, ligand_pdb.positions)
+    modeller.add(ligand_top, ligand_pos)
 
     # ── 4. Parametrize ─────────────────────────────────────────────────────────
     forcefield = ForceField(*protein_forcefield_files)
@@ -306,17 +306,27 @@ def _refine_impl(
 # SDF → OpenMM helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _sdf_block_to_openmm(
+def _sdf_block_to_openmm_native(
     sdf_block: str,
     *,
     residue_name: str,
     chain_id: str,
     residue_id: int,
-) -> tuple[Chem.Mol, PDBFile]:
-    """Convert an SDF block to an RDKit Mol and an OpenMM PDBFile.
-
-    Writes a temporary PDB via RDKit so OpenMM can read the topology.
+):
+    """Convert an SDF block directly to an RDKit Mol and native OpenMM Topology/Positions.
+    
+    Bypasses PDB string conversion to ensure no bonds are lost or misinterpreted
+    by PDB format column alignments or CONECT limitations.
     """
+    try:
+        from openmm.app import Topology, Element
+        from openmm import Vec3
+    except ImportError:
+        from simtk.openmm.app import Topology, Element
+        from simtk.openmm import Vec3
+        
+    import openmm.unit as unit
+
     # Strip the trailing $$$$ if present
     clean = sdf_block.split("$$$$")[0].strip()
     mol = Chem.MolFromMolBlock(clean, removeHs=False, sanitize=True)
@@ -326,38 +336,33 @@ def _sdf_block_to_openmm(
     if mol is None:
         raise ValueError("RDKit could not parse the GNINA docked pose SDF block")
 
-    # Build a PDB string with correct residue/chain labels
-    pdb_lines = _mol_to_pdb_block(mol, residue_name=residue_name,
-                                   chain_id=chain_id, residue_id=residue_id)
-    ligand_pdb = PDBFile(io.StringIO(pdb_lines))
-    return mol, ligand_pdb
-
-
-def _mol_to_pdb_block(
-    mol: Chem.Mol,
-    *,
-    residue_name: str,
-    chain_id: str,
-    residue_id: int,
-) -> str:
-    """Write an RDKit molecule to a PDB-format string."""
+    top = Topology()
+    chain = top.addChain(id=chain_id)
+    res = top.addResidue(residue_name, chain, id=str(residue_id))
+    
+    atoms = []
+    positions = []
+    
     conf = mol.GetConformer(0)
-    lines: list[str] = []
-    for idx, atom in enumerate(mol.GetAtoms(), start=1):
-        pos = conf.GetAtomPosition(atom.GetIdx())
-        symbol = atom.GetSymbol()
-        atom_name = f"{symbol}{idx % 1000:03d}"[:4]
-        lines.append(
-            f"HETATM{idx:5d} {atom_name:<4} {residue_name:>3} "
-            f"{chain_id:1}{residue_id:4d}    "
-            f"{pos.x:8.3f}{pos.y:8.3f}{pos.z:8.3f}"
-            f"{1.00:6.2f}{0.00:6.2f}          {symbol:>2}"
-        )
+    for idx, r_atom in enumerate(mol.GetAtoms(), start=1):
+        sym = r_atom.GetSymbol()
+        elem = Element.getBySymbol(sym)
+        # Construct a 4-character atom name
+        atom_name = f"{sym}{idx % 1000:03d}"[:4]
+        
+        omm_atom = top.addAtom(atom_name, elem, res, id=str(idx))
+        atoms.append(omm_atom)
+        
+        pos = conf.GetAtomPosition(r_atom.GetIdx())
+        positions.append(Vec3(pos.x, pos.y, pos.z))
+        
     for bond in mol.GetBonds():
-        i, j = bond.GetBeginAtomIdx() + 1, bond.GetEndAtomIdx() + 1
-        lines.append(f"CONECT{i:5d}{j:5d}")
-    lines.append("END")
-    return "\n".join(lines) + "\n"
+        a1 = atoms[bond.GetBeginAtomIdx()]
+        a2 = atoms[bond.GetEndAtomIdx()]
+        # OpenMM Topology just stores connectivity without order
+        top.addBond(a1, a2)
+        
+    return mol, top, positions * unit.angstrom
 
 
 def _register_ligand_template_from_mol(

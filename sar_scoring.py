@@ -104,18 +104,17 @@ def compute_sar_discrimination(
         Set of compound names that are inactives.
     score_key:
         Which GNINA score to use for ranking. Options:
-        - ``'cnn_affinity'`` (default) – CNN predicted binding affinity (kcal/mol)
-        - ``'vina_score'`` – Vina minimized affinity (kcal/mol)
-        - ``'cnn_score'`` – CNN pose quality (0–1; higher = better, opposite sign)
+        - ``'cnn_affinity'`` (default) – CNN predicted affinity in **pK** units (higher = better)
+        - ``'vina_score'`` – Vina minimized affinity (kcal/mol; more negative = better)
+        - ``'cnn_score'`` – CNN pose quality (0–1; higher = better)
 
     Returns
     -------
     SARScoreResult
     """
-    # Determine sign convention: for affinity/energy scores lower (more negative)
-    # is better. For cnn_score higher is better. We normalize so that "more
-    # positive = worse" for ranking, meaning we store raw scores and flip for AUC.
-    affinity_mode = score_key in ("cnn_affinity", "vina_score")
+    # Ranking direction: vina_score → lower (more negative) is better.
+    # cnn_affinity (pK) and cnn_score → higher is better.
+    higher_is_better_score = score_key in ("cnn_affinity", "cnn_score")
 
     active_scores: list[float] = []
     inactive_scores: list[float] = []
@@ -165,10 +164,10 @@ def compute_sar_discrimination(
         [1] * len(active_scores) + [0] * len(inactive_scores), dtype=int
     )
 
-    auc = _roc_auc(all_scores, labels, higher_is_better=not affinity_mode)
-    ef1 = _enrichment_factor(all_scores, labels, fraction=0.01, higher_is_better=not affinity_mode)
-    ef5 = _enrichment_factor(all_scores, labels, fraction=0.05, higher_is_better=not affinity_mode)
-    ef10 = _enrichment_factor(all_scores, labels, fraction=0.10, higher_is_better=not affinity_mode)
+    auc = _roc_auc(all_scores, labels, higher_is_better=higher_is_better_score)
+    ef1 = _enrichment_factor(all_scores, labels, fraction=0.01, higher_is_better=higher_is_better_score)
+    ef5 = _enrichment_factor(all_scores, labels, fraction=0.05, higher_is_better=higher_is_better_score)
+    ef10 = _enrichment_factor(all_scores, labels, fraction=0.10, higher_is_better=higher_is_better_score)
 
     return SARScoreResult(
         frame_index=frame_index,
@@ -276,12 +275,12 @@ def _best_score(
     """Return the best (extreme) score from a list of docked poses.
 
     Returns None if ``poses`` is empty (compound not docked).
-    For affinity-like scores (cnn_affinity, vina_score): returns minimum (most negative).
-    For cnn_score (0-1, higher=better): returns maximum.
+    For ``cnn_affinity`` (pK): returns maximum. For ``vina_score``: minimum (most negative).
+    For ``cnn_score`` (0–1): returns maximum.
     """
     if not poses:
         return None
     vals = [getattr(p, score_key) for p in poses]
-    if score_key == "cnn_score":
+    if score_key in ("cnn_score", "cnn_affinity"):
         return max(vals)
-    return min(vals)  # most negative = best affinity
+    return min(vals)  # vina: most negative = best

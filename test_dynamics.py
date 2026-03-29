@@ -167,6 +167,14 @@ def parse_args() -> argparse.Namespace:
                         choices=["rescore", "refinement", "none"],
                         help="GNINA CNN scoring mode (default: rescore)")
     parser.add_argument("--gnina-seed",      type=int, default=0)
+    parser.add_argument(
+        "--gnina-timeout-seconds",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Wall-clock limit per GNINA subprocess (seconds). "
+        "Omit for no limit (GNINA runs to completion).",
+    )
 
     # ── Final refinement ─────────────────────────────────────────────────────
     parser.add_argument("--shell-radius-angstrom", type=float, default=8.0)
@@ -181,6 +189,8 @@ def parse_args() -> argparse.Namespace:
     # ── Debug ─────────────────────────────────────────────────────────────────
     parser.add_argument("--dry-run",            action="store_true", default=False)
     parser.add_argument("--analyze-frames-only", action="store_true", default=False)
+    parser.add_argument("--compile-results-only", action="store_true", default=False,
+                        help="Skip MD and docking. Compile top poses directly from existing GNINA output.")
     return parser.parse_args()
 
 
@@ -196,9 +206,10 @@ class _FramePoseResult:
     pocket_id: int
     pocket_score: float          # pocketeer score
     ligand_name: str             # name of the docked compound
-    cnn_affinity: float          # best GNINA CNN affinity (lower = better)
+    cnn_affinity: float          # best GNINA CNN affinity (pK; higher = better)
     vina_score: float            # best GNINA Vina score
     auc_roc: float | None        # SAR discrimination AUC (None in single-compound mode)
+    docked_sdf_block: str = ""   # The SDF block of the docked pose
     # Post-refinement fields (filled only for top-K poses)
     initial_energy_kj_per_mol: float = 0.0
     final_energy_kj_per_mol: float = 0.0
@@ -219,12 +230,12 @@ class _TopKHeap:
 
     def push(self, result: _FramePoseResult) -> bool:
         """Push by primary ranking score (AUC-ROC if available, else CNN affinity)."""
-        # Higher AUC = better; lower CNN affinity = better
+        # Higher AUC = better; higher CNN affinity (pK) = better
         # Normalize to: lower raw_score = better (for min-heap inversion trick)
         if result.auc_roc is not None:
             raw_score = -result.auc_roc          # negate so most negative = worst (pushed out)
         else:
-            raw_score = result.cnn_affinity      # already: most negative = best
+            raw_score = -result.cnn_affinity     # negate pK so tighter binders sort first
         entry = (raw_score, self._counter, result)
         self._counter += 1
         if len(self._heap) < self.k:
@@ -281,6 +292,8 @@ def _dock_frame_worker(
     gnina_seed: int,
     dry_run: bool,
     gnina_output_dir: str | None = None,
+    gnina_timeout_seconds: int | None = None,
+    compile_results_only: bool = False,
 ) -> list[_FramePoseResult]:
     """Worker: Detect pockets, dock all ligands with GNINA, compute SAR score.
 
@@ -339,20 +352,32 @@ def _dock_frame_worker(
 
         try:
             box = docking_box_from_pocket(pocket)
-            pocket_dock = dock_ligands_to_pocket(
-                protein_pdb_path,
-                {n: __import__('pathlib').Path(p) for n, p in ligand_sdf_paths.items()},
-                box,
-                pocket_id=pocket_id,
-                gnina_binary=gnina_binary,
-                exhaustiveness=exhaustiveness,
-                num_modes=num_modes,
-                cnn_scoring=cnn_scoring,
-                seed=gnina_seed,
-                cpu=1,
-                output_dir=out_dir_str,
-                write_gnina_logs=True,
-            )
+            
+            if compile_results_only and out_dir_str:
+                import gnina_docking
+                pocket_dock = gnina_docking.PocketDockResult(pocket_id=pocket_id, docking_box=box)
+                for name, sdf_path in ligand_sdf_paths.items():
+                    out_sdf = Path(out_dir_str) / f"{name}.gnina.sdf"
+                    if out_sdf.exists():
+                        pocket_dock.results[name] = gnina_docking._parse_gnina_sdf(out_sdf.read_text(), ligand_name=name)
+                    else:
+                        pocket_dock.results[name] = []
+            else:
+                pocket_dock = dock_ligands_to_pocket(
+                    protein_pdb_path,
+                    {n: __import__('pathlib').Path(p) for n, p in ligand_sdf_paths.items()},
+                    box,
+                    pocket_id=pocket_id,
+                    gnina_binary=gnina_binary,
+                    exhaustiveness=exhaustiveness,
+                    num_modes=num_modes,
+                    cnn_scoring=cnn_scoring,
+                    seed=gnina_seed,
+                    cpu=1,
+                    timeout_seconds=gnina_timeout_seconds,
+                    output_dir=out_dir_str,
+                    write_gnina_logs=True,
+                )
         except Exception as exc:
             import traceback
             results.append(_FramePoseResult(
@@ -366,15 +391,16 @@ def _dock_frame_worker(
         # ── Aggregate best score per parent ligand ─────────────────────────
         # pocket_dock.results keys are state-level names (e.g. "LIG_s0").
         # We group by parent name and pick the best CNN affinity per parent.
-        parent_best: dict[str, tuple[float, float]] = {}  # parent -> (best_cnn, best_vina)
+        parent_best: dict[str, tuple[float, float, str]] = {}  # parent -> (best_cnn, best_vina, best_sdf)
         for state_name, poses in pocket_dock.results.items():
             if not poses:
                 continue
             parent = name_map.get(state_name, state_name)
             best_cnn = poses[0].cnn_affinity
             best_vina = poses[0].vina_score
-            if parent not in parent_best or best_cnn < parent_best[parent][0]:
-                parent_best[parent] = (best_cnn, best_vina)
+            best_sdf = poses[0].pose_sdf_block
+            if parent not in parent_best or best_cnn > parent_best[parent][0]:
+                parent_best[parent] = (best_cnn, best_vina, best_sdf)
 
         if sar_mode:
             # Build a virtual PocketDockResult with best-per-parent scores
@@ -400,31 +426,35 @@ def _dock_frame_worker(
                 inactive_names=set(inactive_names),
                 score_key="cnn_affinity",
             )
-            # Best-scoring active as the representative pose
-            best_active = min(
+            # Best-scoring active as the representative pose (highest pK)
+            best_active = max(
                 [n for n in active_names if n in parent_best],
                 key=lambda n: parent_best[n][0],
                 default="",
             )
-            best_cnn = parent_best.get(best_active, (0.0, 0.0))[0]
-            best_vina = parent_best.get(best_active, (0.0, 0.0))[1]
+            best_cnn = parent_best.get(best_active, (0.0, 0.0, ""))[0]
+            best_vina = parent_best.get(best_active, (0.0, 0.0, ""))[1]
+            best_sdf = parent_best.get(best_active, (0.0, 0.0, ""))[2]
             results.append(_FramePoseResult(
                 frame_index=frame_index, frame_time_ps=frame_time_ps,
                 pocket_id=pocket_id, pocket_score=pocket_score,
                 ligand_name=best_active,
                 cnn_affinity=best_cnn, vina_score=best_vina,
                 auc_roc=sar.auc_roc,
+                docked_sdf_block=best_sdf,
                 status="ok",
             ))
         else:
             # Single compound mode: one result per pocket per parent ligand
-            for parent, (best_cnn, best_vina) in parent_best.items():
+            for parent, (best_cnn, best_vina, best_sdf) in parent_best.items():
                 results.append(_FramePoseResult(
                     frame_index=frame_index, frame_time_ps=frame_time_ps,
                     pocket_id=pocket_id, pocket_score=pocket_score, ligand_name=parent,
                     cnn_affinity=best_cnn,
                     vina_score=best_vina,
-                    auc_roc=None, status="ok",
+                    auc_roc=None, 
+                    docked_sdf_block=best_sdf,
+                    status="ok",
                 ))
 
     return results
@@ -581,7 +611,9 @@ def main() -> None:
                             best = top_heap.current_best()
                             if best is not None and args.top_k > 0:
                                 prev = rolling_best_energy[0]
-                                rank_score = -best.auc_roc if best.auc_roc is not None else best.cnn_affinity
+                                rank_score = (
+                                    -best.auc_roc if best.auc_roc is not None else -best.cnn_affinity
+                                )
                                 if prev is None or rank_score < prev:
                                     rolling_best_energy[0] = rank_score
                                     best_str = (
@@ -647,6 +679,8 @@ def main() -> None:
                     gnina_seed=args.gnina_seed,
                     dry_run=args.dry_run,
                     gnina_output_dir=str(gnina_output_dir),
+                    gnina_timeout_seconds=args.gnina_timeout_seconds,
+                    compile_results_only=args.compile_results_only,
                 )
                 future.add_done_callback(on_dock_done)
             except Exception:
@@ -663,8 +697,8 @@ def main() -> None:
         # bottleneck, resulting in an indefinite hang on startup.
         print(f"  Worker pool created ({num_workers} processes). Workers will spin up on demand.")
 
-        if args.analyze_frames_only:
-            print("\n  [MD Skipped] --analyze-frames-only is active.")
+        if args.analyze_frames_only or args.compile_results_only:
+            print(f"\n  [MD Skipped] {'--compile-results-only' if args.compile_results_only else '--analyze-frames-only'} is active.")
             frame_dir = outdir / "frames"
             if not frame_dir.exists():
                 print(f"  Error: Frame directory {frame_dir} not found.")
@@ -767,6 +801,28 @@ def main() -> None:
 
     top_poses = top_heap.sorted_best()
     if top_poses:
+        print("\n  Refining top-k poses ...")
+        refined_top_poses = []
+        frame_dir = outdir / "frames"
+        for i, r in enumerate(top_poses, start=1):
+            if r.frame_index == -1:
+                frame_pdb = str(frame_dir / "frame_initial_input.pdb")
+            else:
+                frame_pdb = str(frame_dir / f"frame_{r.frame_index:04d}.pdb")
+            
+            print(f"    Refining rank {i} (frame {r.frame_index}, pocket {r.pocket_id}) ...")
+            refined_r = _refine_pose_worker(
+                result=r,
+                protein_pdb_path=frame_pdb,
+                docked_sdf_block=r.docked_sdf_block,
+                shell_radius_angstrom=args.shell_radius_angstrom,
+                protein_restraint_k=args.protein_restraint_k,
+                refine_iterations=args.refine_iterations,
+                compute_ie=not args.no_interaction_energy,
+            )
+            refined_top_poses.append(refined_r)
+        
+        top_poses = refined_top_poses
         top_pdb_path = outdir / args.top_pdb
         _write_multimodel_pdb(top_pdb_path, top_poses)
         print(f"  Top-{args.top_k} PDB      : {top_pdb_path}  ({len(top_poses)} models)")
