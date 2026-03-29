@@ -27,7 +27,7 @@ cd /work/users/s/h/shuhang/draco
 # 6pbc-prepared.pdb
 # CN(CC1(CC1)c1ccc(F)cc1)C(=O)[C@H](Cc1csc2ccccc12)Nc1cc(ncn1)C(N)=O
 
-pixi run python test_dynamics.py \
+pixi run draco \
   --protein-pdb        "4GL2.pdb" \
   --ligand-smiles      "O=C(Nc1ccc(Cl)cc1)Nc1ccc(S(=O)(=O)Nc2nccs2)cc1" \
   --gnina-binary       "apptainer run --nv /work/users/s/h/shuhang/gnina_build/gnina.sif" \
