@@ -1,4 +1,4 @@
-"""test_dynamics.py – End-to-end Draco pipeline: MD + GNINA docking.
+"""cli.py – Entry point for the Draco pipeline: MD + GNINA docking.
 
 Pipeline
 --------
@@ -37,14 +37,12 @@ Pipeline
                               └─────────────────────────┘
 
 Usage (SAR series mode):
-    pixi run python test_dynamics.py \\
-        --protein-pdb 6pbc-prepared.pdb \\
+    draco --protein-pdb 6pbc-prepared.pdb \\
         --compound-csv compounds.csv \\
         --output-dir dynamics_gnina_output
 
 Usage (single-compound mode):
-    pixi run python test_dynamics.py \\
-        --protein-pdb 6pbc-prepared.pdb \\
+    draco --protein-pdb 6pbc-prepared.pdb \\
         --ligand-smiles "CN(CC1(CC1)c1ccc(F)cc1)C(=O)..." \\
         --output-dir dynamics_gnina_single
 """
@@ -80,18 +78,18 @@ from typing import Any
 
 import numpy as np
 
-from dynamics import DynamicsFrame, DynamicsResult, run_dynamics
-from gnina_docking import (
+from draco.dynamics import DynamicsFrame, DynamicsResult, run_dynamics
+from draco.gnina_docking import (
     DockingBox, GninaDockResult, PocketDockResult,
     docking_box_from_pocket, dock_ligands_to_pocket,
 )
-from ligand_preparation import (
+from draco.ligand_preparation import (
     PreparedLigand, prepare_ligand_from_smiles, prepare_protonation_states,
     load_compound_csv, write_ligand_sdf, write_ligands_for_docking,
 )
-from final_refinement import RefinementResult, refine_docked_pose
-from sar_scoring import SARScoreResult, compute_sar_discrimination
-from protein_preparation import PreparedProtein, prepare_protein
+from draco.final_refinement import RefinementResult, refine_docked_pose
+from draco.sar_scoring import SARScoreResult, compute_sar_discrimination
+from draco.protein_preparation import PreparedProtein, prepare_protein
 
 import pocketeer as pt
 
@@ -277,7 +275,7 @@ def _worker_init() -> None:
         import openmm
         import rdkit
         import pocketeer
-        import protein_preparation
+        import draco.protein_preparation
     except ImportError:
         pass
 
@@ -313,9 +311,9 @@ def _dock_frame_worker(
     import io, tempfile
     import biotite.structure.io.pdb as _biotite_pdb
     import pocketeer as pt
-    from gnina_docking import docking_box_from_pocket, dock_ligands_to_pocket
-    from sar_scoring import compute_sar_discrimination
-    from gnina_docking import PocketDockResult
+    from draco.gnina_docking import docking_box_from_pocket, dock_ligands_to_pocket
+    from draco.sar_scoring import compute_sar_discrimination
+    from draco.gnina_docking import PocketDockResult
 
     if dry_run:
         return []
@@ -361,7 +359,7 @@ def _dock_frame_worker(
             box = docking_box_from_pocket(pocket)
             
             if compile_results_only and out_dir_str:
-                import gnina_docking
+                import draco.gnina_docking as gnina_docking
                 pocket_dock = gnina_docking.PocketDockResult(pocket_id=pocket_id, docking_box=box)
                 for name, sdf_path in ligand_sdf_paths.items():
                     out_sdf = Path(out_dir_str) / f"{name}.gnina.sdf"
@@ -477,7 +475,7 @@ def _refine_pose_worker(
     compute_ie: bool,
 ) -> _FramePoseResult:
     """Worker: Locally minimise one GNINA-docked pose with OpenMM."""
-    from final_refinement import refine_docked_pose
+    from draco.final_refinement import refine_docked_pose
     ref = refine_docked_pose(
         protein_pdb_path,
         docked_sdf_block,
@@ -902,205 +900,6 @@ def main() -> None:
         print(f"  Topology PDB    : {dynamics_topology_pdb}")
 
     print("\n  Done.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Frame-level protein helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _protein_from_frame(
-    *,
-    frame: DynamicsFrame,
-    base_prepared_protein: PreparedProtein,
-) -> PreparedProtein | None:
-    """Return a PreparedProtein with positions from *frame*, reusing topology.
-
-    Tries to substitute the frame positions into the base topology directly.
-    Returns None if atom counts don't match (use _protein_from_pdb_string then).
-    """
-    n_frame = frame.protein_positions_nm.shape[0]
-    topo_atoms = list(base_prepared_protein.topology.atoms())
-    if n_frame != len(topo_atoms):
-        return None
-
-    new_pos = (frame.protein_positions_nm * unit.nanometer)
-    return PreparedProtein(
-        topology=base_prepared_protein.topology,
-        positions=new_pos,
-        source_path=base_prepared_protein.source_path,
-    )
-
-
-def _protein_from_pdb_string(pdb_string: str) -> PreparedProtein:
-    """Build a PreparedProtein from a PDB string via PDBFixer.
-
-    Slower fallback used when the frame topology doesn't match the base.
-    """
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".pdb", mode="w", delete=False) as f:
-        f.write(pdb_string)
-        tmp_path = f.name
-    try:
-        return prepare_protein(tmp_path, add_hydrogens=False)
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-pose local minimization (no induced-fit)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _local_minimize(
-    *,
-    frame_protein: PreparedProtein,
-    overlay_result: OverlayResult,
-    shell_radius_angstrom: float,
-    protein_restraint_k: float,
-    ligand_restraint_k: float,
-    max_iterations: int,
-    platform_name: str,
-    cuda_precision: str,
-    compute_ie: bool,
-    protein_forcefield_files: tuple[str, ...] = ("amber14-all.xml", "amber14/tip3pfb.xml"),
-    openff_forcefield: str = "openff-2.3.0",
-    ligand_residue_name: str = "LIG",
-    temperature_kelvin: float = 300.0,
-    friction_per_ps: float = 1.0,
-    timestep_fs: float = 2.0,
-) -> LocalMinimizationResult:
-    """Run local energy minimization of one overlay pose at one MD frame.
-
-    No induced-fit MD — this keeps each frame analysis fast.
-    """
-    ligand_pdb = PDBFile(
-        io.StringIO(
-            conformer_to_pdb_block(
-                overlay_result.conformer,
-                overlay_result.transformed_all_atom_coords,
-                residue_name=ligand_residue_name,
-                chain_id="L",
-                residue_id=1,
-            )
-        )
-    )
-
-    modeller = Modeller(frame_protein.topology, frame_protein.positions)
-    modeller.add(ligand_pdb.topology, ligand_pdb.positions)
-
-    forcefield = ForceField(*protein_forcefield_files)
-    _register_ligand_template(
-        forcefield, overlay_result, openff_forcefield=openff_forcefield
-    )
-
-    system = forcefield.createSystem(
-        modeller.topology, nonbondedMethod=NoCutoff, constraints=HBonds
-    )
-
-    topo_atoms = list(modeller.topology.atoms())
-    positions_nm = np.asarray(
-        modeller.positions.value_in_unit(unit.nanometer), dtype=np.float64
-    )
-
-    ligand_idxs = [
-        a.index for a in topo_atoms if a.residue.name == ligand_residue_name
-    ]
-    if not ligand_idxs:
-        raise ValueError(f"Ligand residue '{ligand_residue_name}' not found in topology")
-
-    protein_idxs = [
-        a.index for a in topo_atoms
-        if a.residue.name != ligand_residue_name and a.element is not None
-    ]
-
-    restrained_prot, flexible_prot = _partition_protein_atoms_by_shell(
-        positions_nm=positions_nm,
-        protein_atom_indices=protein_idxs,
-        ligand_atom_indices=ligand_idxs,
-        shell_radius_angstrom=shell_radius_angstrom,
-    )
-    n_prot_restrained = _add_positional_restraints(
-        system=system, positions_nm=positions_nm,
-        atom_indices=restrained_prot,
-        k_kcal_per_mol_a2=protein_restraint_k,
-        k_param_name="k_protein_posres",
-    )
-    n_lig_restrained = _add_positional_restraints(
-        system=system, positions_nm=positions_nm,
-        atom_indices=ligand_idxs,
-        k_kcal_per_mol_a2=ligand_restraint_k,
-        k_param_name="k_ligand_posres",
-    )
-
-    integrator = LangevinMiddleIntegrator(
-        temperature_kelvin * unit.kelvin,
-        friction_per_ps / unit.picosecond,
-        timestep_fs * unit.femtoseconds,
-    )
-    try:
-        platform = Platform.getPlatformByName(platform_name)
-        props: dict[str, str] = {}
-        if platform_name.upper() in {"CUDA", "OPENCL"}:
-            props["Precision"] = cuda_precision
-        simulation = Simulation(modeller.topology, system, integrator, platform, props)
-    except Exception:
-        simulation = Simulation(modeller.topology, system, integrator)
-
-    simulation.context.setPositions(modeller.positions)
-
-    init_state = simulation.context.getState(getEnergy=True, getPositions=True)
-    init_energy = float(
-        init_state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-    )
-    init_pos_nm = np.asarray(
-        init_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
-        dtype=np.float64,
-    )
-
-    simulation.minimizeEnergy(maxIterations=max_iterations)
-
-    final_state = simulation.context.getState(getEnergy=True, getPositions=True)
-    final_energy = float(
-        final_state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-    )
-    final_pos_nm = np.asarray(
-        final_state.getPositions(asNumpy=True).value_in_unit(unit.nanometer),
-        dtype=np.float64,
-    )
-
-    heavy_rel = list(overlay_result.conformer.heavy_atom_indices)
-    heavy_abs = [ligand_idxs[i] for i in heavy_rel if i < len(ligand_idxs)]
-    lig_rmsd = _rmsd(
-        init_pos_nm[heavy_abs] * 10.0,
-        final_pos_nm[heavy_abs] * 10.0,
-    )
-
-    ie: float | None = None
-    if compute_ie:
-        ie = _compute_interaction_energy(
-            simulation=simulation,
-            ligand_atom_indices=ligand_idxs,
-            protein_atom_indices=protein_idxs,
-            final_energy_kj_per_mol=final_energy,
-        )
-
-    final_out = io.StringIO()
-    PDBFile.writeFile(modeller.topology, final_state.getPositions(), final_out, keepIds=True)
-
-    return LocalMinimizationResult(
-        initial_energy_kj_per_mol=init_energy,
-        final_energy_kj_per_mol=final_energy,
-        ligand_heavy_atom_rmsd_angstrom=lig_rmsd,
-        protein_atoms_flexible=len(flexible_prot),
-        protein_atoms_restrained=n_prot_restrained,
-        ligand_atoms_restrained=n_lig_restrained,
-        minimized_positions_angstrom=final_pos_nm * 10.0,
-        minimized_complex_pdb=final_out.getvalue(),
-        interaction_energy_kj_per_mol=ie,
-        induced_fit_ligand_rmsd_angstrom=None,
-        induced_fit_final_energy_kj_per_mol=None,
-        induced_fit_complex_pdb=None,
-    )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # I/O helpers

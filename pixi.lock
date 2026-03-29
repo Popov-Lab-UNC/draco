@@ -1368,7 +1368,7 @@ packages:
 - pypi: ./
   name: draco
   version: 0.1.0
-  sha256: 9ff7dfa5db0a90f284395062d01c711fb04002044eae9592cd294110f4d66455
+  sha256: cff227bf53f8bfe7f796b6d13c563f18792cceed6774eafe9ba0ba369b16422f
   requires_dist:
   - atomworks
   - pocketeer>=0.3.0

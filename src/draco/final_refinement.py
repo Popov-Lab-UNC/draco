@@ -30,14 +30,14 @@ from rdkit import Chem
 
 _log = logging.getLogger(__name__)
 
-# Reuse the shared helpers from local_minimization to avoid code duplication
-from local_minimization import (
-    KCAL_PER_MOL_A2_TO_KJ_PER_MOL_NM2,
+# Shared helpers now live in draco.utils (extracted from local_minimization)
+from draco.constants import KCAL_PER_MOL_A2_TO_KJ_PER_MOL_NM2
+from draco.utils import (
     _TEMPLATE_GENERATOR_CACHE,
-    _add_positional_restraints,
-    _compute_interaction_energy,
-    _partition_protein_atoms_by_shell,
-    _rmsd,
+    add_positional_restraints as _add_positional_restraints,
+    compute_interaction_energy as _compute_interaction_energy,
+    partition_protein_atoms_by_shell as _partition_protein_atoms_by_shell,
+    rmsd as _rmsd,
 )
 
 try:

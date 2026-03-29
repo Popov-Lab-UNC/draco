@@ -48,7 +48,8 @@ from typing import Callable
 
 import numpy as np
 import numpy.typing as npt
-from protein_preparation import PreparedProtein, prepare_protein
+from draco.protein_preparation import PreparedProtein, prepare_protein
+from draco.constants import KCAL_PER_MOL_A2_TO_KJ_PER_MOL_NM2, SOLVENT_ION_RESNAMES
 
 import biotite.structure.io.pdb as _biotite_pdb
 
@@ -94,16 +95,10 @@ except ImportError:  # pragma: no cover
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-KCAL_PER_MOL_A2_TO_KJ_PER_MOL_NM2: float = 418.4
+# Import from centralised constants (originals removed to avoid duplication)
 _DEFAULT_FORCEFIELD = ("amber14-all.xml", "amber14/tip3pfb.xml")
-_DEFAULT_WATER_MODEL = "tip3pfb"  # chemistry model; placement via Modeller (see below)
-
-# Ion / water residue names that should be excluded when identifying protein atoms.
-_SOLVENT_ION_RESNAMES: set[str] = {
-    "HOH", "WAT", "TIP3", "SPC", "T3P", "T4P", "T5P",
-    "NA", "CL", "Na+", "Cl-", "NA+", "CL-",
-    "K", "K+", "MG", "CA", "ZN", "FE",
-}
+_DEFAULT_WATER_MODEL = "tip3pfb"
+_SOLVENT_ION_RESNAMES = SOLVENT_ION_RESNAMES
 
 # OpenMM Modeller.addSolvent only accepts tip3p, spce, tip4pew, tip5p, swm4ndp.
 # TIP3P-FB uses the same 3-site geometry as TIP3P; parameters come from the FF XML.

@@ -29,7 +29,7 @@ from typing import Sequence
 import numpy as np
 import numpy.typing as npt
 
-from gnina_docking import GninaDockResult, PocketDockResult
+from draco.gnina_docking import GninaDockResult, PocketDockResult
 
 
 # ─────────────────────────────────────────────────────────────────────────────

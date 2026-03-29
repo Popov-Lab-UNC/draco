@@ -18,20 +18,14 @@ from rdkit.Chem.rdchem import Mol
 from rdkit.Chem.SaltRemover import SaltRemover
 from rdkit import RDConfig
 
+from draco.constants import FEATURE_LABEL_MAP
+
 _log = logging.getLogger(__name__)
 
 # Instantiate globally to compile salt SMARTS patterns only once
 _SALT_REMOVER = SaltRemover()
 
-_FEATURE_LABEL_MAP = {
-    "Donor": "donor",
-    "Acceptor": "acceptor",
-    "PosIonizable": "cation",
-    "NegIonizable": "anion",
-    "Aromatic": "ring",
-    # "Hydrophobe": "hydrophobe",  # Removed to prevent the "hydrophobic swarm"
-    "LumpedHydrophobe": "hydrophobe",
-}
+_FEATURE_LABEL_MAP = FEATURE_LABEL_MAP
 
 
 @dataclass(frozen=True)
