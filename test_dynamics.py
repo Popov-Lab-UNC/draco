@@ -97,11 +97,11 @@ import pocketeer as pt
 
 try:
     from openmm import LangevinMiddleIntegrator, Platform, unit
-    from openmm.app import ForceField, HBonds, Modeller, NoCutoff, PDBFile, Simulation
+    from openmm.app import ForceField, HBonds, Modeller, NoCutoff, PDBFile, PDBxFile, Simulation
 except ImportError:  # pragma: no cover
     from simtk.openmm import LangevinMiddleIntegrator, Platform, unit  # type: ignore
     from simtk.openmm.app import (  # type: ignore
-        ForceField, HBonds, Modeller, NoCutoff, PDBFile, Simulation,
+        ForceField, HBonds, Modeller, NoCutoff, PDBFile, PDBxFile, Simulation,
     )
 
 warnings.filterwarnings(
@@ -181,10 +181,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protein-restraint-k",   type=float, default=10.0)
     parser.add_argument("--refine-iterations",     type=int,   default=500)
     parser.add_argument("--no-interaction-energy", action="store_true", default=False)
+    parser.add_argument(
+        "--skip-refinement",
+        action="store_true",
+        default=False,
+        help="Skip OpenMM refinement and write top poses directly from GNINA docking + frame PDB.",
+    )
 
     # ── Output ────────────────────────────────────────────────────────────────
     parser.add_argument("--top-k",   type=int, default=5)
-    parser.add_argument("--top-pdb", default="top5_poses.pdb")
+    parser.add_argument("--top-pdb", default="top5_poses.cif")
 
     # ── Debug ─────────────────────────────────────────────────────────────────
     parser.add_argument("--dry-run",            action="store_true", default=False)
@@ -218,6 +224,7 @@ class _FramePoseResult:
     protein_atoms_flexible: int = 0
     protein_atoms_restrained: int = 0
     refined_complex_pdb: str = ""
+    refined_complex_cif: str = ""
     status: str = "ok"
     error: str = ""
 
@@ -801,15 +808,40 @@ def main() -> None:
 
     top_poses = top_heap.sorted_best()
     if top_poses:
-        print("\n  Refining top-k poses ...")
-        refined_top_poses = []
         frame_dir = outdir / "frames"
+        if args.skip_refinement:
+            print("\n  Writing top-k docking poses without refinement ...")
+        else:
+            print("\n  Refining top-k poses ...")
+
+        final_top_poses = []
         for i, r in enumerate(top_poses, start=1):
             if r.frame_index == -1:
                 frame_pdb = str(frame_dir / "frame_initial_input.pdb")
             else:
                 frame_pdb = str(frame_dir / f"frame_{r.frame_index:04d}.pdb")
-            
+
+            if args.skip_refinement:
+                print(f"    Using docked rank {i} (frame {r.frame_index}, pocket {r.pocket_id}) ...")
+                try:
+                    complex_pdb, complex_cif = _build_complex_from_frame_and_docked_pose(
+                        frame_pdb_path=frame_pdb,
+                        docked_sdf_block=r.docked_sdf_block,
+                        ligand_residue_name=args.ligand_name,
+                    )
+                    import dataclasses
+                    final_top_poses.append(
+                        dataclasses.replace(
+                            r,
+                            refined_complex_pdb=complex_pdb,
+                            refined_complex_cif=complex_cif,
+                            status="docked",
+                        )
+                    )
+                except Exception as exc:
+                    print(f"    Docked-pose export failed for rank {i}: {exc}")
+                continue
+
             print(f"    Refining rank {i} (frame {r.frame_index}, pocket {r.pocket_id}) ...")
             refined_r = _refine_pose_worker(
                 result=r,
@@ -820,26 +852,48 @@ def main() -> None:
                 refine_iterations=args.refine_iterations,
                 compute_ie=not args.no_interaction_energy,
             )
-            refined_top_poses.append(refined_r)
-        
-        top_poses = refined_top_poses
-        top_pdb_path = outdir / args.top_pdb
-        _write_multimodel_pdb(top_pdb_path, top_poses)
-        print(f"  Top-{args.top_k} PDB      : {top_pdb_path}  ({len(top_poses)} models)")
+            if refined_r.status == "error" or not refined_r.refined_complex_pdb.strip():
+                err_head = (refined_r.error or "empty refined PDB").splitlines()[0]
+                print(f"    Refinement failed for rank {i}: {err_head}")
+                continue
+            final_top_poses.append(refined_r)
 
-        for rank, r in enumerate(top_poses, start=1):
-            ie_tag = (
-                f"{r.interaction_energy_kj_per_mol:.1f}"
-                if r.interaction_energy_kj_per_mol is not None
-                else "noE"
-            )
-            fname = (
-                f"top{rank:02d}_frame{r.frame_index:04d}_"
-                f"pocket{r.pocket_id:03d}_"
-                f"ie{ie_tag.replace('-', 'n')}_kJmol.pdb"
-            )
-            (outdir / fname).write_text(r.refined_complex_pdb)
-            print(f"  Written         : {outdir / fname}")
+        top_poses = final_top_poses
+        if top_poses:
+            top_cif_path = outdir / args.top_pdb
+            _write_multiblock_cif(top_cif_path, top_poses)
+            print(f"  Top-{args.top_k} CIF      : {top_cif_path}  ({len(top_poses)} blocks)")
+            print(f"  Top-{args.top_k} output   : per-rank CIF files ({len(top_poses)} models)")
+            for rank, r in enumerate(top_poses, start=1):
+                if args.skip_refinement:
+                    fname = (
+                        f"top{rank:02d}_frame{r.frame_index:04d}_"
+                        f"pocket{r.pocket_id:03d}_docked_only.cif"
+                    )
+                else:
+                    ie_tag = (
+                        f"{r.interaction_energy_kj_per_mol:.1f}"
+                        if r.interaction_energy_kj_per_mol is not None
+                        else "noE"
+                    )
+                    fname = (
+                        f"top{rank:02d}_frame{r.frame_index:04d}_"
+                        f"pocket{r.pocket_id:03d}_"
+                        f"ie{ie_tag.replace('-', 'n')}_kJmol.cif"
+                    )
+                cif_text = r.refined_complex_cif
+                if not cif_text.strip() and r.refined_complex_pdb.strip():
+                    cif_text = _pdb_text_to_cif(r.refined_complex_pdb)
+                if not cif_text.strip():
+                    print(f"  Skipped         : {outdir / fname} (no CIF content)")
+                    continue
+                (outdir / fname).write_text(cif_text)
+                print(f"  Written         : {outdir / fname}")
+        else:
+            if args.skip_refinement:
+                print("  Docked-pose export failed for all top poses; no CIF models written.")
+            else:
+                print("  Refinement failed for all top poses; no refined CIF models written.")
     else:
         print("  No successful poses – nothing to write.")
 
@@ -1127,6 +1181,99 @@ def _write_multimodel_pdb(path: Path, results: list[_FramePoseResult]) -> None:
         lines.append("ENDMDL")
     lines.append("END")
     path.write_text("\n".join(lines) + "\n")
+
+
+def _write_multiblock_cif(path: Path, results: list[_FramePoseResult]) -> None:
+    """Write multiple poses as a valid multi-data-block mmCIF file."""
+    blocks: list[str] = []
+    for rank, r in enumerate(results, start=1):
+        cif_text = r.refined_complex_cif
+        if not cif_text.strip() and r.refined_complex_pdb.strip():
+            cif_text = _pdb_text_to_cif(r.refined_complex_pdb)
+        if not cif_text.strip():
+            continue
+
+        lines = cif_text.splitlines()
+        if not lines:
+            continue
+
+        # Ensure each data block has a unique name.
+        header = (
+            f"data_top{rank:02d}_frame{r.frame_index:04d}_pocket{r.pocket_id:03d}"
+        )
+        if lines[0].startswith("data_"):
+            lines[0] = header
+        else:
+            lines = [header] + lines
+        blocks.append("\n".join(lines).rstrip() + "\n")
+
+    path.write_text("\n".join(blocks))
+
+
+def _build_complex_from_frame_and_docked_pose(
+    *,
+    frame_pdb_path: str,
+    docked_sdf_block: str,
+    ligand_residue_name: str = "LIG",
+) -> tuple[str, str]:
+    """Build a protein+ligand complex and return (PDB text, mmCIF text)."""
+    from rdkit import Chem
+    try:
+        from openmm import Vec3
+        from openmm.app import Topology, Element
+    except ImportError:  # pragma: no cover
+        from simtk.openmm import Vec3  # type: ignore
+        from simtk.openmm.app import Topology, Element  # type: ignore
+
+    protein = PDBFile(str(frame_pdb_path))
+
+    mol_block = docked_sdf_block.split("$$$$")[0].strip()
+    mol = Chem.MolFromMolBlock(mol_block, removeHs=False, sanitize=True)
+    if mol is None:
+        mol = Chem.MolFromMolBlock(mol_block, removeHs=True, sanitize=True)
+    if mol is None:
+        raise ValueError("Unable to parse docked SDF block for complex export")
+
+    top = Topology()
+    chain = top.addChain(id="L")
+    res = top.addResidue(ligand_residue_name[:3], chain, id="1")
+    conf = mol.GetConformer(0)
+    atoms = []
+    positions = []
+    for idx, r_atom in enumerate(mol.GetAtoms(), start=1):
+        sym = r_atom.GetSymbol()
+        elem = Element.getBySymbol(sym)
+        atom_name = f"{sym}{idx % 1000:03d}"[:4]
+        atoms.append(top.addAtom(atom_name, elem, res, id=str(idx)))
+        pos = conf.GetAtomPosition(r_atom.GetIdx())
+        positions.append(Vec3(pos.x, pos.y, pos.z))
+    for bond in mol.GetBonds():
+        top.addBond(atoms[bond.GetBeginAtomIdx()], atoms[bond.GetEndAtomIdx()])
+
+    modeller = Modeller(protein.topology, protein.positions)
+    modeller.add(top, positions * unit.angstrom)
+
+    pdb_out = io.StringIO()
+    PDBFile.writeFile(modeller.topology, modeller.positions, pdb_out, keepIds=True)
+    cif_out = io.StringIO()
+    PDBxFile.writeFile(modeller.topology, modeller.positions, cif_out, keepIds=True)
+    return pdb_out.getvalue(), cif_out.getvalue()
+
+
+def _pdb_text_to_cif(pdb_text: str) -> str:
+    """Convert PDB text to mmCIF text via OpenMM I/O."""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".pdb", mode="w", delete=False) as f:
+        f.write(pdb_text)
+        tmp_path = f.name
+    try:
+        pdb = PDBFile(tmp_path)
+        out = io.StringIO()
+        PDBxFile.writeFile(pdb.topology, pdb.positions, out, keepIds=True)
+        return out.getvalue()
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -48,6 +48,7 @@ pixi run python test_dynamics.py \
   --shell-radius-angstrom  8.0 \
   --protein-restraint-k    10.0 \
   --refine-iterations      500 \
+  --skip-refinement \
   --top-k 5 \
-  --top-pdb "top5_poses.pdb" \
+  --top-pdb "top5_poses.cif" \
   --analyze-frames-only
