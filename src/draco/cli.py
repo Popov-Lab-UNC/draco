@@ -25,7 +25,7 @@ Pipeline
                               └────────────┬────────────┘
                                            │
                               ┌────────────▼────────────┐
-                              │  final refinement (OpeNMM)
+                              │  refinement (OpeNMM)
                               │  (top-K poses only)     │
                               └────────────┬────────────┘
                                            │
@@ -40,7 +40,7 @@ Usage (SAR series mode):
     draco --mode sar \
         --steps dynamics pocket docking scoring refinement \
         --protein-pdb 6pbc-prepared.pdb \
-        --compound-csv compounds.csv \\
+        --ligand-csv compounds.csv \\
         --output-dir dynamics_docking_output
 
 Usage (single-compound mode):
@@ -85,17 +85,15 @@ import numpy as np
 from draco.dynamics import DynamicsFrame, DynamicsResult, run_dynamics
 from draco.docking import (
     DockingBox, GninaDockResult, PocketDockResult,
-    docking_box_from_pocket, dock_ligands_to_pocket,
+    dock_ligands_to_pocket,
 )
 from draco.ligand_preparation import (
     PreparedLigand, prepare_ligand_from_smiles, prepare_protonation_states,
     load_compound_csv, write_ligand_sdf, write_ligands_for_docking,
 )
-from draco.final_refinement import RefinementResult, refine_docked_pose
+from draco.refinement import RefinementResult, refine_docked_pose
 from draco.sar_scoring import SARScoreResult, compute_sar_discrimination
 from draco.protein_preparation import PreparedProtein, prepare_protein
-
-import pocketeer as pt
 
 try:
     from openmm import LangevinMiddleIntegrator, Platform, unit
@@ -119,7 +117,7 @@ warnings.filterwarnings(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Draco: MD → GNINA docking → SAR scoring → top-k refinement.",
+        description="Draco: MD → Pocketeer → GNINA docking → SAR scoring → top-k refinement.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -136,7 +134,8 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=["dynamics", "pocket", "docking", "scoring", "refinement"],
         choices=["dynamics", "pocket", "docking", "scoring", "refinement"],
-        help="[OPTIONAL] Specify which steps of the pipeline to run."
+        help="[OPTIONAL] Pipeline steps. With 'pocket', artifacts are written to "
+        "<output-dir>/pockets/. Docking/scoring without 'pocket' reloads those artifacts."
     )
     primary_grp.add_argument(
         "--protein-pdb",
@@ -144,7 +143,7 @@ def parse_args() -> argparse.Namespace:
         help="[REQUIRED] Input protein PDB path."
     )
     primary_grp.add_argument(
-        "--compound-csv",
+        "--ligand-csv",
         help="[REQUIRED for --mode sar] CSV with columns name,smiles,active (1/0). Enables SAR discrimination scoring."
     )
     primary_grp.add_argument(
@@ -161,7 +160,7 @@ def parse_args() -> argparse.Namespace:
     global_grp = parser.add_argument_group("Global & Output Parameters")
     global_grp.add_argument("--ph", type=float, default=7.4, help="Target pH for protonation states.")
     global_grp.add_argument("--top-k", type=int, default=5, help="Number of top poses to keep.")
-    global_grp.add_argument("--top-pdb", default="top5_poses.cif", help="Filename for the top poses (CIF format).")
+    global_grp.add_argument("--top-output", default="top5_poses.cif", help="Filename for the top poses (CIF format).")
     global_grp.add_argument("--dry-run", action="store_true", default=False, help="Run without computationally intensive steps.")
 
     # ── Dynamics (MD) Parameters ──────────────────────────────────────────────
@@ -196,8 +195,8 @@ def parse_args() -> argparse.Namespace:
     docking_grp.add_argument("--gnina-seed", type=int, default=0, help="Random seed for GNINA.")
     docking_grp.add_argument("--gnina-timeout-seconds", type=int, default=None, metavar="N", help="Wall-clock limit per GNINA subprocess (seconds).")
 
-    # ── Final Refinement Parameters ───────────────────────────────────────────
-    refine_grp = parser.add_argument_group("Final Refinement Parameters")
+    # ── Refinement Parameters ───────────────────────────────────────────────────
+    refine_grp = parser.add_argument_group("Refinement Parameters")
     refine_grp.add_argument("--shell-radius-angstrom", type=float, default=8.0, help="Radius around ligand to keep flexible.")
     refine_grp.add_argument("--protein-restraint-k", type=float, default=10.0, help="Restraint force constant for non-flexible protein atoms.")
     refine_grp.add_argument("--refine-iterations", type=int, default=500, help="Maximum number of refinement iterations.")
@@ -207,15 +206,15 @@ def parse_args() -> argparse.Namespace:
 
     # Post-parsing validation
     if args.mode == "sar":
-        if not args.compound_csv:
-            parser.error("--compound-csv is REQUIRED when --mode is 'sar'.")
+        if not args.ligand_csv:
+            parser.error("--ligand-csv is REQUIRED when --mode is 'sar'.")
         if args.ligand_smiles:
-            parser.error("--ligand-smiles cannot be used when --mode is 'sar'. Use --compound-csv instead.")
+            parser.error("--ligand-smiles cannot be used when --mode is 'sar'. Use --ligand-csv instead.")
     elif args.mode == "single":
         if not args.ligand_smiles:
             parser.error("--ligand-smiles is REQUIRED when --mode is 'single'.")
-        if args.compound_csv:
-            parser.error("--compound-csv cannot be used when --mode is 'single'. Use --ligand-smiles instead.")
+        if args.ligand_csv:
+            parser.error("--ligand-csv cannot be used when --mode is 'single'. Use --ligand-smiles instead.")
 
     return args
 
@@ -296,7 +295,7 @@ def _worker_init() -> None:
     try:
         import openmm
         import rdkit
-        import pocketeer
+        import draco.pocket
         import draco.protein_preparation
     except ImportError:
         pass
@@ -321,6 +320,7 @@ def _dock_frame_worker(
     docking_output_dir: str | None = None,
     gnina_timeout_seconds: int | None = None,
     steps: list[str] | None = None,
+    project_output_dir: str | None = None,
 ) -> list[_FramePoseResult]:
     """Worker: Detect pockets, dock all ligands with GNINA, compute SAR score.
 
@@ -330,10 +330,13 @@ def _dock_frame_worker(
 
     Returns one _FramePoseResult per (pocket, parent_ligand) pair.
     """
-    import io, tempfile
-    import biotite.structure.io.pdb as _biotite_pdb
-    import pocketeer as pt
-    from draco.docking import docking_box_from_pocket, dock_ligands_to_pocket
+    from draco.docking import DockingBox, dock_ligands_to_pocket
+    from draco.pocket import (
+        docking_box_from_pocket,
+        find_pockets_above_threshold,
+        load_pocket_entries,
+        write_pocket_artifact_for_frame,
+    )
     from draco.sar_scoring import compute_sar_discrimination
     from draco.docking import PocketDockResult
 
@@ -343,17 +346,13 @@ def _dock_frame_worker(
     if steps is None:
         steps = ["dynamics", "pocket", "docking", "scoring", "refinement"]
 
-    pockets = []
+    work_items: list[tuple[int, float, DockingBox]] = []
+
     if "pocket" in steps:
         try:
-            frame_atomarray = _biotite_pdb.PDBFile.read(
-                io.StringIO(protein_pdb_string)
-            ).get_structure(model=1)
-            pockets = pt.find_pockets(frame_atomarray)
-            pockets = [p for p in pockets
-                       if float(getattr(p, "score", 0.0)) > pocket_score_threshold]
-            if not pockets:
-                return []
+            pockets = find_pockets_above_threshold(
+                protein_pdb_string, pocket_score_threshold
+            )
         except Exception as exc:
             import traceback
             return [_FramePoseResult(
@@ -362,20 +361,33 @@ def _dock_frame_worker(
                 cnn_affinity=0.0, vina_score=0.0, auc_roc=None,
                 status="error", error=f"Pocketeer failed: {exc}\n{traceback.format_exc()}"
             )]
-    else:
-        # If we skipped pockets but need to do docking, we can't really proceed
-        # unless docking is also skipped (meaning we just read results).
-        # Actually, if we just read results, we might need pocket info.
-        # But wait, if we are loading existing docking output, we still need pocket_id.
-        # Let's see how compile-results-only handled it: it still ran pt.find_pockets!
-        # Since pocketeer is fast, we will just error if they skip pocket but want docking/scoring
-        # without pockets. Actually, wait. If they skip pocket, how do we get pockets?
-        # We'll just run pocketeer if docking or scoring is requested, OR we can raise an error.
-        # Let's raise an error if they try to do docking or scoring without pockets.
-        if "docking" in steps or "scoring" in steps:
-            # Actually, the user requirement is: "throw error if something is not there, for example, the frames needed for pocket finding"
-            # We'll raise an error if pocket is missing but we are here.
-            raise ValueError("The 'pocket' step is required for 'docking' or 'scoring'.")
+        if project_output_dir:
+            write_pocket_artifact_for_frame(project_output_dir, frame_index, pockets)
+        if not pockets:
+            return []
+        for idx, pocket in enumerate(pockets):
+            pid = int(getattr(pocket, "pocket_id", idx))
+            score = float(getattr(pocket, "score", 0.0))
+            box = docking_box_from_pocket(pocket)
+            work_items.append((pid, score, box))
+    elif "docking" in steps or "scoring" in steps:
+        if not project_output_dir:
+            raise ValueError(
+                "project_output_dir is required when running docking or scoring without the "
+                "'pocket' step (expected pocket artifacts under <output-dir>/pockets/)."
+            )
+        try:
+            work_items = load_pocket_entries(project_output_dir, frame_index)
+        except FileNotFoundError as exc:
+            raise ValueError(
+                "Docking/scoring without the 'pocket' step requires precomputed pocket "
+                f"artifacts. {exc}"
+            ) from exc
+        if not work_items:
+            return []
+
+    if not work_items:
+        return []
 
     results: list[_FramePoseResult] = []
     sar_mode = bool(active_names or inactive_names)
@@ -384,10 +396,7 @@ def _dock_frame_worker(
     active_state_names = {sn for sn, pn in name_map.items() if pn in set(active_names)}
     inactive_state_names = {sn for sn, pn in name_map.items() if pn in set(inactive_names)}
 
-    for pocket_idx, pocket in enumerate(pockets):
-        pocket_id = int(getattr(pocket, "pocket_id", pocket_idx))
-        pocket_score = float(getattr(pocket, "score", 0.0))
-
+    for pocket_id, pocket_score, box in work_items:
         # Create per-pocket output dir for GNINA
         if docking_output_dir:
             pocket_out = __import__('pathlib').Path(docking_output_dir) / f"frame{frame_index:04d}_pocket{pocket_id}"
@@ -397,8 +406,6 @@ def _dock_frame_worker(
             out_dir_str = None
 
         try:
-            box = docking_box_from_pocket(pocket)
-            
             if "docking" not in steps and out_dir_str:
                 import draco.docking as docking
                 pocket_dock = docking.PocketDockResult(pocket_id=pocket_id, docking_box=box)
@@ -522,7 +529,7 @@ def _refine_pose_worker(
     compute_ie: bool,
 ) -> _FramePoseResult:
     """Worker: Locally minimise one GNINA-docked pose with OpenMM."""
-    from draco.final_refinement import refine_docked_pose
+    from draco.refinement import refine_docked_pose
     ref = refine_docked_pose(
         protein_pdb_path,
         docked_sdf_block,
@@ -592,9 +599,9 @@ def main() -> None:
     # name_map: state_name → parent_ligand_name
     name_map: dict[str, str] = {}
 
-    if args.compound_csv:
+    if args.ligand_csv:
         actives, inactives, name_map = load_compound_csv(
-            args.compound_csv, num_conformers=args.num_conformers,
+            args.ligand_csv, num_conformers=args.num_conformers,
         )
         all_compounds = actives + inactives
         # active_names / inactive_names are PARENT-level names
@@ -603,7 +610,7 @@ def main() -> None:
         n_act_states = len(actives)
         n_inact_states = len(inactives)
         print(f"  Loaded {len(active_names)} actives ({n_act_states} states), "
-              f"{len(inactive_names)} inactives ({n_inact_states} states) from {args.compound_csv}")
+              f"{len(inactive_names)} inactives ({n_inact_states} states) from {args.ligand_csv}")
     else:
         states = prepare_protonation_states(
             args.ligand_smiles, name=args.ligand_name,
@@ -678,7 +685,7 @@ def main() -> None:
                                         f"ligand={best.ligand_name}"
                                     )
                             if heap_updated and args.top_k > 0:
-                                _write_multimodel_pdb(outdir / args.top_pdb, top_heap.sorted_best())
+                                _write_multimodel_pdb(outdir / args.top_output, top_heap.sorted_best())
                         else:
                             print(f"     Frame {r.frame_index} pocket {r.pocket_id} FAILED: {r.error[:120]}")
                             row = {"status": "error", "frame_index": r.frame_index,
@@ -733,6 +740,7 @@ def main() -> None:
                     docking_output_dir=str(docking_output_dir),
                     gnina_timeout_seconds=args.gnina_timeout_seconds,
                     steps=args.steps,
+                    project_output_dir=str(outdir),
                 )
                 future.add_done_callback(on_dock_done)
             except Exception:
@@ -905,7 +913,7 @@ def main() -> None:
 
         top_poses = final_top_poses
         if top_poses:
-            top_cif_path = outdir / args.top_pdb
+            top_cif_path = outdir / args.top_output
             _write_multiblock_cif(top_cif_path, top_poses)
             print(f"  Top-{args.top_k} CIF      : {top_cif_path}  ({len(top_poses)} blocks)")
             print(f"  Top-{args.top_k} output   : per-rank CIF files ({len(top_poses)} models)")

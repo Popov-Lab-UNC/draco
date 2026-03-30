@@ -1,6 +1,6 @@
 """utils.py – Shared helpers used by multiple Draco pipeline stages.
 
-Extracted from local_minimization.py so that final_refinement.py and
+Extracted from local_minimization.py so that refinement.py and
 other modules can import them without depending on the deprecated
 overlay-based local_minimization module.
 """

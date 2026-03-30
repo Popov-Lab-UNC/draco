@@ -2,15 +2,17 @@
 
 Role in the Pipeline
 --------------------
-Sits between Pocketeer pocket detection and SAR scoring:
+Sits between ``draco.pocket`` (Pocketeer) and SAR scoring:
 
-    dynamics.py → pocketeer → docking → sar_scoring → final_refinement
+    dynamics.py → pocket.py → docking → sar_scoring → refinement
 
 This module provides:
-  1. DockingBox – derived from a Pocketeer pocket's alpha-sphere cloud.
+  1. DockingBox – axis-aligned GNINA search box (often built via ``draco.pocket``).
   2. GninaDockResult – parsed output from a single GNINA docking run.
   3. dock_ligand() – run GNINA on a single ligand SDF into a single pocket.
   4. dock_ligands_to_pocket() – dock multiple ligands into the same pocket.
+
+Pocketeer-specific box construction lives in ``draco.pocket``.
 
 GNINA is called as a subprocess. It must be available on PATH (or provide
 the full binary path via ``gnina_binary``).
@@ -41,7 +43,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import numpy.typing as npt
 
 _log = logging.getLogger(__name__)
 
@@ -116,81 +117,6 @@ class PocketDockResult:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Docking box derivation from Pocketeer pockets
-# ─────────────────────────────────────────────────────────────────────────────
-
-def docking_box_from_pocket(
-    pocket,
-    *,
-    padding_angstrom: float = 5.0,
-    min_size_angstrom: float = 15.0,
-) -> DockingBox:
-    """Derive a GNINA docking box from a Pocketeer pocket object.
-
-    The center is the centroid of all alpha-sphere centers. The size is
-    the coordinate range (max - min) along each axis, plus ``padding_angstrom``
-    on each side, with a minimum of ``min_size_angstrom`` in each dimension.
-
-    Parameters
-    ----------
-    pocket:
-        A Pocketeer ``Pocket`` object (has ``.atom_coords`` or equivalent).
-    padding_angstrom:
-        Extra space added to each side of the bounding box (default 5 Å).
-    min_size_angstrom:
-        Minimum box dimension in any axis (default 15 Å).
-
-    Returns
-    -------
-    DockingBox
-    """
-    centers = _get_pocket_sphere_centers(pocket)  # (N, 3) in Å
-
-    centroid = centers.mean(axis=0)  # shape (3,)
-    extent = centers.max(axis=0) - centers.min(axis=0)  # shape (3,)
-    size = np.maximum(extent + 2.0 * padding_angstrom, min_size_angstrom)
-
-    return DockingBox(
-        center_x=float(centroid[0]),
-        center_y=float(centroid[1]),
-        center_z=float(centroid[2]),
-        size_x=float(size[0]),
-        size_y=float(size[1]),
-        size_z=float(size[2]),
-    )
-
-
-def _get_pocket_sphere_centers(pocket) -> npt.NDArray[np.float64]:
-    """Extract alpha-sphere center coordinates (Å) from a Pocketeer pocket.
-
-    Pocketeer may expose these via different attribute names depending on
-    version; we try a few known names.
-    """
-    # Pocketeer >= 0.3: pocket.sphere_centers (Å) or pocket.spheres (list of AlphaSphere)
-    for attr in ("sphere_centers", "alpha_sphere_centers", "centers", "spheres"):
-        val = getattr(pocket, attr, None)
-        if val is not None:
-            if attr == "spheres" and isinstance(val, list):
-                # val is list[AlphaSphere], each with a .center attribute (Å)
-                return np.stack([s.center for s in val], axis=0)
-            arr = np.asarray(val, dtype=np.float64)
-            if arr.ndim == 2 and arr.shape[1] == 3:
-                return arr
-
-    # Fallback: pocket.atoms gives the lining atoms; use their coordinates
-    # (less accurate than sphere centers but always available)
-    atoms = getattr(pocket, "atoms", None)
-    if atoms is not None:
-        coords = np.stack([a.coord for a in atoms], axis=0)
-        return coords.astype(np.float64)
-
-    raise AttributeError(
-        "Cannot extract alpha-sphere centers from pocket object. "
-        f"Available attributes: {[a for a in dir(pocket) if not a.startswith('_')]}"
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # GNINA invocation
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -219,7 +145,7 @@ def dock_ligand(
     ligand_sdf_path:
         Path to the ligand SDF file (one or more conformers).
     box:
-        Docking search box (from ``docking_box_from_pocket``).
+        Docking search box (e.g. from ``draco.pocket.docking_box_from_pocket``).
     ligand_name:
         Label for the ligand (used in result objects). Defaults to the
         SDF filename stem.

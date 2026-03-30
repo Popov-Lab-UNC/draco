@@ -2,7 +2,7 @@
 
 Role in the Pipeline
 --------------------
-    docking → sar_scoring → final_refinement
+    docking → sar_scoring → refinement
 
 This module takes docking results for a full SAR compound series (actives +
 inactives) docked into a single (conformation, pocket) pair, and computes

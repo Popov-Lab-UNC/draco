@@ -1,8 +1,8 @@
-"""final_refinement.py – Local protein-ligand relaxation for GNINA-docked poses.
+"""refinement.py – Local protein-ligand relaxation for GNINA-docked poses.
 
 Role in the Pipeline
 --------------------
-    docking → sar_scoring → final_refinement
+    docking → sar_scoring → refinement
 
 Applied only to the top-K (conformation, pose) pairs selected after SAR
 scoring. Because GNINA-docked poses are already sterically valid (Monte
