@@ -37,12 +37,16 @@ Pipeline
                               └─────────────────────────┘
 
 Usage (SAR series mode):
-    draco --protein-pdb 6pbc-prepared.pdb \\
+    draco --mode sar \
+        --steps dynamics pocket docking scoring refinement \
+        --protein-pdb 6pbc-prepared.pdb \
         --compound-csv compounds.csv \\
         --output-dir dynamics_docking_output
 
 Usage (single-compound mode):
-    draco --protein-pdb 6pbc-prepared.pdb \\
+    draco --mode single \
+        --steps dynamics pocket docking refinement \
+        --protein-pdb 6pbc-prepared.pdb \
         --ligand-smiles "CN(CC1(CC1)c1ccc(F)cc1)C(=O)..." \\
         --output-dir dynamics_gnina_single
 """
@@ -115,87 +119,105 @@ warnings.filterwarnings(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Draco: MD → GNINA docking → SAR scoring → top-k refinement."
+        description="Draco: MD → GNINA docking → SAR scoring → top-k refinement.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # ── Input / output ──────────────────────────────────────────────────────
-    parser.add_argument("--protein-pdb", required=True, help="Input protein PDB path")
-    # Ligand input — mutually exclusive modes
-    lig_grp = parser.add_mutually_exclusive_group(required=True)
-    lig_grp.add_argument(
-        "--compound-csv",
-        help="CSV with columns name,smiles,active (1/0). Enables SAR discrimination scoring."
+    # ── Primary Execution Parameters ──────────────────────────────────────────
+    primary_grp = parser.add_argument_group("Primary Execution Parameters")
+    primary_grp.add_argument(
+        "--mode",
+        required=True,
+        choices=["single", "sar"],
+        help="[REQUIRED] Mode of operation: 'single' for one compound or 'sar' for structure-activity relationship scoring."
     )
-    lig_grp.add_argument(
-        "--ligand-smiles",
-        help="Single ligand SMILES. Poses ranked by CNN affinity (no SAR scoring)."
-    )
-    parser.add_argument("--ligand-name", default="LIG", help="Name for --ligand-smiles compound")
-    parser.add_argument("--output-dir",  default="dynamics_docking_output")
-    parser.add_argument("--ph",          type=float, default=7.4)
-
-    # ── MD / dynamics ────────────────────────────────────────────────────────
-    parser.add_argument("--platform-name",          default="CUDA")
-    parser.add_argument("--cuda-precision",         default="mixed")
-    parser.add_argument("--box-padding-nm",         type=float, default=1.0)
-    parser.add_argument("--ionic-strength",         type=float, default=0.15)
-    parser.add_argument("--nvt-steps",              type=int, default=50_000)
-    parser.add_argument("--npt-steps",              type=int, default=50_000)
-    parser.add_argument("--production-steps",       type=int, default=2_500_000)
-    parser.add_argument("--timestep-fs",            type=float, default=2.0)
-    parser.add_argument("--friction-per-ps",        type=float, default=1.0)
-    parser.add_argument("--temperature-kelvin",     type=float, default=300.0)
-    parser.add_argument("--water-model",            default="tip3pfb")
-    parser.add_argument("--report-interval-steps", type=int, default=5_000)
-    parser.add_argument("--rmsd-threshold-angstrom", type=float, default=1.5)
-    parser.add_argument("--no-trajectory",          action="store_true", default=False)
-
-    # ── Pocketeer ─────────────────────────────────────────────────────────────
-    parser.add_argument("--pocket-score-threshold", type=float, default=5.0)
-    parser.add_argument("--num-conformers",         type=int,   default=20)
-
-    # ── GNINA docking ─────────────────────────────────────────────────────────
-    parser.add_argument("--gnina-binary",    default="gnina",
-                        help="Path or name of the gnina binary (default: gnina)")
-    parser.add_argument("--exhaustiveness",  type=int, default=8,
-                        help="GNINA exhaustiveness (default 8)")
-    parser.add_argument("--num-modes",       type=int, default=9,
-                        help="Number of docked poses per ligand (default 9)")
-    parser.add_argument("--cnn-scoring",     default="rescore",
-                        choices=["rescore", "refinement", "none"],
-                        help="GNINA CNN scoring mode (default: rescore)")
-    parser.add_argument("--gnina-seed",      type=int, default=0)
-    parser.add_argument(
-        "--gnina-timeout-seconds",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Wall-clock limit per GNINA subprocess (seconds). "
-        "Omit for no limit (GNINA runs to completion).",
-    )
-
-    # ── Final refinement ─────────────────────────────────────────────────────
-    parser.add_argument("--shell-radius-angstrom", type=float, default=8.0)
-    parser.add_argument("--protein-restraint-k",   type=float, default=10.0)
-    parser.add_argument("--refine-iterations",     type=int,   default=500)
-    parser.add_argument("--no-interaction-energy", action="store_true", default=False)
-
-    # ── Output ────────────────────────────────────────────────────────────────
-    parser.add_argument("--top-k",   type=int, default=5)
-    parser.add_argument("--top-pdb", default="top5_poses.cif")
-
-    # ── Debug ─────────────────────────────────────────────────────────────────
-    parser.add_argument("--dry-run",            action="store_true", default=False)
-
-    # ── Steps ─────────────────────────────────────────────────────────────────
-    parser.add_argument(
+    primary_grp.add_argument(
         "--steps",
         nargs="+",
         default=["dynamics", "pocket", "docking", "scoring", "refinement"],
         choices=["dynamics", "pocket", "docking", "scoring", "refinement"],
-        help="Specify which steps of the pipeline to run. Defaults to all.",
+        help="[OPTIONAL] Specify which steps of the pipeline to run."
     )
-    return parser.parse_args()
+    primary_grp.add_argument(
+        "--protein-pdb",
+        required=True,
+        help="[REQUIRED] Input protein PDB path."
+    )
+    primary_grp.add_argument(
+        "--compound-csv",
+        help="[REQUIRED for --mode sar] CSV with columns name,smiles,active (1/0). Enables SAR discrimination scoring."
+    )
+    primary_grp.add_argument(
+        "--ligand-smiles",
+        help="[REQUIRED for --mode single] Single ligand SMILES. Poses ranked by CNN affinity (no SAR scoring)."
+    )
+    primary_grp.add_argument(
+        "--output-dir",
+        default="dynamics_docking_output",
+        help="[OPTIONAL] Directory for output files."
+    )
+
+    # ── Output & Global Parameters ────────────────────────────────────────────
+    global_grp = parser.add_argument_group("Global & Output Parameters")
+    global_grp.add_argument("--ph", type=float, default=7.4, help="Target pH for protonation states.")
+    global_grp.add_argument("--top-k", type=int, default=5, help="Number of top poses to keep.")
+    global_grp.add_argument("--top-pdb", default="top5_poses.cif", help="Filename for the top poses (CIF format).")
+    global_grp.add_argument("--dry-run", action="store_true", default=False, help="Run without computationally intensive steps.")
+
+    # ── Dynamics (MD) Parameters ──────────────────────────────────────────────
+    dyn_grp = parser.add_argument_group("Dynamics (MD) Parameters")
+    dyn_grp.add_argument("--platform-name", default="CUDA", help="OpenMM platform name.")
+    dyn_grp.add_argument("--cuda-precision", default="mixed", help="CUDA precision.")
+    dyn_grp.add_argument("--box-padding-nm", type=float, default=1.0, help="Solvent box padding in nm.")
+    dyn_grp.add_argument("--ionic-strength", type=float, default=0.15, help="Ionic strength in Molar.")
+    dyn_grp.add_argument("--nvt-steps", type=int, default=50_000, help="Number of NVT equilibration steps.")
+    dyn_grp.add_argument("--npt-steps", type=int, default=50_000, help="Number of NPT equilibration steps.")
+    dyn_grp.add_argument("--production-steps", type=int, default=2_500_000, help="Number of production MD steps.")
+    dyn_grp.add_argument("--timestep-fs", type=float, default=2.0, help="MD timestep in femtoseconds.")
+    dyn_grp.add_argument("--friction-per-ps", type=float, default=1.0, help="Langevin friction coefficient (1/ps).")
+    dyn_grp.add_argument("--temperature-kelvin", type=float, default=300.0, help="Simulation temperature in Kelvin.")
+    dyn_grp.add_argument("--water-model", default="tip3pfb", help="Water model for solvation.")
+    dyn_grp.add_argument("--report-interval-steps", type=int, default=5_000, help="Steps between frame reports.")
+    dyn_grp.add_argument("--rmsd-threshold-angstrom", type=float, default=1.5, help="C-alpha RMSD threshold for keeping a frame.")
+    dyn_grp.add_argument("--no-trajectory", action="store_true", default=False, help="Disable saving the MD trajectory (DCD).")
+
+    # ── Pocket & Ligand Prep Parameters ───────────────────────────────────────
+    pocket_grp = parser.add_argument_group("Pocket & Ligand Prep Parameters")
+    pocket_grp.add_argument("--pocket-score-threshold", type=float, default=5.0, help="Pocketeer score threshold.")
+    pocket_grp.add_argument("--num-conformers", type=int, default=20, help="Number of conformers to generate for ligands.")
+    pocket_grp.add_argument("--ligand-name", default="LIG", help="Name for --ligand-smiles compound.")
+
+    # ── GNINA Docking Parameters ──────────────────────────────────────────────
+    docking_grp = parser.add_argument_group("GNINA Docking Parameters")
+    docking_grp.add_argument("--gnina-binary", default="gnina", help="Path or name of the gnina binary.")
+    docking_grp.add_argument("--exhaustiveness", type=int, default=8, help="GNINA exhaustiveness.")
+    docking_grp.add_argument("--num-modes", type=int, default=9, help="Number of docked poses per ligand.")
+    docking_grp.add_argument("--cnn-scoring", default="rescore", choices=["rescore", "refinement", "none"], help="GNINA CNN scoring mode.")
+    docking_grp.add_argument("--gnina-seed", type=int, default=0, help="Random seed for GNINA.")
+    docking_grp.add_argument("--gnina-timeout-seconds", type=int, default=None, metavar="N", help="Wall-clock limit per GNINA subprocess (seconds).")
+
+    # ── Final Refinement Parameters ───────────────────────────────────────────
+    refine_grp = parser.add_argument_group("Final Refinement Parameters")
+    refine_grp.add_argument("--shell-radius-angstrom", type=float, default=8.0, help="Radius around ligand to keep flexible.")
+    refine_grp.add_argument("--protein-restraint-k", type=float, default=10.0, help="Restraint force constant for non-flexible protein atoms.")
+    refine_grp.add_argument("--refine-iterations", type=int, default=500, help="Maximum number of refinement iterations.")
+    refine_grp.add_argument("--no-interaction-energy", action="store_true", default=False, help="Disable computing the interaction energy.")
+
+    args = parser.parse_args()
+
+    # Post-parsing validation
+    if args.mode == "sar":
+        if not args.compound_csv:
+            parser.error("--compound-csv is REQUIRED when --mode is 'sar'.")
+        if args.ligand_smiles:
+            parser.error("--ligand-smiles cannot be used when --mode is 'sar'. Use --compound-csv instead.")
+    elif args.mode == "single":
+        if not args.ligand_smiles:
+            parser.error("--ligand-smiles is REQUIRED when --mode is 'single'.")
+        if args.compound_csv:
+            parser.error("--compound-csv cannot be used when --mode is 'single'. Use --ligand-smiles instead.")
+
+    return args
 
 
 # ─────────────────────────────────────────────────────────────────────────────
