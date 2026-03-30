@@ -10,7 +10,7 @@
 #SBATCH --cpus-per-task=16
 
 #SBATCH --mem=32G
-#SBATCH --time=08:00:00
+#SBATCH --time=01-00:00:00
 #SBATCH --output=test_dynamics_%j.log
 #SBATCH --error=test_dynamics_%j.err
 #SBATCH --mail-user=shuhang@unc.edu
@@ -29,9 +29,9 @@ cd /work/users/s/h/shuhang/draco
 OUTPUT_DIR="test_dynamics_output_2"
 
 pixi run draco \
-  --mode single \
-  --steps scoring \
+  --mode sar \
+  --steps pocket docking scoring \
   --protein-pdb       "6WAU.pdb" \
-  --ligand-smiles     "BrC1=NN(C)C2=C1C(N3CC[C@@H](NC4CCC4)CCC3)=NC(N5CCC(F)(F)C5)=N2" \
+  --ligand-csv        "/users/s/h/shuhang/PHF19/phf19_data_30mar2026.csv" \
   --gnina-binary      "apptainer run --nv /work/users/s/h/shuhang/gnina_build/gnina.sif" \
   --output-dir        "${OUTPUT_DIR}"
