@@ -90,7 +90,7 @@ from draco.docking import (
     dock_ligands_to_pocket,
 )
 from draco.ligand_preparation import (
-    PreparedLigand, prepare_ligand_from_smiles, prepare_protonation_states,
+    PreparedLigand, prepare_ligand_from_smiles,
     load_compound_csv, write_ligand_sdf, write_ligands_for_docking,
 )
 from draco.refinement import RefinementResult, refine_docked_pose
@@ -185,7 +185,8 @@ def parse_args() -> argparse.Namespace:
     # ── Pocket & Ligand Prep Parameters ───────────────────────────────────────
     pocket_grp = parser.add_argument_group("Pocket & Ligand Prep Parameters")
     pocket_grp.add_argument("--pocket-score-threshold", type=float, default=5.0, help="Pocketeer score threshold.")
-    pocket_grp.add_argument("--num-conformers", type=int, default=20, help="Number of conformers to generate for ligands.")
+    pocket_grp.add_argument("--num-conformers", type=int, default=100, help="Number of conformers to generate for ligands.")
+    pocket_grp.add_argument("--energy-cutoff", type=float, default=5.0, help="Energy cutoff (kcal/mol) for conformer pruning.")
     pocket_grp.add_argument("--ligand-name", default="LIG", help="Name for --ligand-smiles compound.")
 
     # ── GNINA Docking Parameters ──────────────────────────────────────────────
@@ -629,6 +630,7 @@ def main() -> None:
         "random_seed": 0xF00D,
         "optimize": True,
         "max_iterations": 200,
+        "energy_cutoff": args.energy_cutoff,
     }
 
     cache_hit = False
@@ -679,31 +681,30 @@ def main() -> None:
         if args.ligand_csv:
             actives, inactives, name_map = load_compound_csv(
                 args.ligand_csv, num_conformers=args.num_conformers,
+                energy_cutoff=args.energy_cutoff,
             )
             all_compounds = actives + inactives
             # active_names / inactive_names are PARENT-level names
             active_names = sorted({name_map[l.name] for l in actives})
             inactive_names = sorted({name_map[l.name] for l in inactives})
-            n_act_states = len(actives)
-            n_inact_states = len(inactives)
             print(
-                f"  Loaded {len(active_names)} actives ({n_act_states} states), "
-                f"{len(inactive_names)} inactives ({n_inact_states} states) from {args.ligand_csv}"
+                f"  Loaded {len(active_names)} actives, "
+                f"{len(inactive_names)} inactives from {args.ligand_csv}"
             )
         else:
-            states = prepare_protonation_states(
+            prep = prepare_ligand_from_smiles(
                 args.ligand_smiles, name=args.ligand_name,
                 num_conformers=args.num_conformers,
+                energy_cutoff=args.energy_cutoff,
             )
-            all_compounds = states
-            for s in states:
-                name_map[s.name] = args.ligand_name
+            all_compounds = [prep]
+            name_map[prep.name] = args.ligand_name
             active_names = []
             inactive_names = []
-            n_confs = sum(len(s.conformers) for s in states)
+            n_confs = len(prep.conformers)
             print(
                 f"  Single compound mode: {args.ligand_name} "
-                f"({len(states)} protonation state(s), {n_confs} total conformers)"
+                f"({n_confs} conformers within {args.energy_cutoff} kcal/mol cutoff)"
             )
 
         # Write SDF files once; pass absolute paths to workers
