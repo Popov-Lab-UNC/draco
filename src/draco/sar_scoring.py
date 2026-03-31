@@ -113,8 +113,8 @@ def compute_sar_discrimination(
     SARScoreResult
     """
     # Ranking direction: vina_score → lower (more negative) is better.
-    # cnn_affinity (pK) and cnn_score → higher is better.
-    higher_is_better_score = score_key in ("cnn_affinity", "cnn_score")
+    # cnn_affinity (pK), cnn_vs (0-1), and cnn_score (0-1) → higher is better.
+    higher_is_better_score = score_key in ("cnn_affinity", "cnn_score", "cnn_vs")
 
     active_scores: list[float] = []
     inactive_scores: list[float] = []
@@ -276,11 +276,11 @@ def _best_score(
 
     Returns None if ``poses`` is empty (compound not docked).
     For ``cnn_affinity`` (pK): returns maximum. For ``vina_score``: minimum (most negative).
-    For ``cnn_score`` (0–1): returns maximum.
+    For ``cnn_score`` (0–1) and ``cnn_vs`` (0-1): returns maximum.
     """
     if not poses:
         return None
     vals = [getattr(p, score_key) for p in poses]
-    if score_key in ("cnn_score", "cnn_affinity"):
+    if score_key in ("cnn_score", "cnn_affinity", "cnn_vs"):
         return max(vals)
     return min(vals)  # vina: most negative = best

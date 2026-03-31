@@ -197,6 +197,8 @@ def parse_args() -> argparse.Namespace:
     docking_grp.add_argument("--cnn-scoring", default="rescore", choices=["rescore", "refinement", "none"], help="GNINA CNN scoring mode.")
     docking_grp.add_argument("--gnina-seed", type=int, default=0, help="Random seed for GNINA.")
     docking_grp.add_argument("--gnina-timeout-seconds", type=int, default=None, metavar="N", help="Wall-clock limit per GNINA subprocess (seconds).")
+    docking_grp.add_argument("--scoring-method", default="cnn_vs", choices=["cnn_vs", "cnn_affinity", "cnn_score", "vina_score"], help="Which GNINA metric to use for ranking poses and computing SAR.")
+    docking_grp.add_argument("--sar-metric", default="auc_roc", choices=["auc_roc", "enrichment_1pct", "enrichment_5pct", "enrichment_10pct"], help="Metric to rank poses by in 'sar' mode. Defaults to auc_roc.")
 
     # ── Refinement Parameters ───────────────────────────────────────────────────
     refine_grp = parser.add_argument_group("Refinement Parameters")
@@ -236,7 +238,9 @@ class _FramePoseResult:
     ligand_name: str             # name of the docked compound
     cnn_affinity: float          # best GNINA CNN affinity (pK; higher = better)
     vina_score: float            # best GNINA Vina score
-    auc_roc: float | None        # SAR discrimination AUC (None in single-compound mode)
+    cnn_score: float             # best GNINA CNN pose score (0-1)
+    cnn_vs: float                # best GNINA CNN VS score (0-1)
+    auc_roc: float | None        # SAR discrimination metric (None in single-compound mode)
     docked_sdf_block: str = ""   # The SDF block of the docked pose
     # Post-refinement fields (filled only for top-K poses)
     initial_energy_kj_per_mol: float = 0.0
@@ -254,15 +258,25 @@ class _FramePoseResult:
 @dataclass
 class _TopKHeap:
     k: int
-    ranking_metric: str = "cnn_affinity"  # one of {"cnn_affinity", "auc_roc"}
+    ranking_metric: str = "cnn_vs"  # depends on args.scoring_method or args.sar_metric
     _heap: list[tuple[float, int, _FramePoseResult]] = field(default_factory=list)
     _counter: int = 0
 
     def _rank_score(self, result: _FramePoseResult) -> float:
-        if self.ranking_metric == "auc_roc":
-            # In SAR mode, prefer AUC if available; otherwise fall back to CNN affinity.
-            return result.auc_roc if result.auc_roc is not None else result.cnn_affinity
-        return result.cnn_affinity
+        # If in SAR mode, the ranking metric is a SAR metric (e.g. auc_roc)
+        if self.ranking_metric in ("auc_roc", "enrichment_1pct", "enrichment_5pct", "enrichment_10pct"):
+            sar_val = getattr(result, self.ranking_metric, None)
+            # If SAR metric is missing, fall back to cnn_vs
+            return sar_val if sar_val is not None else result.cnn_vs
+
+        # In single mode, the ranking metric is the primary scoring method.
+        # Note: vina_score is lower-is-better, but we want to maximize the rank score.
+        # So if ranking_metric is vina_score, we must negate it so that the heap works correctly (it's a min-heap tracking the worst retained entry)
+        # Actually, higher=better is assumed by _TopKHeap logic.
+        val = getattr(result, self.ranking_metric)
+        if self.ranking_metric == "vina_score":
+            return -val
+        return val
 
     def push(self, result: _FramePoseResult) -> bool:
         """Push by selected ranking metric (higher = better)."""
@@ -324,6 +338,8 @@ def _dock_frame_worker(
     cnn_scoring: str,
     gnina_seed: int,
     dry_run: bool,
+    scoring_method: str = "cnn_vs",
+    sar_metric: str = "auc_roc",
     docking_output_dir: str | None = None,
     gnina_timeout_seconds: int | None = None,
     steps: list[str] | None = None,
@@ -452,17 +468,34 @@ def _dock_frame_worker(
 
         # ── Aggregate best score per parent ligand ─────────────────────────
         # pocket_dock.results keys are state-level names (e.g. "LIG_s0").
-        # We group by parent name and pick the best CNN affinity per parent.
-        parent_best: dict[str, tuple[float, float, str]] = {}  # parent -> (best_cnn, best_vina, best_sdf)
+        # We group by parent name and pick the best pose (by scoring_method) per parent.
+        parent_best: dict[str, tuple[float, float, float, float, str]] = {}  # parent -> (best_scoring_metric, cnn_affinity, vina_score, cnn_score, cnn_vs, best_sdf)
         for state_name, poses in pocket_dock.results.items():
             if not poses:
                 continue
             parent = name_map.get(state_name, state_name)
-            best_cnn = poses[0].cnn_affinity
-            best_vina = poses[0].vina_score
-            best_sdf = poses[0].pose_sdf_block
-            if parent not in parent_best or best_cnn > parent_best[parent][0]:
-                parent_best[parent] = (best_cnn, best_vina, best_sdf)
+
+            # Find the best pose for this state by the requested scoring method
+            if scoring_method == "vina_score":
+                best_pose = min(poses, key=lambda p: p.vina_score)
+            else:
+                best_pose = max(poses, key=lambda p: getattr(p, scoring_method))
+
+            p_val = getattr(best_pose, scoring_method)
+
+            # Determine if this state's best pose is better than the parent's current best
+            is_better = False
+            if parent not in parent_best:
+                is_better = True
+            else:
+                current_best_val = parent_best[parent][0]
+                if scoring_method == "vina_score":
+                    is_better = p_val < current_best_val
+                else:
+                    is_better = p_val > current_best_val
+
+            if is_better:
+                parent_best[parent] = (p_val, best_pose.cnn_affinity, best_pose.vina_score, best_pose.cnn_score, best_pose.cnn_vs, best_pose.pose_sdf_block)
 
         if sar_mode:
             # Build a virtual PocketDockResult with best-per-parent scores
@@ -482,42 +515,85 @@ def _dock_frame_worker(
                 results=parent_results,
             )
             auc_roc = None
+            enrichment_1pct = None
+            enrichment_5pct = None
+            enrichment_10pct = None
             if "scoring" in steps:
                 sar = compute_sar_discrimination(
                     frame_index=frame_index,
                     pocket_result=parent_dock,
                     active_names=set(active_names),
                     inactive_names=set(inactive_names),
-                    score_key="cnn_affinity",
+                    score_key=scoring_method,
                 )
                 auc_roc = sar.auc_roc
+                enrichment_1pct = sar.enrichment_1pct
+                enrichment_5pct = sar.enrichment_5pct
+                enrichment_10pct = sar.enrichment_10pct
 
-            # Best-scoring active as the representative pose (highest pK)
-            best_active = max(
-                [n for n in active_names if n in parent_best],
-                key=lambda n: parent_best[n][0],
-                default="",
-            )
-            best_cnn = parent_best.get(best_active, (0.0, 0.0, ""))[0]
-            best_vina = parent_best.get(best_active, (0.0, 0.0, ""))[1]
-            best_sdf = parent_best.get(best_active, (0.0, 0.0, ""))[2]
-            results.append(_FramePoseResult(
+                # Fetch whichever sar metric the user requested to set correctly for the summary if we need
+                # but currently we only track auc_roc explicitly in _FramePoseResult, so let's set auc_roc to the sar metric
+                # actually _FramePoseResult is requested to only have auc_roc, or should we add the others?
+                # Let's map auc_roc to the requested sar_metric so it can be sorted properly in the summary.csv
+                sar_val = getattr(sar, sar_metric)
+
+            # Best-scoring active as the representative pose
+            best_active = ""
+            best_active_val = None
+            for n in active_names:
+                if n in parent_best:
+                    val = parent_best[n][0]
+                    if best_active_val is None:
+                        best_active = n
+                        best_active_val = val
+                    else:
+                        if scoring_method == "vina_score":
+                            if val < best_active_val:
+                                best_active = n
+                                best_active_val = val
+                        else:
+                            if val > best_active_val:
+                                best_active = n
+                                best_active_val = val
+
+            if best_active:
+                _, best_cnn_aff, best_vina, best_cnn_score, best_cnn_vs, best_sdf = parent_best[best_active]
+            else:
+                best_cnn_aff, best_vina, best_cnn_score, best_cnn_vs, best_sdf = 0.0, 0.0, 0.0, 0.0, ""
+
+            r = _FramePoseResult(
                 frame_index=frame_index, frame_time_ps=frame_time_ps,
                 pocket_id=pocket_id, pocket_score=pocket_score,
                 ligand_name=best_active,
-                cnn_affinity=best_cnn, vina_score=best_vina,
-                auc_roc=auc_roc,
+                cnn_affinity=best_cnn_aff, vina_score=best_vina,
+                cnn_score=best_cnn_score, cnn_vs=best_cnn_vs,
+                auc_roc=sar_val if "scoring" in steps else None,
                 docked_sdf_block=best_sdf,
                 status="ok",
-            ))
+            )
+            # monkey-patch other metrics in case TopKHeap wants them
+            if "scoring" in steps:
+                r.auc_roc = auc_roc
+                setattr(r, "enrichment_1pct", enrichment_1pct)
+                setattr(r, "enrichment_5pct", enrichment_5pct)
+                setattr(r, "enrichment_10pct", enrichment_10pct)
+                # Re-assign the correct one to auc_roc for backward compatibility
+                # in the summary CSV, or leave it. Actually the user wants auc_roc in summary csv, but might want to sort by something else.
+                # Actually _FramePoseResult now has auc_roc. We will set the chosen sar_metric value to the field matching it if we had it, but we only have auc_roc in _FramePoseResult.
+                # Let's just set the `auc_roc` field to auc_roc, and monkeypatch the requested `sar_metric` for TopKHeap.
+                setattr(r, sar_metric, sar_val)
+
+            results.append(r)
         else:
             # Single compound mode: one result per pocket per parent ligand
-            for parent, (best_cnn, best_vina, best_sdf) in parent_best.items():
+            for parent, (_, best_cnn_aff, best_vina, best_cnn_score, best_cnn_vs, best_sdf) in parent_best.items():
                 results.append(_FramePoseResult(
                     frame_index=frame_index, frame_time_ps=frame_time_ps,
                     pocket_id=pocket_id, pocket_score=pocket_score, ligand_name=parent,
-                    cnn_affinity=best_cnn,
+                    cnn_affinity=best_cnn_aff,
                     vina_score=best_vina,
+                    cnn_score=best_cnn_score,
+                    cnn_vs=best_cnn_vs,
                     auc_roc=None, 
                     docked_sdf_block=best_sdf,
                     status="ok",
@@ -586,7 +662,7 @@ def main() -> None:
 
     # Shared state for analysis
     results_lock = threading.Lock()
-    ranking_metric = "auc_roc" if args.mode == "sar" else "cnn_affinity"
+    ranking_metric = args.sar_metric if args.mode == "sar" else args.scoring_method
     top_heap = _TopKHeap(k=args.top_k, ranking_metric=ranking_metric)
     all_rows: list[dict[str, Any]] = []
     
@@ -771,9 +847,7 @@ def main() -> None:
                                 if prev is None or rank_score > prev:
                                     rolling_best_energy[0] = rank_score
                                     best_str = (
-                                        f"AUC={best.auc_roc:.3f}"
-                                        if ranking_metric == "auc_roc" and best.auc_roc is not None
-                                        else f"CNN={best.cnn_affinity:.2f}"
+                                        f"{ranking_metric}={rank_score:.3f}"
                                     )
                                     print(
                                         f"  [top-{args.top_k}] new best rank-1: {best_str} | "
@@ -833,6 +907,8 @@ def main() -> None:
                     cnn_scoring=args.cnn_scoring,
                     gnina_seed=args.gnina_seed,
                     dry_run=args.dry_run,
+                    scoring_method=args.scoring_method,
+                    sar_metric=args.sar_metric,
                     docking_output_dir=str(docking_output_dir),
                     gnina_timeout_seconds=args.gnina_timeout_seconds,
                     steps=args.steps,
@@ -947,16 +1023,14 @@ def main() -> None:
     # Successful rows first, then descending ranking score.
     def _summary_rank_key(row: dict[str, Any]) -> tuple[int, float]:
         try:
-            cnn = float(row.get("cnn_affinity", ""))
+            val = float(row.get(ranking_metric, ""))
+            if ranking_metric == "vina_score":
+                val = -val
         except (TypeError, ValueError):
-            cnn = float("-inf")
-        try:
-            auc = float(row.get("auc_roc", ""))
-        except (TypeError, ValueError):
-            auc = float("-inf")
+            val = float("-inf")
+
         is_error = 1 if str(row.get("status", "")).lower() == "error" else 0
-        metric = auc if ranking_metric == "auc_roc" else cnn
-        return (is_error, -metric)
+        return (is_error, -val)
 
     all_rows_sorted = sorted(all_rows, key=_summary_rank_key)
     _write_csv(summary_csv_path, all_rows_sorted)
@@ -1083,7 +1157,7 @@ def _energy_for_topk_ranking(r: _FramePoseResult) -> float:
 _FIELDNAMES = [
     "status", "frame_index", "frame_time_ps",
     "pocket_id", "pocket_score",
-    "ligand_name", "cnn_affinity", "vina_score", "auc_roc",
+    "ligand_name", "cnn_vs", "cnn_affinity", "cnn_score", "vina_score", "auc_roc",
     "initial_energy_kj_per_mol", "final_energy_kj_per_mol",
     "interaction_energy_kj_per_mol",
     "ligand_rmsd_from_dock_angstrom",
@@ -1100,10 +1174,12 @@ def _to_row(r: _FramePoseResult) -> dict[str, Any]:
         "pocket_id": r.pocket_id,
         "pocket_score": f"{r.pocket_score:.3f}",
         "ligand_name": r.ligand_name,
-        "cnn_affinity": f"{r.cnn_affinity:.3f}",
-        "vina_score": f"{r.vina_score:.3f}",
-        "auc_roc": f"{r.auc_roc:.4f}" if r.auc_roc is not None else "",
-        "initial_energy_kj_per_mol": f"{r.initial_energy_kj_per_mol:.2f}",
+        "cnn_vs": f"{r.cnn_vs:.3f}" if r.cnn_vs != "" else "",
+        "cnn_affinity": f"{r.cnn_affinity:.3f}" if r.cnn_affinity != "" else "",
+        "cnn_score": f"{r.cnn_score:.3f}" if r.cnn_score != "" else "",
+        "vina_score": f"{r.vina_score:.3f}" if r.vina_score != "" else "",
+        "auc_roc": f"{r.auc_roc:.4f}" if r.auc_roc is not None and r.auc_roc != "" else "",
+        "initial_energy_kj_per_mol": f"{r.initial_energy_kj_per_mol:.2f}" if isinstance(r.initial_energy_kj_per_mol, (int, float)) else r.initial_energy_kj_per_mol,
         "final_energy_kj_per_mol": f"{r.final_energy_kj_per_mol:.2f}",
         "interaction_energy_kj_per_mol": (
             f"{r.interaction_energy_kj_per_mol:.2f}"

@@ -92,6 +92,9 @@ class GninaDockResult:
     cnn_affinity: float
     """GNINA CNN predicted binding affinity in pK units (higher = tighter binding)."""
 
+    cnn_vs: float
+    """GNINA CNN virtual screening score (probability, 0-1). Higher = better."""
+
     pose_sdf_block: str
     """The full SDF block for this pose (can be written back to disk)."""
 
@@ -331,6 +334,7 @@ def _parse_gnina_sdf(sdf_text: str, *, ligand_name: str) -> list[GninaDockResult
       > <minimizedAffinity>   (Vina score, kcal/mol)
       > <CNNscore>            (CNN pose quality, 0–1)
       > <CNNaffinity>         (CNN affinity, pK units; higher = tighter binding)
+      > <CNN_VS>              (CNN virtual screening score, 0-1)
     """
     results: list[GninaDockResult] = []
     # Split by the $$$$ record separator
@@ -340,6 +344,10 @@ def _parse_gnina_sdf(sdf_text: str, *, ligand_name: str) -> list[GninaDockResult
         vina = _parse_sdf_property(block, "minimizedAffinity", required=True)
         cnn_score = _parse_sdf_property(block, "CNNscore", required=True)
         cnn_aff = _parse_sdf_property(block, "CNNaffinity", required=True)
+        cnn_vs = _parse_sdf_property(block, "CNN_VS", required=False) # Make CNN_VS optional to be safe, defaulting to 0.0 if missing
+
+        if cnn_vs is None:
+            cnn_vs = 0.0
 
         # GNINA output can occasionally contain a trailing/truncated SDF record
         # (e.g. interrupted write). Treat such records as invalid instead of
@@ -354,11 +362,14 @@ def _parse_gnina_sdf(sdf_text: str, *, ligand_name: str) -> list[GninaDockResult
                 vina_score=vina,
                 cnn_score=cnn_score,
                 cnn_affinity=cnn_aff,
+                cnn_vs=cnn_vs,
                 pose_sdf_block=block + "\n$$$$\n",
             )
         )
 
-    # Sort best → worst by CNN affinity (pK: higher = better)
+    # Note: Sorting here is still by CNN affinity to maintain previous local pose ranking behavior,
+    # or should we sort by cnn_vs? Let's keep it sorted by CNN affinity for GNINA's local ordering
+    # but the pipeline ranking will depend on the requested scoring method.
     results.sort(key=lambda r: r.cnn_affinity, reverse=True)
     return results
 
