@@ -75,6 +75,8 @@ import io
 import threading
 import time
 import multiprocessing
+import hashlib
+import json
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -251,29 +253,33 @@ class _FramePoseResult:
 @dataclass
 class _TopKHeap:
     k: int
+    ranking_metric: str = "cnn_affinity"  # one of {"cnn_affinity", "auc_roc"}
     _heap: list[tuple[float, int, _FramePoseResult]] = field(default_factory=list)
     _counter: int = 0
 
+    def _rank_score(self, result: _FramePoseResult) -> float:
+        if self.ranking_metric == "auc_roc":
+            # In SAR mode, prefer AUC if available; otherwise fall back to CNN affinity.
+            return result.auc_roc if result.auc_roc is not None else result.cnn_affinity
+        return result.cnn_affinity
+
     def push(self, result: _FramePoseResult) -> bool:
-        """Push by primary ranking score (AUC-ROC if available, else CNN affinity)."""
-        # Higher AUC = better; higher CNN affinity (pK) = better
-        # Normalize to: lower raw_score = better (for min-heap inversion trick)
-        if result.auc_roc is not None:
-            raw_score = -result.auc_roc          # negate so most negative = worst (pushed out)
-        else:
-            raw_score = -result.cnn_affinity     # negate pK so tighter binders sort first
-        entry = (raw_score, self._counter, result)
+        """Push by selected ranking metric (higher = better)."""
+        # Keep a size-k min-heap keyed by ranking score.
+        # Heap root is the current worst among retained entries.
+        rank_score = self._rank_score(result)
+        entry = (rank_score, self._counter, result)
         self._counter += 1
         if len(self._heap) < self.k:
             heapq.heappush(self._heap, entry)
             return True
-        elif raw_score < self._heap[0][0]:
+        elif rank_score > self._heap[0][0]:
             heapq.heapreplace(self._heap, entry)
             return True
         return False
 
     def sorted_best(self) -> list[_FramePoseResult]:
-        return [r for _, _, r in sorted(self._heap, key=lambda t: t[0])]
+        return [r for _, _, r in sorted(self._heap, key=lambda t: t[0], reverse=True)]
 
     def current_best(self) -> _FramePoseResult | None:
         if not self._heap:
@@ -579,7 +585,8 @@ def main() -> None:
 
     # Shared state for analysis
     results_lock = threading.Lock()
-    top_heap = _TopKHeap(k=args.top_k)
+    ranking_metric = "auc_roc" if args.mode == "sar" else "cnn_affinity"
+    top_heap = _TopKHeap(k=args.top_k, ranking_metric=ranking_metric)
     all_rows: list[dict[str, Any]] = []
     
     # We open the CSV here to allow real-time appends in the callback
@@ -590,7 +597,6 @@ def main() -> None:
     csv_fh.flush()
 
     # ── Ligand preparation ───────────────────────────────────────────────────
-    print(f"\n[2/4]  Preparing ligands …")
     ligands_dir = outdir / "ligands"
     ligands_dir.mkdir(exist_ok=True)
     docking_output_dir = outdir / "docking_output"
@@ -598,36 +604,126 @@ def main() -> None:
 
     # name_map: state_name → parent_ligand_name
     name_map: dict[str, str] = {}
+    ligand_sdf_paths: dict[str, str] = {}
+
+    ligand_manifest_path = outdir / "ligand_prep_manifest.json"
+
+    def _sha256_file(path: Path) -> str:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    # NOTE: ligand_preparation currently uses these defaults when Draco doesn't
+    # explicitly pass protonation parameters.
+    _DEFAULT_PROTONATION = {
+        "ph_min": 6.4,
+        "ph_max": 8.4,
+        "max_variants": 8,
+        "precision": 1.0,
+    }
+    _DEFAULT_PREP = {
+        "num_conformers": args.num_conformers,
+        "prune_rms_threshold": 0.5,
+        "random_seed": 0xF00D,
+        "optimize": True,
+        "max_iterations": 200,
+    }
+
+    cache_hit = False
+    cached_manifest: dict[str, Any] | None = None
+    if ligand_manifest_path.is_file():
+        try:
+            cached_manifest = json.loads(ligand_manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            cached_manifest = None
 
     if args.ligand_csv:
-        actives, inactives, name_map = load_compound_csv(
-            args.ligand_csv, num_conformers=args.num_conformers,
-        )
-        all_compounds = actives + inactives
-        # active_names / inactive_names are PARENT-level names
-        active_names = sorted({name_map[l.name] for l in actives})
-        inactive_names = sorted({name_map[l.name] for l in inactives})
-        n_act_states = len(actives)
-        n_inact_states = len(inactives)
-        print(f"  Loaded {len(active_names)} actives ({n_act_states} states), "
-              f"{len(inactive_names)} inactives ({n_inact_states} states) from {args.ligand_csv}")
+        ligand_signature = {
+            "mode": "csv",
+            "ligand_csv_sha256": _sha256_file(Path(args.ligand_csv)),
+            "protonation": _DEFAULT_PROTONATION,
+            "prep": _DEFAULT_PREP,
+        }
     else:
-        states = prepare_protonation_states(
-            args.ligand_smiles, name=args.ligand_name,
-            num_conformers=args.num_conformers,
-        )
-        all_compounds = states
-        for s in states:
-            name_map[s.name] = args.ligand_name
-        active_names = []
-        inactive_names = []
-        n_confs = sum(len(s.conformers) for s in states)
-        print(f"  Single compound mode: {args.ligand_name} "
-              f"({len(states)} protonation state(s), {n_confs} total conformers)")
+        ligand_signature = {
+            "mode": "single",
+            "ligand_smiles_sha256": hashlib.sha256(args.ligand_smiles.encode("utf-8")).hexdigest(),
+            "ligand_name": args.ligand_name,
+            "protonation": _DEFAULT_PROTONATION,
+            "prep": _DEFAULT_PREP,
+        }
 
-    # Write SDF files once; pass absolute paths to workers
-    ligand_sdf_paths = write_ligands_for_docking(all_compounds, ligands_dir)
-    print(f"  Written {len(ligand_sdf_paths)} SDF files to {ligands_dir}/")
+    if cached_manifest and cached_manifest.get("signature") == ligand_signature:
+        expected_state_names: list[str] = []
+        expected_state_names.extend(cached_manifest.get("active_state_names", []))
+        expected_state_names.extend(cached_manifest.get("inactive_state_names", []))
+        cache_hit = all((ligands_dir / f"{sn}.sdf").is_file() for sn in expected_state_names)
+
+    if cache_hit and cached_manifest:
+        name_map = dict(cached_manifest.get("name_map", {}))
+        active_names = list(cached_manifest.get("active_parent_names", []))
+        inactive_names = list(cached_manifest.get("inactive_parent_names", []))
+        active_state_names = list(cached_manifest.get("active_state_names", []))
+        inactive_state_names = list(cached_manifest.get("inactive_state_names", []))
+        for sn in active_state_names + inactive_state_names:
+            ligand_sdf_paths[sn] = str((ligands_dir / f"{sn}.sdf").resolve())
+        print(
+            f"\n[2/4]  Preparing ligands … (cache hit)  "
+            f"{len(ligand_sdf_paths)} SDFs reused from {ligands_dir}/"
+        )
+    else:
+        print(f"\n[2/4]  Preparing ligands …")
+
+        if args.ligand_csv:
+            actives, inactives, name_map = load_compound_csv(
+                args.ligand_csv, num_conformers=args.num_conformers,
+            )
+            all_compounds = actives + inactives
+            # active_names / inactive_names are PARENT-level names
+            active_names = sorted({name_map[l.name] for l in actives})
+            inactive_names = sorted({name_map[l.name] for l in inactives})
+            n_act_states = len(actives)
+            n_inact_states = len(inactives)
+            print(
+                f"  Loaded {len(active_names)} actives ({n_act_states} states), "
+                f"{len(inactive_names)} inactives ({n_inact_states} states) from {args.ligand_csv}"
+            )
+        else:
+            states = prepare_protonation_states(
+                args.ligand_smiles, name=args.ligand_name,
+                num_conformers=args.num_conformers,
+            )
+            all_compounds = states
+            for s in states:
+                name_map[s.name] = args.ligand_name
+            active_names = []
+            inactive_names = []
+            n_confs = sum(len(s.conformers) for s in states)
+            print(
+                f"  Single compound mode: {args.ligand_name} "
+                f"({len(states)} protonation state(s), {n_confs} total conformers)"
+            )
+
+        # Write SDF files once; pass absolute paths to workers
+        ligand_sdf_paths = write_ligands_for_docking(all_compounds, ligands_dir)
+        print(f"  Written {len(ligand_sdf_paths)} SDF files to {ligands_dir}/")
+
+        # Write cache manifest so subsequent runs can skip ligand preparation.
+        manifest: dict[str, Any] = {
+            "signature": ligand_signature,
+            "name_map": name_map,
+            "active_parent_names": active_names,
+            "inactive_parent_names": inactive_names,
+        }
+        if args.ligand_csv:
+            manifest["active_state_names"] = [l.name for l in actives]
+            manifest["inactive_state_names"] = [l.name for l in inactives]
+        else:
+            manifest["active_state_names"] = []
+            manifest["inactive_state_names"] = [s.name for s in states]
+        ligand_manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     # Prepare initial protein structure
     print("  Preparing initial protein (PDBFixer + H) …")
@@ -670,13 +766,12 @@ def main() -> None:
                             best = top_heap.current_best()
                             if best is not None and args.top_k > 0:
                                 prev = rolling_best_energy[0]
-                                rank_score = (
-                                    -best.auc_roc if best.auc_roc is not None else -best.cnn_affinity
-                                )
-                                if prev is None or rank_score < prev:
+                                rank_score = top_heap._rank_score(best)
+                                if prev is None or rank_score > prev:
                                     rolling_best_energy[0] = rank_score
                                     best_str = (
-                                        f"AUC={best.auc_roc:.3f}" if best.auc_roc is not None
+                                        f"AUC={best.auc_roc:.3f}"
+                                        if ranking_metric == "auc_roc" and best.auc_roc is not None
                                         else f"CNN={best.cnn_affinity:.2f}"
                                     )
                                     print(
@@ -846,6 +941,24 @@ def main() -> None:
         # Executor context manager will wait for all tasks on __exit__
 
     csv_fh.close()
+
+    # Reorder summary rows by the same ranking used for top-k selection.
+    # Successful rows first, then descending ranking score.
+    def _summary_rank_key(row: dict[str, Any]) -> tuple[int, float]:
+        try:
+            cnn = float(row.get("cnn_affinity", ""))
+        except (TypeError, ValueError):
+            cnn = float("-inf")
+        try:
+            auc = float(row.get("auc_roc", ""))
+        except (TypeError, ValueError):
+            auc = float("-inf")
+        is_error = 1 if str(row.get("status", "")).lower() == "error" else 0
+        metric = auc if ranking_metric == "auc_roc" else cnn
+        return (is_error, -metric)
+
+    all_rows_sorted = sorted(all_rows, key=_summary_rank_key)
+    _write_csv(summary_csv_path, all_rows_sorted)
 
     print(
         f"\n  ✓ All stages complete: {dynamics_sim_time:.1f} ps simulated, "

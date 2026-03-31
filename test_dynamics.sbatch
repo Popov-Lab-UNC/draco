@@ -29,8 +29,18 @@ cd /work/users/s/h/shuhang/draco
 
 pixi run draco \
   --mode single \
-  --steps pocket docking scoring \
+  --steps docking scoring \
+  --protein-pdb    "4GL2.pdb" \
+  --ligand-smiles  "Cc1ccc(S(N)(=O)=O)cc1C(=O)NCc1ccc(-c2nc3ccccc3s2)o1" \
+  --gnina-binary   "apptainer run --nv /work/users/s/h/shuhang/gnina_build/gnina.sif" \
+  --output-dir     "4GL2_XS421854b"
+
+'''
+pixi run draco \
+  --mode single \
+  --steps scoring \
   --protein-pdb    "4GL2.pdb" \
   --ligand-smiles  "O=C(Nc1ccc(Cl)cc1)Nc1ccc(S(=O)(=O)Nc2nccs2)cc1" \
   --gnina-binary   "apptainer run --nv /work/users/s/h/shuhang/gnina_build/gnina.sif" \
-  --output-dir     "test_dynamics_output"
+  --output-dir     "4GL2_XS466077b"
+'''
