@@ -168,59 +168,16 @@ class PreparedLigand:
         )
 
 
-def protonate_smiles(
-    smiles: str,
-    *,
-    ph_min: float = 6.4,
-    ph_max: float = 8.4,
-    max_variants: int = 8,
-    precision: float = 1.0,
-) -> list[str]:
-    """Generate protonation states of a SMILES at a given pH range using Dimorphite-DL.
-
-    Parameters
-    ----------
-    smiles:
-        Input SMILES string.
-    ph_min / ph_max:
-        pH range (default 6.4–8.4 for physiological).
-    max_variants:
-        Maximum number of protonation variants to return.
-    precision:
-        pKa precision for Dimorphite-DL (default 1.0).
-
-    Returns
-    -------
-    list[str]
-        List of protonated SMILES strings. If Dimorphite-DL fails or returns
-        nothing, falls back to the original SMILES.
-    """
-    try:
-        from dimorphite_dl import protonate_smiles as _dimorphite_protonate
-        result = _dimorphite_protonate(
-            smiles,
-            ph_min=ph_min,
-            ph_max=ph_max,
-            max_variants=max_variants,
-            precision=precision,
-            label_states=False,
-        )
-        if result:
-            return list(result)
-    except Exception as exc:
-        _log.warning("Dimorphite-DL failed for '%s': %s. Using original SMILES.", smiles, exc)
-    return [smiles]
-
-
 def prepare_ligand_from_smiles(
     smiles: str,
     *,
     name: str | None = None,
-    num_conformers: int = 20,
+    num_conformers: int = 100,
     prune_rms_threshold: float = 0.5,
     random_seed: int = 0xF00D,
     optimize: bool = True,
     max_iterations: int = 200,
+    energy_cutoff: float = 5.0,
 ) -> PreparedLigand:
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
@@ -236,90 +193,20 @@ def prepare_ligand_from_smiles(
         random_seed=random_seed,
         optimize=optimize,
         max_iterations=max_iterations,
+        energy_cutoff=energy_cutoff,
     )
-
-
-def prepare_protonation_states(
-    smiles: str,
-    *,
-    name: str,
-    ph_min: float = 6.4,
-    ph_max: float = 8.4,
-    max_variants: int = 8,
-    num_conformers: int = 20,
-    prune_rms_threshold: float = 0.5,
-    random_seed: int = 0xF00D,
-    optimize: bool = True,
-    max_iterations: int = 200,
-) -> list[PreparedLigand]:
-    """Protonate a SMILES with Dimorphite-DL, then prepare each state.
-
-    Each protonation state gets its own ``PreparedLigand`` with a name like
-    ``'{name}_s0'``, ``'{name}_s1'``, etc.  If only one state is produced
-    the name is kept as-is (no suffix).
-
-    Parameters
-    ----------
-    smiles:
-        Input SMILES.
-    name:
-        Base compound name.
-    ph_min / ph_max / max_variants:
-        Forwarded to ``protonate_smiles``.
-    num_conformers / prune_rms_threshold / random_seed / optimize / max_iterations:
-        Forwarded to conformer generation.
-
-    Returns
-    -------
-    list[PreparedLigand]
-        One ``PreparedLigand`` per protonation state.
-    """
-    protonated = protonate_smiles(
-        smiles, ph_min=ph_min, ph_max=ph_max,
-        max_variants=max_variants,
-    )
-    results: list[PreparedLigand] = []
-    use_suffix = len(protonated) > 1
-    for idx, prot_smi in enumerate(protonated):
-        state_name = f"{name}_s{idx}" if use_suffix else name
-        try:
-            prep = prepare_ligand_from_smiles(
-                prot_smi,
-                name=state_name,
-                num_conformers=num_conformers,
-                prune_rms_threshold=prune_rms_threshold,
-                random_seed=random_seed,
-                optimize=optimize,
-                max_iterations=max_iterations,
-            )
-            results.append(prep)
-        except Exception as exc:
-            _log.warning(
-                "Failed to prepare protonation state %d ('%s') of '%s': %s",
-                idx, prot_smi, name, exc,
-            )
-    if not results:
-        # Fallback: prepare original SMILES without protonation
-        _log.warning("All protonation states failed for '%s'. Using original SMILES.", name)
-        results.append(prepare_ligand_from_smiles(
-            smiles, name=name,
-            num_conformers=num_conformers,
-            prune_rms_threshold=prune_rms_threshold,
-            random_seed=random_seed,
-            optimize=optimize, max_iterations=max_iterations,
-        ))
-    return results
 
 
 def prepare_ligand_from_file(
     ligand_path: str | os.PathLike[str],
     *,
     name: str | None = None,
-    num_conformers: int = 20,
+    num_conformers: int = 100,
     prune_rms_threshold: float = 0.5,
     random_seed: int = 0xF00D,
     optimize: bool = True,
     max_iterations: int = 200,
+    energy_cutoff: float = 5.0,
 ) -> PreparedLigand:
     path = Path(ligand_path)
     mol = _load_molecule_from_file(path)
@@ -333,6 +220,7 @@ def prepare_ligand_from_file(
         random_seed=random_seed,
         optimize=optimize,
         max_iterations=max_iterations,
+        energy_cutoff=energy_cutoff,
     )
 
 
@@ -354,19 +242,15 @@ def load_prepared_ligand(
 def load_compound_csv(
     csv_path: str | os.PathLike[str],
     *,
-    num_conformers: int = 20,
+    num_conformers: int = 100,
     prune_rms_threshold: float = 0.5,
     random_seed: int = 0xF00D,
-    protonate: bool = True,
-    ph_min: float = 6.4,
-    ph_max: float = 8.4,
+    energy_cutoff: float = 5.0,
 ) -> tuple[list[PreparedLigand], list[PreparedLigand], dict[str, str]]:
     """Load a compound CSV and return (actives, inactives, name_map).
 
-    When ``protonate=True`` (default), each compound is protonated with
-    Dimorphite-DL, producing potentially multiple ``PreparedLigand`` objects
-    per row.  The returned ``name_map`` maps each state-level name (e.g.
-    ``'compound_A_s0'``) back to the parent compound name (``'compound_A'``).
+    The returned ``name_map`` maps each state-level name back to the parent
+    compound name (identity mapping now that protonation states are removed).
 
     CSV format (required columns):
         name,smiles,active
@@ -377,12 +261,8 @@ def load_compound_csv(
     ----------
     csv_path:
         Path to the CSV file.
-    num_conformers / prune_rms_threshold / random_seed:
+    num_conformers / prune_rms_threshold / random_seed / energy_cutoff:
         Forwarded to ligand preparation.
-    protonate:
-        If True, use Dimorphite-DL to enumerate protonation states.
-    ph_min / ph_max:
-        pH range for protonation (only used if ``protonate=True``).
 
     Returns
     -------
@@ -408,28 +288,19 @@ def load_compound_csv(
             smiles = row["smiles"].strip()
             is_active = str(row["active"]).strip() in ("1", "true", "True", "yes")
 
-            if protonate:
-                states = prepare_protonation_states(
-                    smiles, name=name,
-                    ph_min=ph_min, ph_max=ph_max,
-                    num_conformers=num_conformers,
-                    prune_rms_threshold=prune_rms_threshold,
-                    random_seed=random_seed,
-                )
-            else:
-                states = [prepare_ligand_from_smiles(
-                    smiles, name=name,
-                    num_conformers=num_conformers,
-                    prune_rms_threshold=prune_rms_threshold,
-                    random_seed=random_seed,
-                )]
+            prep = prepare_ligand_from_smiles(
+                smiles, name=name,
+                num_conformers=num_conformers,
+                prune_rms_threshold=prune_rms_threshold,
+                random_seed=random_seed,
+                energy_cutoff=energy_cutoff,
+            )
 
-            for prep in states:
-                name_map[prep.name] = name
-                if is_active:
-                    actives.append(prep)
-                else:
-                    inactives.append(prep)
+            name_map[prep.name] = name
+            if is_active:
+                actives.append(prep)
+            else:
+                inactives.append(prep)
 
     return actives, inactives, name_map
 
@@ -550,6 +421,7 @@ def _prepare_ligand_mol(
     random_seed: int,
     optimize: bool,
     max_iterations: int,
+    energy_cutoff: float,
 ) -> PreparedLigand:
     # --- Strip disconnected counter-ions (Na+, Cl-, etc.) ---
     mol = _SALT_REMOVER.StripMol(mol, dontRemoveEverything=True)
@@ -558,7 +430,8 @@ def _prepare_ligand_mol(
 
     params = AllChem.ETKDGv3()
     params.randomSeed = random_seed
-    params.pruneRmsThresh = prune_rms_threshold
+    # We do NOT prune during embedding because we want to prune AFTER optimization
+    params.pruneRmsThresh = -1.0
     params.useSmallRingTorsions = True
     params.useMacrocycleTorsions = True
 
@@ -567,7 +440,12 @@ def _prepare_ligand_mol(
         raise ValueError(f"RDKit failed to embed conformers for ligand '{name}'")
 
     if optimize:
-        _optimize_conformers(mol, conformer_ids, max_iterations=max_iterations)
+        conformer_ids = _optimize_and_filter_conformers(
+            mol, conformer_ids,
+            max_iterations=max_iterations,
+            energy_cutoff=energy_cutoff,
+            prune_rms_threshold=prune_rms_threshold
+        )
 
     canonical_smiles = Chem.MolToSmiles(Chem.RemoveHs(Chem.Mol(mol)))
     conformers = tuple(_extract_conformer(mol, conf_id) for conf_id in conformer_ids)
@@ -599,19 +477,65 @@ def _load_molecule_from_file(path: Path) -> Mol:
     return mol
 
 
-def _optimize_conformers(
+def _optimize_and_filter_conformers(
     mol: Mol,
     conformer_ids: list[int],
     *,
     max_iterations: int,
-) -> None:
-    if AllChem.MMFFHasAllMoleculeParams(mol):
-        for conf_id in conformer_ids:
-            AllChem.MMFFOptimizeMolecule(mol, confId=conf_id, maxIters=max_iterations)
-        return
+    energy_cutoff: float,
+    prune_rms_threshold: float,
+) -> list[int]:
+    """Optimize conformers, calculate energies, filter by cutoff, and prune by RMSD."""
 
-    for conf_id in conformer_ids:
-        AllChem.UFFOptimizeMolecule(mol, confId=conf_id, maxIters=max_iterations)
+    energies: list[tuple[int, float]] = []
+
+    if AllChem.MMFFHasAllMoleculeParams(mol):
+        props = AllChem.MMFFGetMoleculeProperties(mol)
+        for conf_id in conformer_ids:
+            ff = AllChem.MMFFGetMoleculeForceField(mol, props, confId=conf_id)
+            if ff is not None:
+                ff.Minimize(maxIters=max_iterations)
+                energies.append((conf_id, ff.CalcEnergy()))
+    else:
+        for conf_id in conformer_ids:
+            ff = AllChem.UFFGetMoleculeForceField(mol, confId=conf_id)
+            if ff is not None:
+                ff.Minimize(maxIters=max_iterations)
+                energies.append((conf_id, ff.CalcEnergy()))
+
+    if not energies:
+        return []
+
+    # Sort by energy (ascending)
+    energies.sort(key=lambda x: x[1])
+    min_energy = energies[0][1]
+
+    # Filter by energy cutoff
+    filtered_cids = [cid for cid, energy in energies if energy - min_energy <= energy_cutoff]
+
+    if prune_rms_threshold <= 0:
+        return filtered_cids
+
+    # Prune by RMSD (greedy approach, keeping lowest energy first)
+    keep_cids: list[int] = []
+    for cid in filtered_cids:
+        if not keep_cids:
+            keep_cids.append(cid)
+            continue
+
+        # Check against already kept conformers
+        too_close = False
+        for kept_cid in keep_cids:
+            # We don't pre-align here, RDKit calculates best alignment RMSD
+            rmsd = AllChem.GetBestRMS(mol, mol, cid, kept_cid)
+            if rmsd < prune_rms_threshold:
+                too_close = True
+                break
+
+        if not too_close:
+            keep_cids.append(cid)
+
+    return keep_cids
 
 
 def _extract_conformer(mol: Mol, conformer_id: int) -> PreparedLigandConformer:
