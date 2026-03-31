@@ -199,6 +199,7 @@ def parse_args() -> argparse.Namespace:
     docking_grp.add_argument("--gnina-timeout-seconds", type=int, default=None, metavar="N", help="Wall-clock limit per GNINA subprocess (seconds).")
     docking_grp.add_argument("--scoring-method", default="cnn_vs", choices=["cnn_vs", "cnn_affinity", "cnn_score", "vina_score"], help="Which GNINA metric to use for ranking poses and computing SAR.")
     docking_grp.add_argument("--sar-metric", default="auc_roc", choices=["auc_roc", "enrichment_1pct", "enrichment_5pct", "enrichment_10pct"], help="Metric to rank poses by in 'sar' mode. Defaults to auc_roc.")
+    docking_grp.add_argument("--max-docking-workers", type=int, default=None, help="Maximum concurrent GNINA instances. Defaults to min(4, CPU_COUNT//4).")
 
     # ── Refinement Parameters ───────────────────────────────────────────────────
     refine_grp = parser.add_argument_group("Refinement Parameters")
@@ -666,13 +667,13 @@ def main() -> None:
     top_heap = _TopKHeap(k=args.top_k, ranking_metric=ranking_metric)
     all_rows: list[dict[str, Any]] = []
     
-    # We open the CSV here to allow real-time appends in the callback
     summary_csv_path = outdir / "summary.csv"
     csv_fh = summary_csv_path.open("w", newline="")
     csv_writer = csv.DictWriter(csv_fh, fieldnames=_FIELDNAMES)
     csv_writer.writeheader()
     csv_fh.flush()
 
+    # Ligand Preparation goes here (we can preserve from the old logic)
     # ── Ligand preparation ───────────────────────────────────────────────────
     ligands_dir = outdir / "ligands"
     ligands_dir.mkdir(exist_ok=True)
@@ -804,218 +805,168 @@ def main() -> None:
 
     # Prepare initial protein structure
     print("  Preparing initial protein (PDBFixer + H) …")
-    initial_prepared = prepare_protein(args.protein_pdb, ph=args.ph)
+    initial_prepared = prepare_protein(args.protein_pdb, ph=args.ph, output_dir=str(outdir))
     _initial_buf = io.StringIO()
     PDBFile.writeFile(initial_prepared.topology, initial_prepared.positions, _initial_buf)
     initial_pdb_string = _initial_buf.getvalue()
 
+    max_docking_workers = args.max_docking_workers if args.max_docking_workers is not None else max(1, min(4, num_cpus // 4))
+
     print("\n" + "═" * 70)
-    print(f"[3/4]  Concurrent analysis")
+    print(f"[3/4]  Execution Pipeline")
     print("═" * 70)
 
-    # Tracks best ranking energy seen so far (more negative = better); updated when rank-1 improves.
     rolling_best_energy: list[float | None] = [None]
-    tasks_cv = threading.Condition()
-    active_tasks = [0]
-
-    with concurrent.futures.ProcessPoolExecutor(
-        max_workers=num_workers,
-        mp_context=multiprocessing.get_context("spawn"),
-        initializer=_worker_init
-    ) as executor:
-        def on_dock_done(future: concurrent.futures.Future):
-            """Called when _dock_frame_worker completes for one frame."""
-            try:
-                frame_results: list[_FramePoseResult] = future.result()
-                for r in frame_results:
-                    with results_lock:
-                        if r.status in ("ok", "refined"):
-                            heap_updated = top_heap.push(r)
-                            row = _to_row(r)
-                            score_str = (
-                                f"AUC={r.auc_roc:.3f}" if r.auc_roc is not None
-                                else f"CNN={r.cnn_affinity:.2f}"
-                            )
-                            print(
-                                f"  [pipeline] OK  frame={r.frame_index}  t={r.frame_time_ps:.3f} ps  "
-                                f"pocket={r.pocket_id}  {score_str}"
-                            )
-                            best = top_heap.current_best()
-                            if best is not None and args.top_k > 0:
-                                prev = rolling_best_energy[0]
-                                rank_score = top_heap._rank_score(best)
-                                if prev is None or rank_score > prev:
-                                    rolling_best_energy[0] = rank_score
-                                    best_str = (
-                                        f"{ranking_metric}={rank_score:.3f}"
-                                    )
-                                    print(
-                                        f"  [top-{args.top_k}] new best rank-1: {best_str} | "
-                                        f"frame={best.frame_index} pocket={best.pocket_id} "
-                                        f"ligand={best.ligand_name}"
-                                    )
-                            if heap_updated and args.top_k > 0:
-                                _write_multimodel_pdb(outdir / args.top_output, top_heap.sorted_best())
-                        else:
-                            print(f"     Frame {r.frame_index} pocket {r.pocket_id} FAILED: {r.error[:120]}")
-                            row = {"status": "error", "frame_index": r.frame_index,
-                                   "frame_time_ps": f"{r.frame_time_ps:.3f}",
-                                   "pocket_id": r.pocket_id, "pocket_score": "",
-                                   "ligand_name": r.ligand_name, "cnn_affinity": "",
-                                   "vina_score": "", "auc_roc": "",
-                                   "initial_energy_kj_per_mol": "", "final_energy_kj_per_mol": "",
-                                   "interaction_energy_kj_per_mol": "",
-                                   "ligand_rmsd_from_dock_angstrom": "",
-                                   "protein_atoms_flexible": "", "protein_atoms_restrained": "",
-                                   "error": r.error}
-                        all_rows.append(row)
-                        csv_writer.writerow(row)
-                        csv_fh.flush()
-                        sys.stdout.flush()
-            except Exception as exc:
-                import traceback
-                print(f"  [ERROR] dock worker crashed: {exc}\n{traceback.format_exc()}")
-            finally:
-                with tasks_cv:
-                    active_tasks[0] -= 1
-                    if active_tasks[0] == 0:
-                        tasks_cv.notify_all()
-
-        def submit_pipeline_job(
-            protein_pdb_string: str,
-            protein_pdb_path: str,
-            frame_index: int,
-            frame_time_ps: float,
-        ) -> None:
-            with tasks_cv:
-                active_tasks[0] += 1
-            try:
+    
+    def on_dock_done(future):
+        try:
+            frame_results = future.result()
+            if not frame_results:
+                return
+            for r in frame_results:
+                with results_lock:
+                    if r.status in ("ok", "refined"):
+                        heap_updated = top_heap.push(r)
+                        row = _to_row(r)
+                        score_str = f"AUC={r.auc_roc:.3f}" if r.auc_roc is not None else f"CNN={r.cnn_affinity:.2f}"
+                        print(f"  [pipeline] OK  frame={r.frame_index}  t={r.frame_time_ps:.3f} ps  pocket={r.pocket_id}  {score_str}")
+                        best = top_heap.current_best()
+                        if best is not None and args.top_k > 0:
+                            prev = rolling_best_energy[0]
+                            rank_score = top_heap._rank_score(best)
+                            if prev is None or rank_score > prev:
+                                rolling_best_energy[0] = rank_score
+                                best_str = f"{ranking_metric}={rank_score:.3f}"
+                                print(f"  [top-{args.top_k}] new best rank-1: {best_str} | frame={best.frame_index} pocket={best.pocket_id} ligand={best.ligand_name}")
+                        if heap_updated and args.top_k > 0:
+                            _write_multimodel_pdb(outdir / args.top_output, top_heap.sorted_best())
+                    else:
+                        print(f"     Frame {r.frame_index} pocket {r.pocket_id} FAILED: {r.error[:120]}")
+                        row = {"status": "error", "frame_index": r.frame_index, "frame_time_ps": f"{r.frame_time_ps:.3f}", "pocket_id": r.pocket_id, "pocket_score": "", "ligand_name": r.ligand_name, "cnn_affinity": "", "vina_score": "", "auc_roc": "", "initial_energy_kj_per_mol": "", "final_energy_kj_per_mol": "", "interaction_energy_kj_per_mol": "", "ligand_rmsd_from_dock_angstrom": "", "protein_atoms_flexible": "", "protein_atoms_restrained": "", "error": r.error}
+                    all_rows.append(row)
+                    csv_writer.writerow(row)
+                    csv_fh.flush()
+                    sys.stdout.flush()
+        except Exception as exc:
+            import traceback
+            print(f"  [ERROR] dock worker crashed: {exc}\n{traceback.format_exc()}")
+            
+    # PHASE 1: MD + CPU Pocketeer Streaming
+    frame_dir = outdir / "frames"
+    frame_dir.mkdir(exist_ok=True)
+    dynamics_frames = []
+    
+    if "dynamics" in args.steps:
+        print(f"  [Phase 1] Running Dynamics + concurrent Pocket Detection ({num_workers} CPU workers) ...")
+        
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers, mp_context=multiprocessing.get_context("spawn"), initializer=_worker_init) as executor:
+            active_pocket_futures = []
+            
+            def submit_pocket_job(pdb_str, pdb_path, f_idx, f_time):
+                if "pocket" not in args.steps:
+                    return
                 future = executor.submit(
                     _dock_frame_worker,
-                    frame_index=frame_index,
-                    frame_time_ps=frame_time_ps,
-                    protein_pdb_path=protein_pdb_path,
-                    protein_pdb_string=protein_pdb_string,
-                    ligand_sdf_paths=ligand_sdf_paths,
-                    name_map=name_map,
-                    active_names=active_names,
-                    inactive_names=inactive_names,
-                    pocket_score_threshold=args.pocket_score_threshold,
-                    gnina_binary=args.gnina_binary,
-                    exhaustiveness=args.exhaustiveness,
-                    num_modes=args.num_modes,
-                    cnn_scoring=args.cnn_scoring,
-                    gnina_seed=args.gnina_seed,
-                    dry_run=args.dry_run,
-                    scoring_method=args.scoring_method,
-                    sar_metric=args.sar_metric,
-                    docking_output_dir=str(docking_output_dir),
-                    gnina_timeout_seconds=args.gnina_timeout_seconds,
-                    steps=args.steps,
-                    project_output_dir=str(outdir),
+                    frame_index=f_idx, frame_time_ps=f_time, protein_pdb_path=pdb_path, protein_pdb_string=pdb_str,
+                    ligand_sdf_paths={}, name_map={}, active_names=[], inactive_names=[],
+                    pocket_score_threshold=args.pocket_score_threshold, gnina_binary=args.gnina_binary,
+                    exhaustiveness=args.exhaustiveness, num_modes=args.num_modes, cnn_scoring="none",
+                    gnina_seed=args.gnina_seed, dry_run=args.dry_run, scoring_method=args.scoring_method,
+                    sar_metric=args.sar_metric, docking_output_dir=None, gnina_timeout_seconds=args.gnina_timeout_seconds,
+                    steps=["pocket"], project_output_dir=str(outdir)
                 )
-                future.add_done_callback(on_dock_done)
-            except Exception:
-                with tasks_cv:
-                    active_tasks[0] -= 1
-                    if active_tasks[0] == 0:
-                        tasks_cv.notify_all()
-                raise
+                active_pocket_futures.append(future)
 
-
-
-        # We removed the pre-warming loop because concurrently spawning 31+ processes
-        # that each load PyTorch/Pocketeer simultaneously can cause a massive thread/I/O
-        # bottleneck, resulting in an indefinite hang on startup.
-        print(f"  Worker pool created ({num_workers} processes). Workers will spin up on demand.")
-
-        if "dynamics" not in args.steps:
-            print(f"\n  [MD Skipped] 'dynamics' step is omitted. Loading existing frames.")
-            frame_dir = outdir / "frames"
-            if not frame_dir.exists():
-                print(f"  Error: Frame directory {frame_dir} not found.")
-                return
-            
-            pdb_files = sorted(frame_dir.glob("*.pdb"))
-            if not pdb_files:
-                print(f"  Error: No PDB files found in {frame_dir}.")
-                return
-
-            print(f"  Found {len(pdb_files)} frame PDB files. Submitting to worker pool...")
-            for pdb_path in pdb_files:
-                pdb_str = pdb_path.read_text()
-                import re
-                m = re.search(r"frame_(\d+)", pdb_path.name)
-                if m:
-                    f_idx = int(m.group(1))
-                elif "initial" in pdb_path.name:
-                    f_idx = -1
-                else:
-                    f_idx = 0
-
-                submit_pipeline_job(
-                    protein_pdb_string=pdb_str,
-                    protein_pdb_path=str(pdb_path),
-                    frame_index=f_idx,
-                    frame_time_ps=0.0
-                )
-            
-            print("\n  All remaining frames submitted. Waiting for workers to finish...")
-            dynamics_sim_time = 0.0
-            dynamics_frames_len = len(pdb_files)
-            dynamics_trajectory_dcd = None
-            dynamics_topology_pdb = None
-
-        else:
-            # Run full pipeline on the input (pre-solvation) prepared protein concurrently with MD setup/run.
-            frame_dir = outdir / "frames"
-            frame_dir.mkdir(exist_ok=True)
-            (frame_dir / "frame_initial_input.pdb").write_text(initial_pdb_string)
-            print("  Submitted initial (pre-MD) protein to analysis pipeline (frame_index=-1).")
             initial_pdb_path = str(frame_dir / "frame_initial_input.pdb")
-            submit_pipeline_job(initial_pdb_string, initial_pdb_path, frame_index=-1, frame_time_ps=0.0)
-
-            def frame_callback(frame: DynamicsFrame) -> None:
-                frame_pdb_path = frame_dir / f"frame_{frame.frame_index:04d}.pdb"
-                frame_pdb_path.write_text(frame.protein_pdb_string)
-                submit_pipeline_job(
-                    frame.protein_pdb_string,
-                    str(frame_pdb_path),
-                    frame_index=frame.frame_index,
-                    frame_time_ps=frame.simulation_time_ps,
-                )
-    
-            dynamics_result: DynamicsResult = run_dynamics(
-                args.protein_pdb,
-                ph=args.ph,
-                box_padding_nm=args.box_padding_nm,
-                ionic_strength_molar=args.ionic_strength,
-                nvt_steps=args.nvt_steps,
-                npt_steps=args.npt_steps,
-                production_steps=args.production_steps,
-                temperature_kelvin=args.temperature_kelvin,
-                friction_per_ps=args.friction_per_ps,
-                timestep_fs=args.timestep_fs,
-                report_interval_steps=args.report_interval_steps,
-                rmsd_threshold_angstrom=args.rmsd_threshold_angstrom,
-                platform_name=args.platform_name,
-                cuda_precision=args.cuda_precision,
-                output_dir=outdir,
-                save_trajectory=not args.no_trajectory,
-                water_model=args.water_model,
-                frame_callback=frame_callback,
-                verbose=True,
+            (frame_dir / "frame_initial_input.pdb").write_text(initial_pdb_string)
+            submit_pocket_job(initial_pdb_string, initial_pdb_path, -1, 0.0)
+            dynamics_frames.append((-1, 0.0, initial_pdb_path, initial_pdb_string))
+            
+            def frame_callback(frame):
+                f_path = frame_dir / f"frame_{frame.frame_index:04d}.pdb"
+                f_path.write_text(frame.protein_pdb_string)
+                submit_pocket_job(frame.protein_pdb_string, str(f_path), frame.frame_index, frame.simulation_time_ps)
+                dynamics_frames.append((frame.frame_index, frame.simulation_time_ps, str(f_path), frame.protein_pdb_string))
+                
+            dynamics_result = run_dynamics(
+                initial_prepared, ph=args.ph, box_padding_nm=args.box_padding_nm,
+                ionic_strength_molar=args.ionic_strength, nvt_steps=args.nvt_steps,
+                npt_steps=args.npt_steps, production_steps=args.production_steps,
+                temperature_kelvin=args.temperature_kelvin, friction_per_ps=args.friction_per_ps,
+                timestep_fs=args.timestep_fs, report_interval_steps=args.report_interval_steps,
+                rmsd_threshold_angstrom=args.rmsd_threshold_angstrom, platform_name=args.platform_name,
+                cuda_precision=args.cuda_precision, output_dir=outdir,
+                save_trajectory=not args.no_trajectory, water_model=args.water_model,
+                frame_callback=frame_callback, verbose=True
             )
+            
             dynamics_sim_time = dynamics_result.simulation_time_ps
             dynamics_frames_len = len(dynamics_result.frames)
             dynamics_trajectory_dcd = dynamics_result.trajectory_dcd
             dynamics_topology_pdb = dynamics_result.topology_pdb
+            
+            print("\n  Main MD complete. Waiting for any remaining pocket analysis workers…")
+            concurrent.futures.wait(active_pocket_futures)
+            for f in active_pocket_futures:
+                f.result() # Surface any exceptions
+    else:
+        dynamics_sim_time = 0.0
+        dynamics_frames_len = 0
+        dynamics_trajectory_dcd = None
+        dynamics_topology_pdb = None
+        pdb_files = sorted(frame_dir.glob("*.pdb"))
+        if not pdb_files:
+            print(f"  Error: No PDB files found in {frame_dir}. Cannot run docking without frames.")
+            return
+        print(f"  [MD Skipped] Found {len(pdb_files)} frame PDB files for downstream steps.")
+        for pdb_path in pdb_files:
+            pdb_str = pdb_path.read_text()
+            import re
+            m = re.search(r"frame_(\d+)", pdb_path.name)
+            f_idx = int(m.group(1)) if m else (-1 if "initial" in pdb_path.name else 0)
+            dynamics_frames.append((f_idx, 0.0, str(pdb_path), pdb_str))
+        
+        # We still need to run pocket detection if it was passed without dynamics
+        if "pocket" in args.steps:
+            print(f"  [Phase 1] Running Standalone Pocket Detection ({num_workers} CPU workers) ...")
+            with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers, mp_context=multiprocessing.get_context("spawn"), initializer=_worker_init) as executor:
+                pocket_futures = []
+                for f_idx, f_time, p_path, p_str in dynamics_frames:
+                    future = executor.submit(
+                        _dock_frame_worker,
+                        frame_index=f_idx, frame_time_ps=f_time, protein_pdb_path=p_path, protein_pdb_string=p_str,
+                        ligand_sdf_paths={}, name_map={}, active_names=[], inactive_names=[],
+                        pocket_score_threshold=args.pocket_score_threshold, gnina_binary=args.gnina_binary,
+                        exhaustiveness=args.exhaustiveness, num_modes=args.num_modes, cnn_scoring="none",
+                        gnina_seed=args.gnina_seed, dry_run=args.dry_run, scoring_method=args.scoring_method,
+                        sar_metric=args.sar_metric, docking_output_dir=None, gnina_timeout_seconds=args.gnina_timeout_seconds,
+                        steps=["pocket"], project_output_dir=str(outdir)
+                    )
+                    pocket_futures.append(future)
+                concurrent.futures.wait(pocket_futures)
 
-            print("\n  Main MD complete. Waiting for remaining analysis workers …")
-        with tasks_cv:
-            while active_tasks[0] > 0:
-                tasks_cv.wait()
-        # Executor context manager will wait for all tasks on __exit__
+
+    # PHASE 2: Docking & Scoring (GPU Heavy!)
+    do_dock = "docking" in args.steps or "scoring" in args.steps
+    if do_dock:
+        docking_steps = [s for s in args.steps if s in ("docking", "scoring")]
+        print(f"\n  [Phase 2] Running Sequential GPU Docking ({max_docking_workers} workers) ...")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_docking_workers, mp_context=multiprocessing.get_context("spawn"), initializer=_worker_init) as executor:
+            dock_futures = []
+            for f_idx, f_time, p_path, p_str in dynamics_frames:
+                future = executor.submit(
+                    _dock_frame_worker,
+                    frame_index=f_idx, frame_time_ps=f_time, protein_pdb_path=p_path, protein_pdb_string=p_str,
+                    ligand_sdf_paths=ligand_sdf_paths, name_map=name_map, active_names=active_names, inactive_names=inactive_names,
+                    pocket_score_threshold=args.pocket_score_threshold, gnina_binary=args.gnina_binary,
+                    exhaustiveness=args.exhaustiveness, num_modes=args.num_modes, cnn_scoring=args.cnn_scoring,
+                    gnina_seed=args.gnina_seed, dry_run=args.dry_run, scoring_method=args.scoring_method,
+                    sar_metric=args.sar_metric, docking_output_dir=str(docking_output_dir), gnina_timeout_seconds=args.gnina_timeout_seconds,
+                    steps=docking_steps, project_output_dir=str(outdir)
+                )
+                future.add_done_callback(on_dock_done)
+                dock_futures.append(future)
+            concurrent.futures.wait(dock_futures)
 
     csv_fh.close()
 

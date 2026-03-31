@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import io
+import hashlib
 from pathlib import Path
 
 try:
@@ -35,6 +36,7 @@ def prepare_protein(
     add_hydrogens: bool = True,
     ph: float = 7.4,
     forcefield_files: tuple[str, ...] = _DEFAULT_FORCEFIELD_FILES,
+    output_dir: str | Path | None = None,
 ) -> PreparedProtein:
     """Repair a protein PDB with PDBFixer and return a PreparedProtein.
 
@@ -67,6 +69,9 @@ def prepare_protein(
         pH used when determining protonation states (default 7.4).
     forcefield_files:
         Force-field XML files passed to ``ForceField`` for hydrogen addition.
+    output_dir:
+        Directory to look for/cache the prepared protein PDB. If provided,
+        utilizes SHA256 of the input to avoid redundant PDBFixer runs.
     """
     if not _PDBFIXER_AVAILABLE:
         raise ImportError(
@@ -75,6 +80,28 @@ def prepare_protein(
         )
 
     path = Path(protein_pdb_path)
+    content = path.read_bytes()
+    
+    hasher = hashlib.sha256()
+    hasher.update(content)
+    hasher.update(str(add_hydrogens).encode())
+    hasher.update(str(ph).encode())
+    hasher.update(str(forcefield_files).encode())
+    file_hash = hasher.hexdigest()
+
+    cached_pdb_path = None
+    if output_dir:
+        out_path = Path(output_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        cached_pdb_path = out_path / f"{file_hash}_prepared_protein.pdb"
+        if cached_pdb_path.exists():
+            # Load from cache
+            parsed = PDBFile(str(cached_pdb_path))
+            return PreparedProtein(
+                topology=parsed.topology,
+                positions=parsed.positions,
+                source_path=path,
+            )
 
     # --- Step 1: PDBFixer heavy-atom repair ---
     fixer = PDBFixer(filename=str(path))
@@ -110,6 +137,10 @@ def prepare_protein(
         # purely from chain position and adds exactly what each template needs.
         ff = ForceField(*forcefield_files)
         modeller.addHydrogens(ff, pH=ph)
+
+    if cached_pdb_path:
+        with open(cached_pdb_path, 'w') as f:
+            PDBFile.writeFile(modeller.topology, modeller.positions, f)
 
     return PreparedProtein(
         topology=modeller.topology,

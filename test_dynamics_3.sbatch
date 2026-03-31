@@ -11,8 +11,8 @@
 
 #SBATCH --mem=32G
 #SBATCH --time=1-12:00:00
-#SBATCH --output=test_dynamics_%j.log
-#SBATCH --error=test_dynamics_%j.err
+#SBATCH --output=test_3_%j.log
+#SBATCH --error=test_3_%j.err
 #SBATCH --mail-user=shuhang@unc.edu
 #SBATCH --mail-type=ALL
 
@@ -30,17 +30,15 @@ cd /work/users/s/h/shuhang/draco
 pixi run draco \
   --mode single \
   --steps docking scoring \
-  --protein-pdb    "4GL2.pdb" \
-  --ligand-smiles  "Cc1ccc(S(N)(=O)=O)cc1C(=O)NCc1ccc(-c2nc3ccccc3s2)o1" \
-  --gnina-binary   "apptainer run --nv /work/users/s/h/shuhang/gnina_build/gnina.sif" \
-  --output-dir     "4GL2_XS421854b"
-
-'''
-pixi run draco \
-  --mode single \
-  --steps scoring \
-  --protein-pdb    "4GL2.pdb" \
+  --protein-pdb    "3B6E.pdb" \
   --ligand-smiles  "O=C(Nc1ccc(Cl)cc1)Nc1ccc(S(=O)(=O)Nc2nccs2)cc1" \
   --gnina-binary   "apptainer run --nv /work/users/s/h/shuhang/gnina_build/gnina.sif" \
-  --output-dir     "4GL2_XS466077b"
-'''
+  --output-dir     "3B6E_XS466077b"
+
+pixi run draco \
+  --mode single \
+  --steps docking scoring \
+  --protein-pdb    "3B6E.pdb" \
+  --ligand-smiles  "Cc1ccc(S(N)(=O)=O)cc1C(=O)NCc1ccc(-c2nc3ccccc3s2)o1" \
+  --gnina-binary   "apptainer run --nv /work/users/s/h/shuhang/gnina_build/gnina.sif" \
+  --output-dir     "3B6E_XS421854b"

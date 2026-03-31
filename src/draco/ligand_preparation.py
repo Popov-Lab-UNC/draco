@@ -13,45 +13,17 @@ import numpy as np
 import numpy.typing as npt
 
 from rdkit import Chem
-from rdkit.Chem import AllChem, ChemicalFeatures, rdMolDescriptors
+from rdkit.Chem import AllChem, rdMolDescriptors
 from rdkit.Chem.rdchem import Mol
 from rdkit.Chem.SaltRemover import SaltRemover
+from rdkit.Chem.MolStandardize import rdMolStandardize
 from rdkit import RDConfig
 
-from draco.constants import FEATURE_LABEL_MAP
 
 _log = logging.getLogger(__name__)
 
 # Instantiate globally to compile salt SMARTS patterns only once
 _SALT_REMOVER = SaltRemover()
-
-_FEATURE_LABEL_MAP = FEATURE_LABEL_MAP
-
-
-@dataclass(frozen=True)
-class LigandColorPoint:
-    label: str
-    coords: npt.NDArray[np.float64]
-    atom_indices: tuple[int, ...]
-    radius: float = 1.7
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "label": self.label,
-            "coords": self.coords.tolist(),
-            "atom_indices": list(self.atom_indices),
-            "radius": self.radius,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "LigandColorPoint":
-        return cls(
-            label=str(data["label"]),
-            coords=np.asarray(data["coords"], dtype=np.float64),
-            atom_indices=tuple(int(idx) for idx in data["atom_indices"]),
-            radius=float(data.get("radius", 1.7)),
-        )
-
 
 @dataclass(frozen=True)
 class LigandBond:
@@ -79,7 +51,6 @@ class PreparedLigandConformer:
     bonds: tuple[LigandBond, ...]
     heavy_atom_indices: tuple[int, ...]
     shape_atom_radii: npt.NDArray[np.float64]
-    color_points: tuple[LigandColorPoint, ...]
     mol_block: str
 
     @property
@@ -111,33 +82,8 @@ class PreparedLigandConformer:
             bonds=tuple(LigandBond.from_dict(bond) for bond in data["bonds"]),
             heavy_atom_indices=tuple(int(idx) for idx in data["heavy_atom_indices"]),
             shape_atom_radii=np.asarray(data["shape_atom_radii"], dtype=np.float64),
-            color_points=tuple(
-                LigandColorPoint.from_dict(point) for point in data["color_points"]
-            ),
             mol_block=str(data["mol_block"]),
         )
-
-
-@dataclass(frozen=True)
-class SphereOverlapResult:
-    """Per-sphere compatibility result from ligand–pocket feature overlap scoring."""
-
-    sphere_id: int
-    sphere_labels: tuple[str, ...]
-    matched_ligand_label: str
-    ligand_point_index: int
-    distance: float
-    compatibility: int
-
-
-@dataclass(frozen=True)
-class PocketAlignPoint:
-    """Internal: pocket feature anchor for rigid-body alignment to a ligand."""
-
-    feature_id: str
-    label: str
-    coords: npt.NDArray[np.float64]
-    sphere_id: int
 
 
 @dataclass(frozen=True)
@@ -178,6 +124,8 @@ def prepare_ligand_from_smiles(
     optimize: bool = True,
     max_iterations: int = 200,
     energy_cutoff: float = 5.0,
+    enumerate_tautomers: bool = True,
+    max_tautomers: int = 4,
 ) -> PreparedLigand:
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
@@ -194,6 +142,8 @@ def prepare_ligand_from_smiles(
         optimize=optimize,
         max_iterations=max_iterations,
         energy_cutoff=energy_cutoff,
+        enumerate_tautomers=enumerate_tautomers,
+        max_tautomers=max_tautomers,
     )
 
 
@@ -207,6 +157,8 @@ def prepare_ligand_from_file(
     optimize: bool = True,
     max_iterations: int = 200,
     energy_cutoff: float = 5.0,
+    enumerate_tautomers: bool = True,
+    max_tautomers: int = 4,
 ) -> PreparedLigand:
     path = Path(ligand_path)
     mol = _load_molecule_from_file(path)
@@ -221,6 +173,8 @@ def prepare_ligand_from_file(
         optimize=optimize,
         max_iterations=max_iterations,
         energy_cutoff=energy_cutoff,
+        enumerate_tautomers=enumerate_tautomers,
+        max_tautomers=max_tautomers,
     )
 
 
@@ -246,6 +200,8 @@ def load_compound_csv(
     prune_rms_threshold: float = 0.5,
     random_seed: int = 0xF00D,
     energy_cutoff: float = 5.0,
+    enumerate_tautomers: bool = True,
+    max_tautomers: int = 4,
 ) -> tuple[list[PreparedLigand], list[PreparedLigand], dict[str, str]]:
     """Load a compound CSV and return (actives, inactives, name_map).
 
@@ -294,6 +250,8 @@ def load_compound_csv(
                 prune_rms_threshold=prune_rms_threshold,
                 random_seed=random_seed,
                 energy_cutoff=energy_cutoff,
+                enumerate_tautomers=enumerate_tautomers,
+                max_tautomers=max_tautomers,
             )
 
             name_map[prep.name] = name
@@ -422,73 +380,77 @@ def _prepare_ligand_mol(
     optimize: bool,
     max_iterations: int,
     energy_cutoff: float,
+    enumerate_tautomers: bool,
+    max_tautomers: int,
 ) -> PreparedLigand:
-    # --- Strip disconnected counter-ions (Na+, Cl-, etc.) ---
-    mol = _SALT_REMOVER.StripMol(mol, dontRemoveEverything=True)
+    mol = _strip_salts(mol)
     
-    mol = Chem.AddHs(Chem.Mol(mol))
+    tautomer_mols = _enumerate_tautomers_limited(mol, enumerate_tautomers, max_tautomers)
+    canonical_smiles = Chem.MolToSmiles(Chem.RemoveHs(Chem.Mol(mol)))
+    prepared_conformers: list[PreparedLigandConformer] = []
 
-    params = AllChem.ETKDGv3()
-    params.randomSeed = random_seed
-    # We do NOT prune during embedding because we want to prune AFTER optimization
-    params.pruneRmsThresh = -1.0
-    params.useSmallRingTorsions = True
-    params.useMacrocycleTorsions = True
+    for tautomer_index, tautomer in enumerate(tautomer_mols):
+        mol_with_h = Chem.AddHs(Chem.Mol(tautomer))
+        
+        conformer_ids = _embed_conformers(mol_with_h, num_conformers, random_seed + tautomer_index)
+        if not conformer_ids:
+            continue
 
-    conformer_ids = list(AllChem.EmbedMultipleConfs(mol, numConfs=num_conformers, params=params))
-    if not conformer_ids:
-        raise ValueError(f"RDKit failed to embed conformers for ligand '{name}'")
+        if optimize:
+            energies = _optimize_conformers(mol_with_h, conformer_ids, max_iterations)
+        else:
+            energies = _calc_unoptimized_energies(mol_with_h, conformer_ids)
 
-    if optimize:
-        conformer_ids = _optimize_and_filter_conformers(
-            mol, conformer_ids,
-            max_iterations=max_iterations,
-            energy_cutoff=energy_cutoff,
-            prune_rms_threshold=prune_rms_threshold
+        keep_cids = _filter_and_prune_conformers(
+            mol_with_h, energies, energy_cutoff, prune_rms_threshold
         )
 
-    canonical_smiles = Chem.MolToSmiles(Chem.RemoveHs(Chem.Mol(mol)))
-    conformers = tuple(_extract_conformer(mol, conf_id) for conf_id in conformer_ids)
+        for conf_id in keep_cids:
+            extracted = _extract_conformer(mol_with_h, conf_id)
+            prepared_conformers.append(
+                PreparedLigandConformer(
+                    conformer_id=len(prepared_conformers),
+                    all_atom_coords=extracted.all_atom_coords,
+                    atom_symbols=extracted.atom_symbols,
+                    bonds=extracted.bonds,
+                    heavy_atom_indices=extracted.heavy_atom_indices,
+                    shape_atom_radii=extracted.shape_atom_radii,
+                    mol_block=extracted.mol_block,
+                )
+            )
+
+    if not prepared_conformers:
+        raise ValueError(f"RDKit failed to embed conformers for ligand '{name}'")
 
     return PreparedLigand(
         name=name,
         canonical_smiles=canonical_smiles,
         source=source,
-        conformers=conformers,
+        conformers=tuple(prepared_conformers),
     )
 
 
-def _load_molecule_from_file(path: Path) -> Mol:
-    suffix = path.suffix.lower()
-    if suffix == ".sdf":
-        supplier = Chem.SDMolSupplier(str(path), removeHs=False)
-        mol = next((entry for entry in supplier if entry is not None), None)
-    elif suffix in {".mol", ".mol2"}:
-        mol = Chem.MolFromMolFile(str(path), removeHs=False)
-    elif suffix == ".pdb":
-        mol = Chem.MolFromPDBFile(str(path), removeHs=False)
-    else:
-        raise ValueError(
-            f"Unsupported ligand file type '{suffix}'. Use SMILES, SDF, MOL, MOL2, or PDB."
-        )
-
-    if mol is None:
-        raise ValueError(f"Could not load ligand from file: {path}")
-    return mol
+def _strip_salts(mol: Mol) -> Mol:
+    return _SALT_REMOVER.StripMol(mol, dontRemoveEverything=True)
 
 
-def _optimize_and_filter_conformers(
-    mol: Mol,
-    conformer_ids: list[int],
-    *,
-    max_iterations: int,
-    energy_cutoff: float,
-    prune_rms_threshold: float,
-) -> list[int]:
-    """Optimize conformers, calculate energies, filter by cutoff, and prune by RMSD."""
+def _enumerate_tautomers_limited(mol: Mol, enumerate_tautomers: bool, max_tautomers: int) -> list[Mol]:
+    if not enumerate_tautomers:
+        return [Chem.RemoveHs(Chem.Mol(mol))]
+    return _enumerate_tautomer_molecules(mol, max_tautomers=max_tautomers)
 
+
+def _embed_conformers(mol_with_h: Mol, num_conformers: int, seed: int) -> list[int]:
+    params = AllChem.ETKDGv3()
+    params.randomSeed = seed
+    params.pruneRmsThresh = -1.0 # Prune later
+    params.useSmallRingTorsions = True
+    params.useMacrocycleTorsions = True
+    return list(AllChem.EmbedMultipleConfs(mol_with_h, numConfs=num_conformers, params=params))
+
+
+def _optimize_conformers(mol: Mol, conformer_ids: list[int], max_iterations: int) -> list[tuple[int, float]]:
     energies: list[tuple[int, float]] = []
-
     if AllChem.MMFFHasAllMoleculeParams(mol):
         props = AllChem.MMFFGetMoleculeProperties(mol)
         for conf_id in conformer_ids:
@@ -502,39 +464,54 @@ def _optimize_and_filter_conformers(
             if ff is not None:
                 ff.Minimize(maxIters=max_iterations)
                 energies.append((conf_id, ff.CalcEnergy()))
+    return energies
 
+
+def _calc_unoptimized_energies(mol: Mol, conformer_ids: list[int]) -> list[tuple[int, float]]:
+    energies: list[tuple[int, float]] = []
+    if AllChem.MMFFHasAllMoleculeParams(mol):
+        props = AllChem.MMFFGetMoleculeProperties(mol)
+        for conf_id in conformer_ids:
+            ff = AllChem.MMFFGetMoleculeForceField(mol, props, confId=conf_id)
+            if ff is not None:
+                energies.append((conf_id, ff.CalcEnergy()))
+    else:
+        for conf_id in conformer_ids:
+            ff = AllChem.UFFGetMoleculeForceField(mol, confId=conf_id)
+            if ff is not None:
+                energies.append((conf_id, ff.CalcEnergy()))
+    return energies
+
+
+def _filter_and_prune_conformers(
+    mol: Mol,
+    energies: list[tuple[int, float]],
+    energy_cutoff: float,
+    prune_rms_threshold: float,
+) -> list[int]:
     if not energies:
         return []
-
-    # Sort by energy (ascending)
+    
     energies.sort(key=lambda x: x[1])
     min_energy = energies[0][1]
-
-    # Filter by energy cutoff
     filtered_cids = [cid for cid, energy in energies if energy - min_energy <= energy_cutoff]
 
     if prune_rms_threshold <= 0:
         return filtered_cids
 
-    # Prune by RMSD (greedy approach, keeping lowest energy first)
     keep_cids: list[int] = []
     for cid in filtered_cids:
         if not keep_cids:
             keep_cids.append(cid)
             continue
-
-        # Check against already kept conformers
         too_close = False
         for kept_cid in keep_cids:
-            # We don't pre-align here, RDKit calculates best alignment RMSD
             rmsd = AllChem.GetBestRMS(mol, mol, cid, kept_cid)
             if rmsd < prune_rms_threshold:
                 too_close = True
                 break
-
         if not too_close:
             keep_cids.append(cid)
-
     return keep_cids
 
 
@@ -556,7 +533,6 @@ def _extract_conformer(mol: Mol, conformer_id: int) -> PreparedLigandConformer:
             heavy_atom_indices.append(atom_index)
             heavy_atom_radii.append(float(periodic_table.GetRvdw(atom.GetAtomicNum())))
 
-    color_points = tuple(_extract_color_points(mol, conformer_id, all_atom_coords))
     bonds = tuple(
         LigandBond(
             begin=bond.GetBeginAtomIdx(),
@@ -574,42 +550,8 @@ def _extract_conformer(mol: Mol, conformer_id: int) -> PreparedLigandConformer:
         bonds=bonds,
         heavy_atom_indices=tuple(heavy_atom_indices),
         shape_atom_radii=np.asarray(heavy_atom_radii, dtype=np.float64),
-        color_points=color_points,
         mol_block=mol_block,
     )
-
-
-def _extract_color_points(
-    mol: Mol,
-    conformer_id: int,
-    all_atom_coords: npt.NDArray[np.float64],
-) -> list[LigandColorPoint]:
-    feature_factory = _build_feature_factory()
-    features = feature_factory.GetFeaturesForMol(mol, confId=conformer_id)
-
-    points: list[LigandColorPoint] = []
-    seen: set[tuple[str, tuple[int, ...]]] = set()
-
-    for feature in features:
-        label = _FEATURE_LABEL_MAP.get(feature.GetFamily())
-        if label is None:
-            continue
-
-        atom_indices = tuple(sorted(int(idx) for idx in feature.GetAtomIds()))
-        dedupe_key = (label, atom_indices)
-        if dedupe_key in seen:
-            continue
-        seen.add(dedupe_key)
-
-        coords = np.mean(all_atom_coords[np.asarray(atom_indices, dtype=int)], axis=0)
-        points.append(LigandColorPoint(label=label, coords=coords, atom_indices=atom_indices))
-
-    return points
-
-
-def _build_feature_factory() -> ChemicalFeatures.MolChemicalFeatureFactory:
-    feature_path = os.path.join(RDConfig.RDDataDir, "BaseFeatures.fdef")
-    return ChemicalFeatures.BuildFeatureFactory(feature_path)
 
 
 def approximate_shape_self_overlap(

@@ -173,7 +173,7 @@ class DynamicsResult:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_dynamics(
-    protein_pdb_path: str | Path,
+    protein_input: str | Path | PreparedProtein,
     *,
     ph: float = 7.4,
     # Solvation
@@ -270,8 +270,12 @@ def run_dynamics(
     timestep_fs = float(timestep_fs)
 
     # ── Step 1: Prepare protein (PDBFixer + H addition) ────────────────────
-    log("── Step 1/4: Preparing protein (PDBFixer) …")
-    prepared_protein = prepare_protein(protein_pdb_path, ph=ph)
+    if isinstance(protein_input, PreparedProtein):
+        log("── Step 1/4: Using pre-prepared protein …")
+        prepared_protein = protein_input
+    else:
+        log("── Step 1/4: Preparing protein (PDBFixer) …")
+        prepared_protein = prepare_protein(protein_input, ph=ph, output_dir=outdir)
 
     # ── Snapshot: prepared protein (before solvation) ──────────────────────
     step1_pdb = outdir / "step1_prepared_protein.pdb"
