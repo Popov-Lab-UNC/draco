@@ -118,8 +118,8 @@ def prepare_ligand_from_smiles(
     smiles: str,
     *,
     name: str | None = None,
-    num_conformers: int = 100,
-    prune_rms_threshold: float = 0.5,
+    num_conformers: int = 10,
+    prune_rms_threshold: float = 1.0,
     random_seed: int = 0xF00D,
     optimize: bool = True,
     max_iterations: int = 200,
@@ -151,8 +151,8 @@ def prepare_ligand_from_file(
     ligand_path: str | os.PathLike[str],
     *,
     name: str | None = None,
-    num_conformers: int = 100,
-    prune_rms_threshold: float = 0.5,
+    num_conformers: int = 10,
+    prune_rms_threshold: float = 1.0,
     random_seed: int = 0xF00D,
     optimize: bool = True,
     max_iterations: int = 200,
@@ -193,11 +193,39 @@ def load_prepared_ligand(
     return PreparedLigand.from_dict(json.loads(path.read_text()))
 
 
+def _prepare_csv_row(
+    row: dict[str, str],
+    num_conformers: int,
+    prune_rms_threshold: float,
+    random_seed: int,
+    energy_cutoff: float,
+    enumerate_tautomers: bool,
+    max_tautomers: int,
+) -> tuple[bool, str, PreparedLigand | None, str | None]:
+    name = row["name"].strip()
+    smiles = row["smiles"].strip()
+    is_active = str(row["active"]).strip() in ("1", "true", "True", "yes")
+
+    try:
+        prep = prepare_ligand_from_smiles(
+            smiles, name=name,
+            num_conformers=num_conformers,
+            prune_rms_threshold=prune_rms_threshold,
+            random_seed=random_seed,
+            energy_cutoff=energy_cutoff,
+            enumerate_tautomers=enumerate_tautomers,
+            max_tautomers=max_tautomers,
+        )
+        return is_active, name, prep, None
+    except Exception as e:
+        return is_active, name, None, str(e)
+
+
 def load_compound_csv(
     csv_path: str | os.PathLike[str],
     *,
-    num_conformers: int = 100,
-    prune_rms_threshold: float = 0.5,
+    num_conformers: int = 10,
+    prune_rms_threshold: float = 1.0,
     random_seed: int = 0xF00D,
     energy_cutoff: float = 5.0,
     enumerate_tautomers: bool = True,
@@ -239,21 +267,32 @@ def load_compound_csv(
                 f"Compound CSV {path} must have columns: {required}. "
                 f"Found: {reader.fieldnames}"
             )
-        for row in reader:
-            name = row["name"].strip()
-            smiles = row["smiles"].strip()
-            is_active = str(row["active"]).strip() in ("1", "true", "True", "yes")
+        rows = list(reader)
 
-            prep = prepare_ligand_from_smiles(
-                smiles, name=name,
-                num_conformers=num_conformers,
-                prune_rms_threshold=prune_rms_threshold,
-                random_seed=random_seed,
-                energy_cutoff=energy_cutoff,
-                enumerate_tautomers=enumerate_tautomers,
-                max_tautomers=max_tautomers,
-            )
+    import concurrent.futures
+    import functools
+    import os
 
+    worker = functools.partial(
+        _prepare_csv_row,
+        num_conformers=num_conformers,
+        prune_rms_threshold=prune_rms_threshold,
+        random_seed=random_seed,
+        energy_cutoff=energy_cutoff,
+        enumerate_tautomers=enumerate_tautomers,
+        max_tautomers=max_tautomers,
+    )
+
+    max_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
+    # Leave 1 CPU free to avoid complete starvation
+    max_workers = max(1, max_workers - 1)
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        for is_active, name, prep, err in executor.map(worker, rows):
+            if err is not None:
+                _log.warning("Failed to prepare ligand '%s': %s", name, err)
+                continue
+            assert prep is not None
             name_map[prep.name] = name
             if is_active:
                 actives.append(prep)
@@ -430,6 +469,20 @@ def _prepare_ligand_mol(
     )
 
 
+def _load_molecule_from_file(path: Path) -> Mol:
+    if path.suffix == ".sdf":
+        supplier = Chem.SDMolSupplier(str(path))
+        mol = next(supplier)
+    elif path.suffix == ".pdb":
+        mol = Chem.MolFromPDBFile(str(path))
+    else:
+        raise ValueError(f"Unsupported file format: {path.suffix}")
+
+    if mol is None:
+        raise ValueError(f"Could not load molecule from {path}")
+    return mol
+
+
 def _strip_salts(mol: Mol) -> Mol:
     return _SALT_REMOVER.StripMol(mol, dontRemoveEverything=True)
 
@@ -438,6 +491,14 @@ def _enumerate_tautomers_limited(mol: Mol, enumerate_tautomers: bool, max_tautom
     if not enumerate_tautomers:
         return [Chem.RemoveHs(Chem.Mol(mol))]
     return _enumerate_tautomer_molecules(mol, max_tautomers=max_tautomers)
+
+
+def _enumerate_tautomer_molecules(mol: Mol, max_tautomers: int) -> list[Mol]:
+    enumerator = rdMolStandardize.TautomerEnumerator()
+    # Enumerate generates tautomers; we take up to max_tautomers.
+    # Note: Enumerate returns a TautomerEnumeratorResult which is iterable.
+    tautomers = enumerator.Enumerate(mol)
+    return [t for i, t in enumerate(tautomers) if i < max_tautomers]
 
 
 def _embed_conformers(mol_with_h: Mol, num_conformers: int, seed: int) -> list[int]:
@@ -456,13 +517,13 @@ def _optimize_conformers(mol: Mol, conformer_ids: list[int], max_iterations: int
         for conf_id in conformer_ids:
             ff = AllChem.MMFFGetMoleculeForceField(mol, props, confId=conf_id)
             if ff is not None:
-                ff.Minimize(maxIters=max_iterations)
+                ff.Minimize(maxIts=max_iterations)
                 energies.append((conf_id, ff.CalcEnergy()))
     else:
         for conf_id in conformer_ids:
             ff = AllChem.UFFGetMoleculeForceField(mol, confId=conf_id)
             if ff is not None:
-                ff.Minimize(maxIters=max_iterations)
+                ff.Minimize(maxIts=max_iterations)
                 energies.append((conf_id, ff.CalcEnergy()))
     return energies
 

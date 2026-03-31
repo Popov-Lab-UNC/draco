@@ -185,7 +185,8 @@ def parse_args() -> argparse.Namespace:
     # ── Pocket & Ligand Prep Parameters ───────────────────────────────────────
     pocket_grp = parser.add_argument_group("Pocket & Ligand Prep Parameters")
     pocket_grp.add_argument("--pocket-score-threshold", type=float, default=5.0, help="Pocketeer score threshold.")
-    pocket_grp.add_argument("--num-conformers", type=int, default=100, help="Number of conformers to generate for ligands.")
+    pocket_grp.add_argument("--num-conformers", type=int, default=10, help="Number of conformers to generate for ligands.")
+    pocket_grp.add_argument("--prune-rms-threshold", type=float, default=1.0, help="RMSD threshold for conformer pruning.")
     pocket_grp.add_argument("--energy-cutoff", type=float, default=5.0, help="Energy cutoff (kcal/mol) for conformer pruning.")
     pocket_grp.add_argument("--ligand-name", default="LIG", help="Name for --ligand-smiles compound.")
 
@@ -703,7 +704,7 @@ def main() -> None:
     }
     _DEFAULT_PREP = {
         "num_conformers": args.num_conformers,
-        "prune_rms_threshold": 0.5,
+        "prune_rms_threshold": args.prune_rms_threshold,
         "random_seed": 0xF00D,
         "optimize": True,
         "max_iterations": 200,
@@ -758,6 +759,7 @@ def main() -> None:
         if args.ligand_csv:
             actives, inactives, name_map = load_compound_csv(
                 args.ligand_csv, num_conformers=args.num_conformers,
+                prune_rms_threshold=args.prune_rms_threshold,
                 energy_cutoff=args.energy_cutoff,
             )
             all_compounds = actives + inactives
@@ -772,6 +774,7 @@ def main() -> None:
             prep = prepare_ligand_from_smiles(
                 args.ligand_smiles, name=args.ligand_name,
                 num_conformers=args.num_conformers,
+                prune_rms_threshold=args.prune_rms_threshold,
                 energy_cutoff=args.energy_cutoff,
             )
             all_compounds = [prep]
@@ -799,8 +802,8 @@ def main() -> None:
             manifest["active_state_names"] = [l.name for l in actives]
             manifest["inactive_state_names"] = [l.name for l in inactives]
         else:
-            manifest["active_state_names"] = []
-            manifest["inactive_state_names"] = [s.name for s in states]
+            manifest["active_state_names"] = [c.name for c in all_compounds]
+            manifest["inactive_state_names"] = []
         ligand_manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     # Prepare initial protein structure
