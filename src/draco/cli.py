@@ -1266,8 +1266,8 @@ def main() -> None:
                 )
                 active_pocket_futures.append(future)
 
-            initial_pdb_path = str(frame_dir / "frame_initial_input.pdb")
-            (frame_dir / "frame_initial_input.pdb").write_text(initial_pdb_string)
+            initial_pdb_path = str(frame_dir / "frame_0000.pdb")
+            (frame_dir / "frame_0000.pdb").write_text(initial_pdb_string)
             submit_pocket_job(initial_pdb_string, initial_pdb_path, 0, 0.0)
             dynamics_frames.append((0, 0.0, initial_pdb_path, initial_pdb_string))
             
@@ -1315,7 +1315,7 @@ def main() -> None:
         dynamics_topology_pdb = None
         
         # Ensure initial frame is present in frames directory even if dynamics is not run
-        initial_pdb_path = frame_dir / "frame_initial_input.pdb"
+        initial_pdb_path = frame_dir / "frame_0000.pdb"
         if not initial_pdb_path.exists():
             initial_pdb_path.write_text(initial_pdb_string)
             
@@ -1329,7 +1329,7 @@ def main() -> None:
             pdb_str = pdb_path.read_text()
             import re
             m = re.search(r"frame_(\d+)", pdb_path.name)
-            f_idx = int(m.group(1)) if m else (0 if "initial" in pdb_path.name else 0)
+            f_idx = int(m.group(1)) if m else 0
             dynamics_frames.append((f_idx, 0.0, str(pdb_path), pdb_str))
         
         # We still need to run pocket detection if it was passed without dynamics
@@ -1480,10 +1480,7 @@ def main() -> None:
 
         final_top_poses = []
         for i, r in enumerate(top_poses, start=1):
-            if r.frame_index == 0:
-                frame_pdb = str(frame_dir / "frame_initial_input.pdb")
-            else:
-                frame_pdb = str(frame_dir / f"frame_{r.frame_index:04d}.pdb")
+            frame_pdb = str(frame_dir / f"frame_{r.frame_index:04d}.pdb")
 
             if "refinement" not in args.steps:
                 print(f"    Using docked rank {i} (frame {r.frame_index}, pocket {r.pocket_id}) ...")
