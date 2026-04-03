@@ -401,6 +401,10 @@ def run_dynamics(
         f"{production_time_ps:.1f} ps), "
         f"RMSD threshold {rmsd_threshold_angstrom:.1f} Å …")
 
+    # Reset step index so reporter progress is normalized to production only.
+    # Without this, equilibration steps inflate progress beyond 100%.
+    simulation.currentStep = 0
+
     if save_trajectory:
         dcd_path = outdir / "trajectory.dcd"
         simulation.reporters.append(

@@ -49,6 +49,9 @@ class SARScoreResult:
     auc_roc: float
     """AUC-ROC for active vs inactive discrimination (0.5 = random, 1.0 = perfect)."""
 
+    auc_pr: float
+    """AUC-PR for active vs inactive discrimination (average precision)."""
+
     enrichment_1pct: float
     """Enrichment factor at 1% of the ranked compound list."""
 
@@ -60,6 +63,45 @@ class SARScoreResult:
 
     n_actives: int
     n_inactives: int
+
+    active_mean_score: float
+    """Mean of best docking scores for active compounds."""
+
+    inactive_mean_score: float
+    """Mean of best docking scores for inactive compounds."""
+
+    active_std_score: float
+    """Std-dev of best docking scores for active compounds (population std)."""
+
+    inactive_std_score: float
+    """Std-dev of best docking scores for inactive compounds (population std)."""
+
+    active_min_score: float
+    """Minimum of best docking scores for actives."""
+
+    active_max_score: float
+    """Maximum of best docking scores for actives."""
+
+    inactive_min_score: float
+    """Minimum of best docking scores for inactives."""
+
+    inactive_max_score: float
+    """Maximum of best docking scores for inactives."""
+
+    active_best_score: float
+    """Best (extreme) docking score among actives, consistent with `score_key` direction."""
+
+    inactive_best_score: float
+    """Best (extreme) docking score among inactives, consistent with `score_key` direction."""
+
+    overall_min_score: float
+    """Minimum of best docking scores across both actives and inactives."""
+
+    overall_max_score: float
+    """Maximum of best docking scores across both actives and inactives."""
+
+    mean_rank_active_minus_inactive: float
+    """Mean(score) difference after mapping to a 'higher is better' rank direction."""
 
     active_best_scores: list[float]
     """Best docking score per active compound (most negative = best binding)."""
@@ -135,36 +177,68 @@ def compute_sar_discrimination(
         else:
             inactive_scores.append(score)
 
-    if len(active_scores) < 2 or len(inactive_scores) < 1:
-        warnings.warn(
-            f"Frame {frame_index} pocket {pocket_result.pocket_id}: "
-            f"insufficient docked compounds for AUC computation "
-            f"({len(active_scores)} actives, {len(inactive_scores)} inactives). "
-            "AUC set to 0.5.",
-            stacklevel=2,
-        )
-        return SARScoreResult(
-            frame_index=frame_index,
-            pocket_id=pocket_result.pocket_id,
-            auc_roc=0.5,
-            enrichment_1pct=0.0,
-            enrichment_5pct=0.0,
-            enrichment_10pct=0.0,
-            n_actives=len(active_scores),
-            n_inactives=len(inactive_scores),
-            active_best_scores=active_scores,
-            inactive_best_scores=inactive_scores,
-            score_key=score_key,
-            undocked_actives=undocked_actives,
-            undocked_inactives=undocked_inactives,
-        )
-
     all_scores = np.array(active_scores + inactive_scores, dtype=np.float64)
     labels = np.array(
         [1] * len(active_scores) + [0] * len(inactive_scores), dtype=int
     )
 
+    n_actives = len(active_scores)
+    n_inactives = len(inactive_scores)
+    if n_actives < 1 or n_inactives < 1:
+        warnings.warn(
+            f"Frame {frame_index} pocket {pocket_result.pocket_id}: "
+            f"insufficient docked compounds for discrimination metrics "
+            f"({n_actives} actives, {n_inactives} inactives).",
+            stacklevel=2,
+        )
+
+    active_arr = np.array(active_scores, dtype=np.float64)
+    inactive_arr = np.array(inactive_scores, dtype=np.float64)
+
+    # Map scores so that "higher is better" always holds for rank-space metrics.
+    if higher_is_better_score:
+        active_rank = active_arr
+        inactive_rank = inactive_arr
+    else:
+        active_rank = -active_arr
+        inactive_rank = -inactive_arr
+
+    # Stats (safe defaults for empty lists).
+    def _safe_mean(x: np.ndarray) -> float:
+        return float(x.mean()) if x.size else 0.0
+
+    def _safe_std(x: np.ndarray) -> float:
+        return float(x.std(ddof=0)) if x.size else 0.0
+
+    def _safe_min(x: np.ndarray) -> float:
+        return float(x.min()) if x.size else 0.0
+
+    def _safe_max(x: np.ndarray) -> float:
+        return float(x.max()) if x.size else 0.0
+
+    active_mean = _safe_mean(active_arr)
+    inactive_mean = _safe_mean(inactive_arr)
+    active_std = _safe_std(active_arr)
+    inactive_std = _safe_std(inactive_arr)
+    active_min = _safe_min(active_arr)
+    active_max = _safe_max(active_arr)
+    inactive_min = _safe_min(inactive_arr)
+    inactive_max = _safe_max(inactive_arr)
+
+    if higher_is_better_score:
+        active_best = active_max
+        inactive_best = inactive_max
+    else:
+        active_best = active_min
+        inactive_best = inactive_min
+
+    overall_min = _safe_min(all_scores)
+    overall_max = _safe_max(all_scores)
+
+    mean_rank_active_minus_inactive = _safe_mean(active_rank) - _safe_mean(inactive_rank)
+
     auc = _roc_auc(all_scores, labels, higher_is_better=higher_is_better_score)
+    auc_pr = _auprc_average_precision(all_scores, labels, higher_is_better=higher_is_better_score)
     ef1 = _enrichment_factor(all_scores, labels, fraction=0.01, higher_is_better=higher_is_better_score)
     ef5 = _enrichment_factor(all_scores, labels, fraction=0.05, higher_is_better=higher_is_better_score)
     ef10 = _enrichment_factor(all_scores, labels, fraction=0.10, higher_is_better=higher_is_better_score)
@@ -173,11 +247,25 @@ def compute_sar_discrimination(
         frame_index=frame_index,
         pocket_id=pocket_result.pocket_id,
         auc_roc=auc,
+        auc_pr=auc_pr,
         enrichment_1pct=ef1,
         enrichment_5pct=ef5,
         enrichment_10pct=ef10,
-        n_actives=len(active_scores),
-        n_inactives=len(inactive_scores),
+        n_actives=n_actives,
+        n_inactives=n_inactives,
+        active_mean_score=active_mean,
+        inactive_mean_score=inactive_mean,
+        active_std_score=active_std,
+        inactive_std_score=inactive_std,
+        active_min_score=active_min,
+        active_max_score=active_max,
+        inactive_min_score=inactive_min,
+        inactive_max_score=inactive_max,
+        active_best_score=active_best,
+        inactive_best_score=inactive_best,
+        overall_min_score=overall_min,
+        overall_max_score=overall_max,
+        mean_rank_active_minus_inactive=mean_rank_active_minus_inactive,
         active_best_scores=active_scores,
         inactive_best_scores=inactive_scores,
         score_key=score_key,
@@ -232,7 +320,12 @@ def _roc_auc(
     # Prepend (0, 0)
     tpr = np.concatenate([[0.0], tpr])
     fpr = np.concatenate([[0.0], fpr])
-    auc = float(np.trapz(tpr, fpr))
+    # NumPy 2.0 removed `np.trapz` in favor of `np.trapezoid`.
+    # Keep compatibility across NumPy versions.
+    if hasattr(np, "trapezoid"):
+        auc = float(np.trapezoid(tpr, fpr))
+    else:  # pragma: no cover
+        auc = float(np.trapz(tpr, fpr))
     return auc
 
 
@@ -266,6 +359,40 @@ def _enrichment_factor(
     hits_found = top_labels.sum()
     hits_expected = fraction * n_actives_total
     return float(hits_found / hits_expected) if hits_expected > 0 else 0.0
+
+
+def _auprc_average_precision(
+    scores: npt.NDArray[np.float64],
+    labels: npt.NDArray[np.int_],
+    *,
+    higher_is_better: bool = False,
+) -> float:
+    """Compute AUC-PR as *average precision* (AP) without sklearn.
+
+    Uses the standard AP definition for ranked binary labels:
+      AP = mean(precision_at_each_positive_position)
+    """
+    n = len(scores)
+    if n == 0:
+        return 0.0
+
+    n_pos = int(labels.sum())
+    if n_pos == 0:
+        return 0.0
+
+    sort_idx = np.argsort(scores)
+    if higher_is_better:
+        sort_idx = sort_idx[::-1]
+    sorted_labels = labels[sort_idx]
+
+    tp = np.cumsum(sorted_labels)
+    fp = np.cumsum(1 - sorted_labels)
+    precision = tp / (tp + fp)
+
+    pos_idx = np.where(sorted_labels == 1)[0]
+    # Recall increases by 1/n_pos at each positive, so AP is just the mean precision
+    # at positive indices.
+    return float(precision[pos_idx].mean()) if pos_idx.size else 0.0
 
 
 def _best_score(

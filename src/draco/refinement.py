@@ -27,6 +27,7 @@ import numpy as np
 import numpy.typing as npt
 
 from rdkit import Chem
+from rdkit.Chem import AllChem
 
 _log = logging.getLogger(__name__)
 
@@ -306,6 +307,74 @@ def _refine_impl(
 # SDF → OpenMM helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _ensure_explicit_hydrogens(mol: Chem.Mol) -> Chem.Mol:
+    """Return a copy of *mol* with explicit H atoms and 3D coordinates.
+
+    GNINA docked SDF files typically contain only heavy atoms.  OpenFF's
+    SMIRNOFFTemplateGenerator requires the OpenMM residue topology to match the
+    registered molecule atom-for-atom (including Hs), so we must add Hs before
+    building the topology.
+
+    Strategy
+    --------
+    1. If *mol* already has any explicit H atoms, return it unchanged.
+    2. Otherwise add Hs and embed using ETKDGv3 with a coordMap that pins the
+       heavy-atom positions, allowing only the new H atoms to be placed.
+    3. Fall back to ``Chem.AddHs(addCoords=True)`` (simple geometric placement)
+       if the constrained embed fails.
+    """
+    if any(a.GetAtomicNum() == 1 for a in mol.GetAtoms()):
+        return mol
+
+    mol_h = Chem.AddHs(mol)
+
+    if mol.GetNumConformers() > 0:
+        try:
+            from rdkit.Geometry import rdGeometry
+            conf = mol.GetConformer(0)
+            coord_map = {
+                i: rdGeometry.Point3D(
+                    conf.GetAtomPosition(i).x,
+                    conf.GetAtomPosition(i).y,
+                    conf.GetAtomPosition(i).z,
+                )
+                for i in range(mol.GetNumAtoms())
+            }
+            ps = AllChem.ETKDGv3()
+            ps.coordMap = coord_map
+            ps.randomSeed = 42
+            if AllChem.EmbedMolecule(mol_h, ps) != -1:
+                return mol_h
+        except Exception:
+            pass
+
+    # Geometric fallback: places Hs at idealized bond angles without moving
+    # heavy atoms.
+    return Chem.AddHs(mol, addCoords=True)
+
+
+def _assign_partial_charges_with_fallback(off_mol) -> None:
+    """Assign partial charges in-place on an ``openff.toolkit.Molecule``.
+
+    Tries charge methods in order of quality/accuracy:
+    1. ``am1bcc``   – semi-empirical, best for drug-like molecules (requires
+                      ambertools or an OpenFF-native AM1-BCC implementation)
+    2. ``gasteiger`` – empirical, fast, works for virtually any organic molecule
+
+    Silently returns without assigning charges only if every method fails
+    (the SMIRNOFF generator will then attempt its own charge assignment at
+    ``createSystem()`` time, which may still succeed or raise a descriptive
+    error).
+    """
+    for method in ("am1bcc", "gasteiger"):
+        try:
+            off_mol.assign_partial_charges(method)
+            _log.debug("Assigned partial charges using %r.", method)
+            return
+        except Exception as exc:
+            _log.debug("Charge method %r failed: %s", method, exc)
+
+
 def _sdf_block_to_openmm_native(
     sdf_block: str,
     *,
@@ -336,6 +405,14 @@ def _sdf_block_to_openmm_native(
     if mol is None:
         raise ValueError("RDKit could not parse the GNINA docked pose SDF block")
 
+    # GNINA sometimes writes only polar Hs (e.g. the secondary-amine NH) rather
+    # than all Hs. _ensure_explicit_hydrogens short-circuits if it sees *any*
+    # H atom, so strip whatever partial Hs GNINA wrote and rebuild the full set.
+    # SMIRNOFFTemplateGenerator matches the OpenMM residue topology atom-for-atom
+    # against the registered OpenFF molecule, so the topology must have the
+    # complete H count.
+    mol = _ensure_explicit_hydrogens(Chem.RemoveHs(mol))
+
     top = Topology()
     chain = top.addChain(id=chain_id)
     res = top.addResidue(residue_name, chain, id=str(residue_id))
@@ -359,8 +436,11 @@ def _sdf_block_to_openmm_native(
     for bond in mol.GetBonds():
         a1 = atoms[bond.GetBeginAtomIdx()]
         a2 = atoms[bond.GetEndAtomIdx()]
-        # OpenMM Topology just stores connectivity without order
-        top.addBond(a1, a2)
+        # Pass bond order so SMIRNOFFTemplateGenerator can reconstruct the
+        # correct SMILES when matching the residue topology to the molecule.
+        # Without this, all bonds default to single-bond and the SMILES lookup
+        # fails, producing "Did not recognize residue LIG".
+        top.addBond(a1, a2, order=bond.GetBondTypeAsDouble())
         
     return mol, top, positions * unit.angstrom
 
@@ -370,9 +450,21 @@ def _register_ligand_template_from_mol(
     mol: Chem.Mol,
     openff_forcefield: str,
 ) -> None:
-    """Register OpenFF/GAFF ligand parameters from an RDKit Mol."""
-    # Deduplicate by SMILES to avoid re-parametrizing the same compound
-    smiles = Chem.MolToSmiles(Chem.RemoveHs(mol))
+    """Register OpenFF/GAFF ligand parameters from an RDKit Mol.
+
+    Why ``Molecule.from_smiles`` instead of ``Molecule.from_rdkit``
+    ---------------------------------------------------------------
+    GNINA docked SDF blocks are often tagged as ``2D`` in their mol-file header
+    even though the docked coordinates are 3D.  ``openff.toolkit`` warns about
+    this and may produce a subtly malformed ``Molecule`` object (wrong
+    conformer or incorrect bond perception).  Using the canonical heavy-atom
+    SMILES side-steps the issue completely: the SMILES carries only topology
+    (atoms + bonds), which is all that ``SMIRNOFFTemplateGenerator._match_residue``
+    needs.  That method uses a NetworkX graph-isomorphism check on element and
+    connectivity only — no bond orders, no coordinates, no stereochemistry.
+    """
+    # Canonical heavy-atom SMILES for deduplication and molecule construction.
+    smiles = Chem.MolToSmiles(Chem.RemoveHs(mol), canonical=True)
     cache_key = f"{openff_forcefield}::{smiles}"
 
     if cache_key in _TEMPLATE_GENERATOR_CACHE:
@@ -385,7 +477,19 @@ def _register_ligand_template_from_mol(
         from openff.toolkit.topology import Molecule
         from openmmforcefields.generators import SMIRNOFFTemplateGenerator
 
-        off_mol = Molecule.from_rdkit(mol, allow_undefined_stereo=True)
+        # Build from SMILES to avoid 2D-tag artefacts from GNINA SDF blocks.
+        # allow_undefined_stereo=True suppresses errors for molecules where
+        # stereochemistry cannot be fully inferred from the docked pose.
+        off_mol = Molecule.from_smiles(smiles, allow_undefined_stereo=True)
+
+        # Pre-assign partial charges so createSystem() does not try to run
+        # AM1-BCC lazily (AM1-BCC requires ambertools/OpenEye and can fail for
+        # halogenated or otherwise complex molecules).  Gasteiger charges are
+        # fast and work for any organic molecule; they are accurate enough for
+        # the gentle local minimisation performed here.
+        if off_mol.partial_charges is None:
+            _assign_partial_charges_with_fallback(off_mol)
+
         generator = SMIRNOFFTemplateGenerator(
             molecules=[off_mol],
             forcefield=openff_forcefield,
@@ -400,7 +504,10 @@ def _register_ligand_template_from_mol(
         from openff.toolkit.topology import Molecule
         from openmmforcefields.generators import GAFFTemplateGenerator
 
-        off_mol = Molecule.from_rdkit(mol, allow_undefined_stereo=True)
+        off_mol = Molecule.from_smiles(smiles, allow_undefined_stereo=True)
+        if off_mol.partial_charges is None:
+            _assign_partial_charges_with_fallback(off_mol)
+
         generator = GAFFTemplateGenerator(molecules=[off_mol], forcefield="gaff-2.11")
         _TEMPLATE_GENERATOR_CACHE[f"gaff-2.11::{smiles}"] = generator
         forcefield.registerTemplateGenerator(generator.generator)

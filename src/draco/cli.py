@@ -67,6 +67,73 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["OPENMM_CPU_THREADS"] = "1"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Resource detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _detect_gpus() -> tuple[int, list[int], str]:
+    """Detect the number and IDs of available CUDA GPUs.
+
+    Returns
+    -------
+    (num_gpus, gpu_ids, source)
+        ``num_gpus``  – integer count of visible CUDA GPUs (0 if none).
+        ``gpu_ids``   – list of integer GPU indices (e.g. [0, 1]).
+        ``source``    – human-readable string naming the detection method.
+    """
+    import subprocess
+
+    # 1. Prefer Slurm's explicit allocation: SLURM_GPUS_ON_NODE=2
+    slurm_gpus_on_node = os.environ.get("SLURM_GPUS_ON_NODE", "").strip()
+    if slurm_gpus_on_node.isdigit() and int(slurm_gpus_on_node) > 0:
+        n = int(slurm_gpus_on_node)
+        return n, list(range(n)), "SLURM_GPUS_ON_NODE"
+
+    # 2. SLURM_JOB_GPUS / SLURM_GPUS: can be comma-separated GPU IDs like "0,1"
+    for env_var in ("SLURM_JOB_GPUS", "SLURM_GPUS", "SLURM_STEP_GPUS"):
+        val = os.environ.get(env_var, "").strip()
+        if val:
+            ids = [int(x) for x in val.split(",") if x.strip().isdigit()]
+            if ids:
+                return len(ids), ids, env_var
+
+    # 3. CUDA_VISIBLE_DEVICES: e.g. "0,1" or "NoDevFiles" (none)
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if cvd and cvd.upper() not in ("", "NODEVFILES", "-1"):
+        ids = [int(x) for x in cvd.split(",") if x.strip().isdigit()]
+        if ids:
+            return len(ids), ids, "CUDA_VISIBLE_DEVICES"
+
+    # 4. nvidia-smi subprocess fallback
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            ids = [int(line.strip()) for line in result.stdout.splitlines() if line.strip().isdigit()]
+            if ids:
+                return len(ids), ids, "nvidia-smi"
+    except Exception:
+        pass
+
+    # 5. No GPUs found
+    return 0, [], "none"
+
+
+def _detect_cpus() -> tuple[int, str]:
+    """Detect the number of CPUs allocated to this job/process.
+
+    Returns
+    -------
+    (num_cpus, source)
+    """
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK", "").strip()
+    if slurm_cpus.isdigit() and int(slurm_cpus) > 0:
+        return int(slurm_cpus), "SLURM_CPUS_PER_TASK"
+    return int(os.cpu_count() or 1), "os.cpu_count()"
+
 import argparse
 import concurrent.futures
 import csv
@@ -111,6 +178,27 @@ warnings.filterwarnings(
     category=FutureWarning,
     message=r".*torch\.distributed\.reduce_op.*",
 )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Progress / timing helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ts() -> str:
+    """Return current wall-clock time as a compact string: HH:MM:SS."""
+    return time.strftime("%H:%M:%S")
+
+
+def _elapsed(start: float) -> str:
+    """Return human-readable elapsed time since *start* (time.monotonic())."""
+    secs = int(time.monotonic() - start)
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,9 +286,28 @@ def parse_args() -> argparse.Namespace:
     docking_grp.add_argument("--cnn-scoring", default="rescore", choices=["rescore", "refinement", "none"], help="GNINA CNN scoring mode.")
     docking_grp.add_argument("--gnina-seed", type=int, default=0, help="Random seed for GNINA.")
     docking_grp.add_argument("--gnina-timeout-seconds", type=int, default=None, metavar="N", help="Wall-clock limit per GNINA subprocess (seconds).")
+    docking_grp.add_argument(
+        "--dock-filter",
+        nargs="+",
+        metavar="SPEC",
+        default=None,
+        help=(
+            "Restrict docking to specific frame:pocket pairs. "
+            "Each SPEC is FRAME_IDX:POCKET_ID; multiple pairs can be comma- or space-separated. "
+            "Omit the pocket (just FRAME_IDX) to dock all pockets for that frame. "
+            "Examples: '1:2 3:0 4:0' or '1:2, 3:0, 4:0' (frame 1 pocket 2, frame 3 pocket 0, etc.). "
+            "If omitted entirely, all frames and pockets are docked."
+        ),
+    )
     docking_grp.add_argument("--scoring-method", default="cnn_vs", choices=["cnn_vs", "cnn_affinity", "cnn_score", "vina_score"], help="Which GNINA metric to use for ranking poses and computing SAR.")
-    docking_grp.add_argument("--sar-metric", default="auc_roc", choices=["auc_roc", "enrichment_1pct", "enrichment_5pct", "enrichment_10pct"], help="Metric to rank poses by in 'sar' mode. Defaults to auc_roc.")
+    docking_grp.add_argument(
+        "--sar-metric",
+        default="auc_roc",
+        choices=["auc_roc", "auc_pr", "enrichment_1pct", "enrichment_5pct", "enrichment_10pct"],
+        help="Metric to rank poses by in 'sar' mode. Defaults to auc_roc.",
+    )
     docking_grp.add_argument("--max-docking-workers", type=int, default=None, help="Maximum concurrent GNINA instances. Defaults to min(4, CPU_COUNT//4).")
+    docking_grp.add_argument("--gnina-cpu", type=int, default=None, metavar="N", help="CPU threads per GNINA call for Vina sampling. Auto-computed as CPU_COUNT // docking_workers when omitted (recommended).")
 
     # ── Refinement Parameters ───────────────────────────────────────────────────
     refine_grp = parser.add_argument_group("Refinement Parameters")
@@ -266,7 +373,7 @@ class _TopKHeap:
 
     def _rank_score(self, result: _FramePoseResult) -> float:
         # If in SAR mode, the ranking metric is a SAR metric (e.g. auc_roc)
-        if self.ranking_metric in ("auc_roc", "enrichment_1pct", "enrichment_5pct", "enrichment_10pct"):
+        if self.ranking_metric in ("auc_roc", "auc_pr", "enrichment_1pct", "enrichment_5pct", "enrichment_10pct"):
             sar_val = getattr(result, self.ranking_metric, None)
             # If SAR metric is missing, fall back to cnn_vs
             return sar_val if sar_val is not None else result.cnn_vs
@@ -312,9 +419,58 @@ class _TopKHeap:
 # Parallel Worker Logic
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _worker_init() -> None:
-    """Initializer for ProcessPoolExecutor workers."""
+def _parse_dock_filter(tokens: list[str]) -> dict[int, set[int] | None]:
+    """Parse ``--dock-filter`` tokens into ``{frame_idx: pocket_set | None}``.
+
+    ``None`` as the value means "all pockets for this frame".
+
+    Tokens are comma- and/or space-separated ``FRAME:POCKET`` pairs.
+    A bare ``FRAME`` (no colon) means all pockets for that frame.
+    Specifying the same frame multiple times merges the pocket sets.
+
+    Examples::
+
+        ["1:2"]              → {1: {2}}
+        ["1:2", "3:0", "4:0"] → {1: {2}, 3: {0}, 4: {0}}
+        ["1:2, 3:0, 4:0"]   → {1: {2}, 3: {0}, 4: {0}}   # comma-separated in one string
+        ["1:2,3:0"]         → {1: {2}, 3: {0}}             # no spaces needed
+        ["1:2", "1:3"]      → {1: {2, 3}}                  # same frame, merged
+        ["1"]               → {1: None}                     # frame 1, all pockets
+    """
+    result: dict[int, set[int] | None] = {}
+    # Normalize: join all tokens, split on whitespace and commas
+    raw = " ".join(tokens)
+    items = [s.strip() for s in raw.replace(",", " ").split() if s.strip()]
+    for item in items:
+        if ":" in item:
+            frame_str, pocket_str = item.split(":", 1)
+            frame_idx = int(frame_str.strip())
+            pocket_id = int(pocket_str.strip())
+            if frame_idx in result and result[frame_idx] is None:
+                pass  # already "all pockets" — don't narrow it back down
+            elif frame_idx in result:
+                result[frame_idx].add(pocket_id)  # type: ignore[union-attr]
+            else:
+                result[frame_idx] = {pocket_id}
+        else:
+            frame_idx = int(item.strip())
+            result[frame_idx] = None  # all pockets for this frame
+    return result
+
+
+def _worker_init(gpu_id: int | None = None) -> None:
+    """Initializer for ProcessPoolExecutor workers.
+
+    Parameters
+    ----------
+    gpu_id:
+        If provided, pin this worker to the specified CUDA device by setting
+        ``CUDA_VISIBLE_DEVICES`` before GNINA is invoked. Set to ``None`` for
+        CPU-only workers (pocket detection, refinement).
+    """
     os.environ["OPENMM_CPU_THREADS"] = "1"
+    if gpu_id is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     try:
         import openmm
         import rdkit
@@ -346,6 +502,9 @@ def _dock_frame_worker(
     gnina_timeout_seconds: int | None = None,
     steps: list[str] | None = None,
     project_output_dir: str | None = None,
+    pocket_filter: set[int] | None = None,
+    gnina_cpu_threads: int = 1,
+    gpu_id: int | None = None,
 ) -> list[_FramePoseResult]:
     """Worker: Detect pockets, dock all ligands with GNINA, compute SAR score.
 
@@ -353,8 +512,16 @@ def _dock_frame_worker(
     aggregated to report the **best score per parent ligand** for SAR
     discrimination and single-compound ranking.
 
-    Returns one _FramePoseResult per (pocket, parent_ligand) pair.
+    If *gpu_id* is provided, the worker sets ``CUDA_VISIBLE_DEVICES`` so that
+    GNINA uses only that specific GPU (useful for multi-GPU nodes).
+
+    Returns one _FramePoseResult per (pocket, parent_ligand) pair in `single` mode.
+    In `sar` mode it returns one result per (frame, pocket) with SAR discrimination
+    metrics (and a representative active ligand used for pose export).
     """
+    if gpu_id is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
     from draco.docking import DockingBox, dock_ligands_to_pocket
     from draco.pocket import (
         docking_box_from_pocket,
@@ -422,6 +589,9 @@ def _dock_frame_worker(
     inactive_state_names = {sn for sn, pn in name_map.items() if pn in set(inactive_names)}
 
     for pocket_id, pocket_score, box in work_items:
+        if pocket_filter is not None and pocket_id not in pocket_filter:
+            continue
+
         # Create per-pocket output dir for GNINA
         if docking_output_dir:
             pocket_out = __import__('pathlib').Path(docking_output_dir) / f"frame{frame_index:04d}_pocket{pocket_id}"
@@ -451,7 +621,7 @@ def _dock_frame_worker(
                     num_modes=num_modes,
                     cnn_scoring=cnn_scoring,
                     seed=gnina_seed,
-                    cpu=1,
+                    cpu=gnina_cpu_threads,
                     timeout_seconds=gnina_timeout_seconds,
                     output_dir=out_dir_str,
                     write_gnina_logs=True,
@@ -499,6 +669,24 @@ def _dock_frame_worker(
             if is_better:
                 parent_best[parent] = (p_val, best_pose.cnn_affinity, best_pose.vina_score, best_pose.cnn_score, best_pose.cnn_vs, best_pose.pose_sdf_block)
 
+        # In SAR mode, also write a ligand-only SDF for this pocket containing the
+        # best pose per parent ligand, sorted by the selected scoring method.
+        if sar_mode and out_dir_str and parent_best:
+            try:
+                # Sort parents by "best pose" scoring_method.
+                # For vina_score: lower is better. For others: higher is better.
+                def _parent_sort_key(item: tuple[str, tuple[float, float, float, float, float, str]]) -> float:
+                    score_val = item[1][0]
+                    return score_val if scoring_method != "vina_score" else -score_val
+
+                ranked = sorted(parent_best.items(), key=_parent_sort_key, reverse=True)
+                ranked_sdf_blocks = [t[-1] for _, t in ranked if (t[-1] or "").strip()]
+                ranked_sdf_path = Path(out_dir_str) / f"ligands_ranked_by_{scoring_method}.sdf"
+                _write_multimol_sdf(ranked_sdf_path, ranked_sdf_blocks)
+            except Exception:
+                # Don't fail docking/scoring just because an optional export failed.
+                pass
+
         if sar_mode:
             # Build a virtual PocketDockResult with best-per-parent scores
             # for SAR discrimination. We create a synthetic results dict
@@ -517,9 +705,25 @@ def _dock_frame_worker(
                 results=parent_results,
             )
             auc_roc = None
+            auc_pr = None
             enrichment_1pct = None
             enrichment_5pct = None
             enrichment_10pct = None
+            n_actives = None
+            n_inactives = None
+            active_mean_score = None
+            inactive_mean_score = None
+            active_std_score = None
+            inactive_std_score = None
+            active_min_score = None
+            active_max_score = None
+            inactive_min_score = None
+            inactive_max_score = None
+            active_best_score = None
+            inactive_best_score = None
+            overall_min_score = None
+            overall_max_score = None
+            mean_rank_active_minus_inactive = None
             if "scoring" in steps:
                 sar = compute_sar_discrimination(
                     frame_index=frame_index,
@@ -529,9 +733,25 @@ def _dock_frame_worker(
                     score_key=scoring_method,
                 )
                 auc_roc = sar.auc_roc
+                auc_pr = sar.auc_pr
                 enrichment_1pct = sar.enrichment_1pct
                 enrichment_5pct = sar.enrichment_5pct
                 enrichment_10pct = sar.enrichment_10pct
+                n_actives = sar.n_actives
+                n_inactives = sar.n_inactives
+                active_mean_score = sar.active_mean_score
+                inactive_mean_score = sar.inactive_mean_score
+                active_std_score = sar.active_std_score
+                inactive_std_score = sar.inactive_std_score
+                active_min_score = sar.active_min_score
+                active_max_score = sar.active_max_score
+                inactive_min_score = sar.inactive_min_score
+                inactive_max_score = sar.inactive_max_score
+                active_best_score = sar.active_best_score
+                inactive_best_score = sar.inactive_best_score
+                overall_min_score = sar.overall_min_score
+                overall_max_score = sar.overall_max_score
+                mean_rank_active_minus_inactive = sar.mean_rank_active_minus_inactive
 
                 # Fetch whichever sar metric the user requested to set correctly for the summary if we need
                 # but currently we only track auc_roc explicitly in _FramePoseResult, so let's set auc_roc to the sar metric
@@ -576,6 +796,22 @@ def _dock_frame_worker(
             # monkey-patch other metrics in case TopKHeap wants them
             if "scoring" in steps:
                 r.auc_roc = auc_roc
+                setattr(r, "auc_pr", auc_pr)
+                setattr(r, "n_actives", n_actives)
+                setattr(r, "n_inactives", n_inactives)
+                setattr(r, "active_mean_score", active_mean_score)
+                setattr(r, "inactive_mean_score", inactive_mean_score)
+                setattr(r, "active_std_score", active_std_score)
+                setattr(r, "inactive_std_score", inactive_std_score)
+                setattr(r, "active_min_score", active_min_score)
+                setattr(r, "active_max_score", active_max_score)
+                setattr(r, "inactive_min_score", inactive_min_score)
+                setattr(r, "inactive_max_score", inactive_max_score)
+                setattr(r, "active_best_score", active_best_score)
+                setattr(r, "inactive_best_score", inactive_best_score)
+                setattr(r, "overall_min_score", overall_min_score)
+                setattr(r, "overall_max_score", overall_max_score)
+                setattr(r, "mean_rank_active_minus_inactive", mean_rank_active_minus_inactive)
                 setattr(r, "enrichment_1pct", enrichment_1pct)
                 setattr(r, "enrichment_5pct", enrichment_5pct)
                 setattr(r, "enrichment_10pct", enrichment_10pct)
@@ -644,22 +880,81 @@ def main() -> None:
     outdir = Path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
 
+    pipeline_start = time.monotonic()
+
+    # ── Resource Detection ───────────────────────────────────────────────────
+    num_gpus, gpu_ids, gpu_source = _detect_gpus()
+    num_cpus, cpu_source = _detect_cpus()
+
     # ── Resource Allocation ──────────────────────────────────────────────────
-    num_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
-    # Dedicate 1 CPU for the main MD thread (which mainly orchestrates the GPU),
-    # and the rest for parallel frame analysis on CPU.
-    num_workers = max(1, num_cpus - 1)
+    # Phase 1: Pocket detection – CPU-only, concurrent with MD.
+    # Reserve 1 CPU for the MD orchestrator process.
+    num_pocket_workers = max(1, num_cpus - 1)
+
+    # Phase 2: Docking – GNINA is the throughput bottleneck.
+    # GNINA has two sequential phases per ligand:
+    #   1. Vina sampling  (CPU)  – scales with --cpu threads, up to --exhaustiveness
+    #   2. CNN scoring    (GPU)  – brief GPU burst (rescore mode)
+    #
+    # Optimal strategy: 2 workers per GPU so that one worker can Vina-sample on
+    # CPU while the other CNN-scores on GPU — overlapping CPU and GPU work.
+    # Each worker gets num_cpus / num_workers CPU threads for Vina sampling,
+    # which is far more productive than 1 thread per worker.
+    #
+    # Derivation:
+    #   workers_per_gpu = 2   (pipeline overlap; more adds diminishing returns)
+    #   max_docking_workers   = max(1, num_gpus) * workers_per_gpu
+    #   gnina_cpu_threads     = max(1, num_cpus // max_docking_workers)
+    #
+    # --max-docking-workers and --gnina-cpu CLI overrides take full precedence.
+    _eff_gpus = max(1, num_gpus)           # treat 0-GPU nodes as "1 slot"
+    _default_workers = _eff_gpus * 2       # 2 workers pipelined per GPU
+    max_docking_workers = (
+        args.max_docking_workers
+        if args.max_docking_workers is not None
+        else _default_workers
+    )
+    gnina_cpu_threads = (
+        args.gnina_cpu
+        if args.gnina_cpu is not None
+        else max(1, num_cpus // max_docking_workers)
+    )
+
+    # Build the GPU assignment list for docking workers (round-robin).
+    # If no GPUs, gpu_assignment is all None → workers run GNINA without a
+    # CUDA_VISIBLE_DEVICES override (GNINA will try to use GPU 0 if present,
+    # or fall back to CPU).
+    if num_gpus > 0:
+        gpu_assignment = [gpu_ids[i % num_gpus] for i in range(max_docking_workers)]
+    else:
+        gpu_assignment = [None] * max_docking_workers
+
+    # GPU 0 is used for MD (OpenMM CUDA). If multi-GPU and docking workers are
+    # being distributed, note this so users are aware MD and some docking share GPU 0.
+    md_gpu_desc = f"GPU {gpu_ids[0]} (CUDA)" if num_gpus > 0 else f"{args.platform_name} (no GPU detected)"
 
     print("\n" + "═" * 70)
-    print("CONCURRENT RESOURCE ALLOCATION")
-    print(f"  Available CPUs (Slurm/OS): {num_cpus}")
-    print(f"  Main MD process:           Dedicating 1 CPU thread + 1 {args.platform_name} device")
-    print(f"  Analysis Workers:          Dedicating {num_workers} processes (1 thread each)")
+    print("RESOURCE DETECTION")
+    print(f"  GPUs detected : {num_gpus}  (via {gpu_source})"
+          + (f"  →  IDs: {gpu_ids}" if gpu_ids else ""))
+    print(f"  CPUs detected : {num_cpus}  (via {cpu_source})")
+    print()
+    print("RESOURCE ALLOCATION")
+    print(f"  Dynamics (MD)      : 1 process · {md_gpu_desc}")
+    print(f"  Pocket detection   : {num_pocket_workers} CPU workers (concurrent with MD)")
+    print(f"  Docking (GNINA)    : {max_docking_workers} workers · {gnina_cpu_threads} thread(s) each"
+          + (f"  ·  GPUs: {sorted(set(g for g in gpu_assignment if g is not None))}"
+             if num_gpus > 0 else "  ·  CPU-only"))
+    if num_gpus > 1:
+        from collections import Counter
+        gpu_counts = Counter(g for g in gpu_assignment if g is not None)
+        print(f"    GPU round-robin  : "
+              + "  ".join(f"GPU {g} → {n} workers" for g, n in sorted(gpu_counts.items())))
     print("═" * 70)
 
     # ── [1/4] Explicit-solvent MD ────────────────────────────────────────────
     print("\n" + "═" * 70)
-    print("[1/4]  Explicit-solvent MD  (dynamics engine)")
+    print(f"[1/4]  Explicit-solvent MD  (dynamics engine)  [{_ts()}]")
     print("═" * 70)
 
     # Shared state for analysis
@@ -667,10 +962,16 @@ def main() -> None:
     ranking_metric = args.sar_metric if args.mode == "sar" else args.scoring_method
     top_heap = _TopKHeap(k=args.top_k, ranking_metric=ranking_metric)
     all_rows: list[dict[str, Any]] = []
+    summary_fieldnames = _FIELDNAMES_SAR if args.mode == "sar" else _FIELDNAMES_SINGLE
+
+    # Progress counters for docking (updated inside on_dock_done under results_lock)
+    _dock_progress: dict[str, int] = {"frames_done": 0, "poses_ok": 0, "poses_err": 0}
+    _dock_total_frames: list[int] = [0]   # set just before Phase 2 loop
+    _dock_phase_start: list[float] = [0.0]
     
     summary_csv_path = outdir / "summary.csv"
     csv_fh = summary_csv_path.open("w", newline="")
-    csv_writer = csv.DictWriter(csv_fh, fieldnames=_FIELDNAMES)
+    csv_writer = csv.DictWriter(csv_fh, fieldnames=summary_fieldnames)
     csv_writer.writeheader()
     csv_fh.flush()
 
@@ -750,11 +1051,12 @@ def main() -> None:
         for sn in active_state_names + inactive_state_names:
             ligand_sdf_paths[sn] = str((ligands_dir / f"{sn}.sdf").resolve())
         print(
-            f"\n[2/4]  Preparing ligands … (cache hit)  "
+            f"\n[2/4]  Preparing ligands …  [{_ts()}]  (cache hit)  "
             f"{len(ligand_sdf_paths)} SDFs reused from {ligands_dir}/"
         )
     else:
-        print(f"\n[2/4]  Preparing ligands …")
+        _ligand_prep_start = time.monotonic()
+        print(f"\n[2/4]  Preparing ligands …  [{_ts()}]")
 
         if args.ligand_csv:
             actives, inactives, name_map = load_compound_csv(
@@ -789,7 +1091,8 @@ def main() -> None:
 
         # Write SDF files once; pass absolute paths to workers
         ligand_sdf_paths = write_ligands_for_docking(all_compounds, ligands_dir)
-        print(f"  Written {len(ligand_sdf_paths)} SDF files to {ligands_dir}/")
+        print(f"  Written {len(ligand_sdf_paths)} SDF files to {ligands_dir}/  (elapsed {_elapsed(_ligand_prep_start)})")
+        sys.stdout.flush()
 
         # Write cache manifest so subsequent runs can skip ligand preparation.
         manifest: dict[str, Any] = {
@@ -807,16 +1110,16 @@ def main() -> None:
         ligand_manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     # Prepare initial protein structure
-    print("  Preparing initial protein (PDBFixer + H) …")
+    _prot_prep_start = time.monotonic()
+    print(f"  Preparing initial protein (PDBFixer + H) …  [{_ts()}]")
     initial_prepared = prepare_protein(args.protein_pdb, ph=args.ph, output_dir=str(outdir))
+    print(f"  Protein ready  (elapsed {_elapsed(_prot_prep_start)})", flush=True)
     _initial_buf = io.StringIO()
     PDBFile.writeFile(initial_prepared.topology, initial_prepared.positions, _initial_buf)
     initial_pdb_string = _initial_buf.getvalue()
 
-    max_docking_workers = args.max_docking_workers if args.max_docking_workers is not None else max(1, min(4, num_cpus // 4))
-
     print("\n" + "═" * 70)
-    print(f"[3/4]  Execution Pipeline")
+    print(f"[3/4]  Execution Pipeline  [{_ts()}]")
     print("═" * 70)
 
     rolling_best_energy: list[float | None] = [None]
@@ -825,14 +1128,27 @@ def main() -> None:
         try:
             frame_results = future.result()
             if not frame_results:
+                # Still count the frame as done so the progress line updates
+                with results_lock:
+                    _dock_progress["frames_done"] += 1
+                    _print_dock_progress(_dock_progress, _dock_total_frames[0], _dock_phase_start[0])
                 return
             for r in frame_results:
                 with results_lock:
                     if r.status in ("ok", "refined"):
+                        _dock_progress["poses_ok"] += 1
                         heap_updated = top_heap.push(r)
-                        row = _to_row(r)
-                        score_str = f"AUC={r.auc_roc:.3f}" if r.auc_roc is not None else f"CNN={r.cnn_affinity:.2f}"
-                        print(f"  [pipeline] OK  frame={r.frame_index}  t={r.frame_time_ps:.3f} ps  pocket={r.pocket_id}  {score_str}")
+                        row = _to_row_sar(r) if args.mode == "sar" else _to_row_single(r)
+                        if args.mode == "sar":
+                            metric_val = getattr(r, ranking_metric, None)
+                            score_str = f"{ranking_metric}={metric_val:.3f}" if metric_val is not None else "sar=NA"
+                        else:
+                            score_str = (
+                                f"CNN={r.cnn_affinity:.2f}"
+                                if r.cnn_affinity is not None
+                                else "cnn=NA"
+                            )
+                        print(f"  [dock] frame={r.frame_index}  pocket={r.pocket_id}  {score_str}")
                         best = top_heap.current_best()
                         if best is not None and args.top_k > 0:
                             prev = rolling_best_energy[0]
@@ -840,19 +1156,87 @@ def main() -> None:
                             if prev is None or rank_score > prev:
                                 rolling_best_energy[0] = rank_score
                                 best_str = f"{ranking_metric}={rank_score:.3f}"
-                                print(f"  [top-{args.top_k}] new best rank-1: {best_str} | frame={best.frame_index} pocket={best.pocket_id} ligand={best.ligand_name}")
+                                print(f"  [top-{args.top_k}] NEW BEST {best_str} | frame={best.frame_index} pocket={best.pocket_id} ligand={best.ligand_name}")
                         if heap_updated and args.top_k > 0:
-                            _write_multimodel_pdb(outdir / args.top_output, top_heap.sorted_best())
+                            top_now = top_heap.sorted_best()
+                            # In SAR mode, export pose models sorted by CNN_VS (more intuitive for pose inspection),
+                            # even if the *selection* criterion is a SAR metric like AUC/enrichment.
+                            if args.mode == "sar":
+                                top_now = sorted(top_now, key=lambda rr: rr.cnn_vs, reverse=True)
+                            _write_multimodel_pdb(outdir / args.top_output, top_now)
                     else:
-                        print(f"     Frame {r.frame_index} pocket {r.pocket_id} FAILED: {r.error[:120]}")
-                        row = {"status": "error", "frame_index": r.frame_index, "frame_time_ps": f"{r.frame_time_ps:.3f}", "pocket_id": r.pocket_id, "pocket_score": "", "ligand_name": r.ligand_name, "cnn_affinity": "", "vina_score": "", "auc_roc": "", "initial_energy_kj_per_mol": "", "final_energy_kj_per_mol": "", "interaction_energy_kj_per_mol": "", "ligand_rmsd_from_dock_angstrom": "", "protein_atoms_flexible": "", "protein_atoms_restrained": "", "error": r.error}
+                        _dock_progress["poses_err"] += 1
+                        print(f"  [dock] FAILED frame={r.frame_index} pocket={r.pocket_id}: {r.error[:120]}")
+                        if args.mode == "sar":
+                            row = {
+                                "status": "error",
+                                "frame_index": r.frame_index,
+                                "frame_time_ps": f"{r.frame_time_ps:.3f}",
+                                "pocket_id": r.pocket_id,
+                                "pocket_score": "",
+                                "best_active_ligand_name": r.ligand_name,
+                                "auc_roc": "",
+                                "auc_pr": "",
+                                "n_actives": "",
+                                "n_inactives": "",
+                                "active_mean_score": "",
+                                "inactive_mean_score": "",
+                                "active_std_score": "",
+                                "inactive_std_score": "",
+                                "active_min_score": "",
+                                "active_max_score": "",
+                                "inactive_min_score": "",
+                                "inactive_max_score": "",
+                                "active_best_score": "",
+                                "inactive_best_score": "",
+                                "overall_min_score": "",
+                                "overall_max_score": "",
+                                "mean_rank_active_minus_inactive": "",
+                                "enrichment_1pct": "",
+                                "enrichment_5pct": "",
+                                "enrichment_10pct": "",
+                                "initial_energy_kj_per_mol": "",
+                                "final_energy_kj_per_mol": "",
+                                "interaction_energy_kj_per_mol": "",
+                                "ligand_rmsd_from_dock_angstrom": "",
+                                "protein_atoms_flexible": "",
+                                "protein_atoms_restrained": "",
+                                "error": r.error,
+                            }
+                        else:
+                            row = {
+                                "status": "error",
+                                "frame_index": r.frame_index,
+                                "frame_time_ps": f"{r.frame_time_ps:.3f}",
+                                "pocket_id": r.pocket_id,
+                                "pocket_score": "",
+                                "ligand_name": r.ligand_name,
+                                "cnn_affinity": "",
+                                "vina_score": "",
+                                "auc_roc": "",
+                                "initial_energy_kj_per_mol": "",
+                                "final_energy_kj_per_mol": "",
+                                "interaction_energy_kj_per_mol": "",
+                                "ligand_rmsd_from_dock_angstrom": "",
+                                "protein_atoms_flexible": "",
+                                "protein_atoms_restrained": "",
+                                "error": r.error,
+                            }
                     all_rows.append(row)
                     csv_writer.writerow(row)
                     csv_fh.flush()
-                    sys.stdout.flush()
+                # One progress line per frame (not per pocket) — update after last result of this future batch
+            with results_lock:
+                _dock_progress["frames_done"] += 1
+                _print_dock_progress(_dock_progress, _dock_total_frames[0], _dock_phase_start[0])
+            sys.stdout.flush()
         except Exception as exc:
             import traceback
             print(f"  [ERROR] dock worker crashed: {exc}\n{traceback.format_exc()}")
+            with results_lock:
+                _dock_progress["frames_done"] += 1
+                _print_dock_progress(_dock_progress, _dock_total_frames[0], _dock_phase_start[0])
+            sys.stdout.flush()
             
     # PHASE 1: MD + CPU Pocketeer Streaming
     frame_dir = outdir / "frames"
@@ -860,9 +1244,11 @@ def main() -> None:
     dynamics_frames = []
     
     if "dynamics" in args.steps:
-        print(f"  [Phase 1] Running Dynamics + concurrent Pocket Detection ({num_workers} CPU workers) ...")
+        _phase1_start = time.monotonic()
+        print(f"  [Phase 1] MD + Pocket Detection  [{_ts()}]  —  {num_pocket_workers} CPU pocket workers")
+        sys.stdout.flush()
         
-        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers, mp_context=multiprocessing.get_context("spawn"), initializer=_worker_init) as executor:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_pocket_workers, mp_context=multiprocessing.get_context("spawn"), initializer=_worker_init) as executor:
             active_pocket_futures = []
             
             def submit_pocket_job(pdb_str, pdb_path, f_idx, f_time):
@@ -890,6 +1276,11 @@ def main() -> None:
                 f_path.write_text(frame.protein_pdb_string)
                 submit_pocket_job(frame.protein_pdb_string, str(f_path), frame.frame_index, frame.simulation_time_ps)
                 dynamics_frames.append((frame.frame_index, frame.simulation_time_ps, str(f_path), frame.protein_pdb_string))
+                print(
+                    f"  [MD] frame={frame.frame_index}  t={frame.simulation_time_ps:.1f} ps  "
+                    f"frames_so_far={len(dynamics_frames)}  [{_ts()}]  elapsed {_elapsed(_phase1_start)}",
+                    flush=True,
+                )
                 
             dynamics_result = run_dynamics(
                 initial_prepared, ph=args.ph, box_padding_nm=args.box_padding_nm,
@@ -908,7 +1299,12 @@ def main() -> None:
             dynamics_trajectory_dcd = dynamics_result.trajectory_dcd
             dynamics_topology_pdb = dynamics_result.topology_pdb
             
-            print("\n  Main MD complete. Waiting for any remaining pocket analysis workers…")
+            print(
+                f"\n  [Phase 1] MD complete  [{_ts()}]  elapsed {_elapsed(_phase1_start)}  —  "
+                f"{dynamics_result.simulation_time_ps:.1f} ps,  {len(dynamics_frames)} frames"
+                f"\n  Waiting for any remaining pocket analysis workers…"
+            )
+            sys.stdout.flush()
             concurrent.futures.wait(active_pocket_futures)
             for f in active_pocket_futures:
                 f.result() # Surface any exceptions
@@ -921,7 +1317,8 @@ def main() -> None:
         if not pdb_files:
             print(f"  Error: No PDB files found in {frame_dir}. Cannot run docking without frames.")
             return
-        print(f"  [MD Skipped] Found {len(pdb_files)} frame PDB files for downstream steps.")
+        print(f"  [MD Skipped]  [{_ts()}]  Found {len(pdb_files)} frame PDB files for downstream steps.")
+        sys.stdout.flush()
         for pdb_path in pdb_files:
             pdb_str = pdb_path.read_text()
             import re
@@ -931,8 +1328,10 @@ def main() -> None:
         
         # We still need to run pocket detection if it was passed without dynamics
         if "pocket" in args.steps:
-            print(f"  [Phase 1] Running Standalone Pocket Detection ({num_workers} CPU workers) ...")
-            with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers, mp_context=multiprocessing.get_context("spawn"), initializer=_worker_init) as executor:
+            _pocket_only_start = time.monotonic()
+            print(f"  [Phase 1] Standalone Pocket Detection  [{_ts()}]  —  {num_pocket_workers} CPU workers, {len(dynamics_frames)} frames")
+            sys.stdout.flush()
+            with concurrent.futures.ProcessPoolExecutor(max_workers=num_pocket_workers, mp_context=multiprocessing.get_context("spawn"), initializer=_worker_init) as executor:
                 pocket_futures = []
                 for f_idx, f_time, p_path, p_str in dynamics_frames:
                     future = executor.submit(
@@ -947,16 +1346,50 @@ def main() -> None:
                     )
                     pocket_futures.append(future)
                 concurrent.futures.wait(pocket_futures)
+            print(f"  [Phase 1] Pocket detection complete  [{_ts()}]  elapsed {_elapsed(_pocket_only_start)}", flush=True)
 
 
     # PHASE 2: Docking & Scoring (GPU Heavy!)
     do_dock = "docking" in args.steps or "scoring" in args.steps
     if do_dock:
         docking_steps = [s for s in args.steps if s in ("docking", "scoring")]
-        print(f"\n  [Phase 2] Running Sequential GPU Docking ({max_docking_workers} workers) ...")
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_docking_workers, mp_context=multiprocessing.get_context("spawn"), initializer=_worker_init) as executor:
+
+        dock_filter: dict[int, set[int] | None] | None = None
+        if args.dock_filter:
+            dock_filter = _parse_dock_filter(args.dock_filter)
+            filter_desc = ", ".join(
+                f"frame {fi} (all pockets)" if pi is None else f"frame {fi} pockets {sorted(pi)}"
+                for fi, pi in sorted(dock_filter.items())
+            )
+            print(f"  [dock-filter] Restricting to: {filter_desc}")
+
+        # Count how many frames will actually be dispatched so we can show X/N progress
+        frames_to_dock = [
+            (f_idx, f_time, p_path, p_str)
+            for f_idx, f_time, p_path, p_str in dynamics_frames
+            if dock_filter is None or f_idx in dock_filter
+        ]
+        _dock_total_frames[0] = len(frames_to_dock)
+        _dock_phase_start[0] = time.monotonic()
+
+        print(f"\n  [Phase 2] Docking  [{_ts()}]  —  "
+              f"{_dock_total_frames[0]} frames queued  |"
+              f"  {max_docking_workers} workers × {gnina_cpu_threads} thread(s)  |"
+              f"  GPU(s): {sorted(set(g for g in gpu_assignment if g is not None)) if num_gpus > 0 else 'CPU-only'}")
+        print(f"  {'─' * 66}")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_docking_workers,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=_worker_init,
+        ) as executor:
             dock_futures = []
-            for f_idx, f_time, p_path, p_str in dynamics_frames:
+            worker_index = 0
+            for f_idx, f_time, p_path, p_str in frames_to_dock:
+                pocket_filter_for_frame = dock_filter[f_idx] if dock_filter is not None else None
+                # Assign GPU round-robin so that (with N GPUs) consecutive
+                # workers cycle across all GPUs rather than piling onto GPU 0.
+                assigned_gpu = gpu_assignment[worker_index % max_docking_workers] if gpu_assignment else None
+                worker_index += 1
                 future = executor.submit(
                     _dock_frame_worker,
                     frame_index=f_idx, frame_time_ps=f_time, protein_pdb_path=p_path, protein_pdb_string=p_str,
@@ -965,7 +1398,10 @@ def main() -> None:
                     exhaustiveness=args.exhaustiveness, num_modes=args.num_modes, cnn_scoring=args.cnn_scoring,
                     gnina_seed=args.gnina_seed, dry_run=args.dry_run, scoring_method=args.scoring_method,
                     sar_metric=args.sar_metric, docking_output_dir=str(docking_output_dir), gnina_timeout_seconds=args.gnina_timeout_seconds,
-                    steps=docking_steps, project_output_dir=str(outdir)
+                    steps=docking_steps, project_output_dir=str(outdir),
+                    pocket_filter=pocket_filter_for_frame,
+                    gnina_cpu_threads=gnina_cpu_threads,
+                    gpu_id=assigned_gpu,
                 )
                 future.add_done_callback(on_dock_done)
                 dock_futures.append(future)
@@ -987,23 +1423,50 @@ def main() -> None:
         return (is_error, -val)
 
     all_rows_sorted = sorted(all_rows, key=_summary_rank_key)
-    _write_csv(summary_csv_path, all_rows_sorted)
+    _write_csv(summary_csv_path, all_rows_sorted, fieldnames=summary_fieldnames)
 
     print(
-        f"\n  ✓ All stages complete: {dynamics_sim_time:.1f} ps simulated, "
+        f"\n  ✓ All stages complete  [{_ts()}]  elapsed {_elapsed(pipeline_start)}: "
+        f"{dynamics_sim_time:.1f} ps simulated, "
         f"{dynamics_frames_len} frames analyzed, {len(all_rows)} poses assessed."
     )
+    sys.stdout.flush()
 
     # ── [4/4] Write outputs ──────────────────────────────────────────────────
     print("\n" + "═" * 70)
-    print("[4/4]  Finalizing outputs")
+    print(f"[4/4]  Finalizing outputs  [{_ts()}]")
     print("═" * 70)
+    sys.stdout.flush()
 
     print(f"  Summary CSV     : {summary_csv_path}  ({len(all_rows)} rows)")
 
     top_poses = top_heap.sorted_best()
     if top_poses:
         frame_dir = outdir / "frames"
+        if args.mode == "sar":
+            # For SAR, write the exported pose models ordered by CNN_VS.
+            top_poses = sorted(top_poses, key=lambda rr: rr.cnn_vs, reverse=True)
+            # Also export ligand-only SDFs:
+            # - per-rank: all ligands' best poses for that frame/pocket, sorted by scoring_method
+            # - combined: the single best ligand per selected frame/pocket (top-K pockets)
+            topk_best_ligand_blocks: list[str] = []
+            for rank, r in enumerate(top_poses, start=1):
+                topk_best_ligand_blocks.append(r.docked_sdf_block)
+                # Copy the pocket-ranked ligand SDF (written by the worker) into a stable topXX filename.
+                pocket_ranked = (
+                    outdir
+                    / "docking_output"
+                    / f"frame{r.frame_index:04d}_pocket{r.pocket_id}"
+                    / f"ligands_ranked_by_{args.scoring_method}.sdf"
+                )
+                if pocket_ranked.is_file():
+                    dst = outdir / f"top{rank:02d}_frame{r.frame_index:04d}_pocket{r.pocket_id:03d}_ligands_ranked.sdf"
+                    dst.write_text(pocket_ranked.read_text(encoding="utf-8"), encoding="utf-8")
+                    print(f"  Written         : {dst}")
+            # Combined top-K: one best ligand per selected (frame,pocket)
+            topk_ligands_path = outdir / f"top{args.top_k}_best_ligands.sdf"
+            _write_multimol_sdf(topk_ligands_path, topk_best_ligand_blocks)
+            print(f"  Top-{args.top_k} ligands : {topk_ligands_path}")
         if "refinement" not in args.steps:
             print("\n  Writing top-k docking poses without refinement ...")
         else:
@@ -1037,7 +1500,8 @@ def main() -> None:
                     print(f"    Docked-pose export failed for rank {i}: {exc}")
                 continue
 
-            print(f"    Refining rank {i} (frame {r.frame_index}, pocket {r.pocket_id}) ...")
+            print(f"    Refining rank {i}/{len(top_poses)}  [{_ts()}]  (frame {r.frame_index}, pocket {r.pocket_id}) …")
+            _refine_start = time.monotonic()
             refined_r = _refine_pose_worker(
                 result=r,
                 protein_pdb_path=frame_pdb,
@@ -1049,8 +1513,9 @@ def main() -> None:
             )
             if refined_r.status == "error" or not refined_r.refined_complex_pdb.strip():
                 err_head = (refined_r.error or "empty refined PDB").splitlines()[0]
-                print(f"    Refinement failed for rank {i}: {err_head}")
+                print(f"    Refinement FAILED rank {i}: {err_head}")
                 continue
+            print(f"    Rank {i} refined  (elapsed {_elapsed(_refine_start)})  ΔE={refined_r.final_energy_kj_per_mol - refined_r.initial_energy_kj_per_mol:.1f} kJ/mol", flush=True)
             final_top_poses.append(refined_r)
 
         top_poses = final_top_poses
@@ -1058,32 +1523,36 @@ def main() -> None:
             top_cif_path = outdir / args.top_output
             _write_multiblock_cif(top_cif_path, top_poses)
             print(f"  Top-{args.top_k} CIF      : {top_cif_path}  ({len(top_poses)} blocks)")
-            print(f"  Top-{args.top_k} output   : per-rank CIF files ({len(top_poses)} models)")
-            for rank, r in enumerate(top_poses, start=1):
-                if "refinement" not in args.steps:
-                    fname = (
-                        f"top{rank:02d}_frame{r.frame_index:04d}_"
-                        f"pocket{r.pocket_id:03d}_docked_only.cif"
-                    )
-                else:
-                    ie_tag = (
-                        f"{r.interaction_energy_kj_per_mol:.1f}"
-                        if r.interaction_energy_kj_per_mol is not None
-                        else "noE"
-                    )
-                    fname = (
-                        f"top{rank:02d}_frame{r.frame_index:04d}_"
-                        f"pocket{r.pocket_id:03d}_"
-                        f"ie{ie_tag.replace('-', 'n')}_kJmol.cif"
-                    )
-                cif_text = r.refined_complex_cif
-                if not cif_text.strip() and r.refined_complex_pdb.strip():
-                    cif_text = _pdb_text_to_cif(r.refined_complex_pdb)
-                if not cif_text.strip():
-                    print(f"  Skipped         : {outdir / fname} (no CIF content)")
-                    continue
-                (outdir / fname).write_text(cif_text)
-                print(f"  Written         : {outdir / fname}")
+            write_per_rank = not (args.mode == "sar" and "refinement" not in args.steps)
+            if write_per_rank:
+                print(f"  Top-{args.top_k} output   : per-rank CIF files ({len(top_poses)} models)")
+                for rank, r in enumerate(top_poses, start=1):
+                    if "refinement" not in args.steps:
+                        fname = (
+                            f"top{rank:02d}_frame{r.frame_index:04d}_"
+                            f"pocket{r.pocket_id:03d}_docked_only.cif"
+                        )
+                    else:
+                        ie_tag = (
+                            f"{r.interaction_energy_kj_per_mol:.1f}"
+                            if r.interaction_energy_kj_per_mol is not None
+                            else "noE"
+                        )
+                        fname = (
+                            f"top{rank:02d}_frame{r.frame_index:04d}_"
+                            f"pocket{r.pocket_id:03d}_"
+                            f"ie{ie_tag.replace('-', 'n')}_kJmol.cif"
+                        )
+                    cif_text = r.refined_complex_cif
+                    if not cif_text.strip() and r.refined_complex_pdb.strip():
+                        cif_text = _pdb_text_to_cif(r.refined_complex_pdb)
+                    if not cif_text.strip():
+                        print(f"  Skipped         : {outdir / fname} (no CIF content)")
+                        continue
+                    (outdir / fname).write_text(cif_text)
+                    print(f"  Written         : {outdir / fname}")
+            elif args.mode == "sar":
+                print("  SAR mode        : skipping per-rank *_docked_only.cif outputs.")
         else:
             if "refinement" not in args.steps:
                 print("  Docked-pose export failed for all top poses; no CIF models written.")
@@ -1108,7 +1577,7 @@ def _energy_for_topk_ranking(r: _FramePoseResult) -> float:
     return v if v is not None else r.final_energy_kj_per_mol
 
 
-_FIELDNAMES = [
+_FIELDNAMES_SINGLE = [
     "status", "frame_index", "frame_time_ps",
     "pocket_id", "pocket_score",
     "ligand_name", "cnn_vs", "cnn_affinity", "cnn_score", "vina_score", "auc_roc",
@@ -1119,8 +1588,32 @@ _FIELDNAMES = [
     "error",
 ]
 
+# SAR summaries are per (frame, pocket) discrimination metrics.
+_FIELDNAMES_SAR = [
+    "status", "frame_index", "frame_time_ps",
+    "pocket_id", "pocket_score",
+    # Representative ligand used to export the pocket's top pose.
+    "best_active_ligand_name",
+    "auc_roc",
+    "auc_pr",
+    "n_actives", "n_inactives",
+    "active_mean_score", "inactive_mean_score",
+    "active_std_score", "inactive_std_score",
+    "active_min_score", "active_max_score",
+    "inactive_min_score", "inactive_max_score",
+    "active_best_score", "inactive_best_score",
+    "overall_min_score", "overall_max_score",
+    "mean_rank_active_minus_inactive",
+    "enrichment_1pct", "enrichment_5pct", "enrichment_10pct",
+    "initial_energy_kj_per_mol", "final_energy_kj_per_mol",
+    "interaction_energy_kj_per_mol",
+    "ligand_rmsd_from_dock_angstrom",
+    "protein_atoms_flexible", "protein_atoms_restrained",
+    "error",
+]
 
-def _to_row(r: _FramePoseResult) -> dict[str, Any]:
+
+def _to_row_single(r: _FramePoseResult) -> dict[str, Any]:
     return {
         "status": r.status,
         "frame_index": r.frame_index,
@@ -1133,7 +1626,74 @@ def _to_row(r: _FramePoseResult) -> dict[str, Any]:
         "cnn_score": f"{r.cnn_score:.3f}" if r.cnn_score != "" else "",
         "vina_score": f"{r.vina_score:.3f}" if r.vina_score != "" else "",
         "auc_roc": f"{r.auc_roc:.4f}" if r.auc_roc is not None and r.auc_roc != "" else "",
-        "initial_energy_kj_per_mol": f"{r.initial_energy_kj_per_mol:.2f}" if isinstance(r.initial_energy_kj_per_mol, (int, float)) else r.initial_energy_kj_per_mol,
+        "initial_energy_kj_per_mol": (
+            f"{r.initial_energy_kj_per_mol:.2f}"
+            if isinstance(r.initial_energy_kj_per_mol, (int, float)) else r.initial_energy_kj_per_mol
+        ),
+        "final_energy_kj_per_mol": f"{r.final_energy_kj_per_mol:.2f}",
+        "interaction_energy_kj_per_mol": (
+            f"{r.interaction_energy_kj_per_mol:.2f}"
+            if r.interaction_energy_kj_per_mol is not None else ""
+        ),
+        "ligand_rmsd_from_dock_angstrom": f"{r.ligand_rmsd_from_dock_angstrom:.3f}",
+        "protein_atoms_flexible": r.protein_atoms_flexible,
+        "protein_atoms_restrained": r.protein_atoms_restrained,
+        "error": r.error,
+    }
+
+
+def _to_row_sar(r: _FramePoseResult) -> dict[str, Any]:
+    # Enrichment metrics are set dynamically on SAR results via `setattr`.
+    e1 = getattr(r, "enrichment_1pct", None)
+    e5 = getattr(r, "enrichment_5pct", None)
+    e10 = getattr(r, "enrichment_10pct", None)
+    auc_pr = getattr(r, "auc_pr", None)
+    n_actives = getattr(r, "n_actives", None)
+    n_inactives = getattr(r, "n_inactives", None)
+    active_mean_score = getattr(r, "active_mean_score", None)
+    inactive_mean_score = getattr(r, "inactive_mean_score", None)
+    active_std_score = getattr(r, "active_std_score", None)
+    inactive_std_score = getattr(r, "inactive_std_score", None)
+    active_min_score = getattr(r, "active_min_score", None)
+    active_max_score = getattr(r, "active_max_score", None)
+    inactive_min_score = getattr(r, "inactive_min_score", None)
+    inactive_max_score = getattr(r, "inactive_max_score", None)
+    active_best_score = getattr(r, "active_best_score", None)
+    inactive_best_score = getattr(r, "inactive_best_score", None)
+    overall_min_score = getattr(r, "overall_min_score", None)
+    overall_max_score = getattr(r, "overall_max_score", None)
+    mean_rank_active_minus_inactive = getattr(r, "mean_rank_active_minus_inactive", None)
+    return {
+        "status": r.status,
+        "frame_index": r.frame_index,
+        "frame_time_ps": f"{r.frame_time_ps:.3f}",
+        "pocket_id": r.pocket_id,
+        "pocket_score": f"{r.pocket_score:.3f}",
+        "best_active_ligand_name": r.ligand_name,
+        "auc_roc": f"{r.auc_roc:.4f}" if r.auc_roc is not None and r.auc_roc != "" else "",
+        "auc_pr": f"{auc_pr:.4f}" if auc_pr is not None and auc_pr != "" else "",
+        "n_actives": n_actives if n_actives is not None else "",
+        "n_inactives": n_inactives if n_inactives is not None else "",
+        "active_mean_score": f"{active_mean_score:.4f}" if active_mean_score is not None and active_mean_score != "" else "",
+        "inactive_mean_score": f"{inactive_mean_score:.4f}" if inactive_mean_score is not None and inactive_mean_score != "" else "",
+        "active_std_score": f"{active_std_score:.4f}" if active_std_score is not None and active_std_score != "" else "",
+        "inactive_std_score": f"{inactive_std_score:.4f}" if inactive_std_score is not None and inactive_std_score != "" else "",
+        "active_min_score": f"{active_min_score:.4f}" if active_min_score is not None and active_min_score != "" else "",
+        "active_max_score": f"{active_max_score:.4f}" if active_max_score is not None and active_max_score != "" else "",
+        "inactive_min_score": f"{inactive_min_score:.4f}" if inactive_min_score is not None and inactive_min_score != "" else "",
+        "inactive_max_score": f"{inactive_max_score:.4f}" if inactive_max_score is not None and inactive_max_score != "" else "",
+        "active_best_score": f"{active_best_score:.4f}" if active_best_score is not None and active_best_score != "" else "",
+        "inactive_best_score": f"{inactive_best_score:.4f}" if inactive_best_score is not None and inactive_best_score != "" else "",
+        "overall_min_score": f"{overall_min_score:.4f}" if overall_min_score is not None and overall_min_score != "" else "",
+        "overall_max_score": f"{overall_max_score:.4f}" if overall_max_score is not None and overall_max_score != "" else "",
+        "mean_rank_active_minus_inactive": f"{mean_rank_active_minus_inactive:.4f}" if mean_rank_active_minus_inactive is not None and mean_rank_active_minus_inactive != "" else "",
+        "enrichment_1pct": f"{e1:.4f}" if e1 is not None and e1 != "" else "",
+        "enrichment_5pct": f"{e5:.4f}" if e5 is not None and e5 != "" else "",
+        "enrichment_10pct": f"{e10:.4f}" if e10 is not None and e10 != "" else "",
+        "initial_energy_kj_per_mol": (
+            f"{r.initial_energy_kj_per_mol:.2f}"
+            if isinstance(r.initial_energy_kj_per_mol, (int, float)) else r.initial_energy_kj_per_mol
+        ),
         "final_energy_kj_per_mol": f"{r.final_energy_kj_per_mol:.2f}",
         "interaction_energy_kj_per_mol": (
             f"{r.interaction_energy_kj_per_mol:.2f}"
@@ -1147,11 +1707,82 @@ def _to_row(r: _FramePoseResult) -> dict[str, Any]:
 
 
 
-def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+def _write_csv(path: Path, rows: list[dict[str, Any]], *, fieldnames: list[str]) -> None:
     with path.open("w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=_FIELDNAMES)
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _write_multimol_sdf(path: Path, sdf_blocks: list[str]) -> None:
+    """Write a multi-molecule SDF file from SDF blocks.
+
+    Each block should be a complete molecule record (ideally ending with '$$$$').
+    """
+    # Preserve SD properties (GNINA scores, SMILES, etc.) by writing the raw
+    # SDF record text. Do NOT strip the block: stripping can remove the blank
+    # line that terminates SD property fields and break parsers.
+    out: list[str] = []
+    for block in sdf_blocks:
+        b = (block or "")
+        if not b.strip():
+            continue
+        b = b.replace("\r\n", "\n")
+        # Avoid leading blank lines which can confuse some SDF readers.
+        b = b.lstrip("\n")
+        if "$$$$" in b:
+            head = b.split("$$$$", 1)[0]
+        else:
+            head = b
+        # Ensure record ends with a newline before the delimiter.
+        if not head.endswith("\n"):
+            head += "\n"
+        out.append(head + "$$$$\n")
+    path.write_text("".join(out), encoding="utf-8")
+
+
+def _print_dock_progress(
+    progress: dict[str, int],
+    total_frames: int,
+    phase_start: float,
+) -> None:
+    """Print a one-line docking progress summary to stdout.
+
+    Called under ``results_lock`` after every frame completes so the log file
+    always has an up-to-date status line.  Format::
+
+        [Progress]  7/22 frames  |  143 poses  |  2 errors  |  elapsed 4m 12s  |  ETA ~8m 03s
+    """
+    done = progress["frames_done"]
+    ok   = progress["poses_ok"]
+    err  = progress["poses_err"]
+    elapsed_s = time.monotonic() - phase_start
+
+    # Estimate time remaining using average frame rate so far
+    if done > 0 and total_frames > 0:
+        rate = elapsed_s / done          # seconds per frame
+        remaining = max(0, (total_frames - done) * rate)
+        r_h, r_rem = divmod(int(remaining), 3600)
+        r_m, r_s   = divmod(r_rem, 60)
+        eta_str = (
+            f"{r_h}h {r_m:02d}m {r_s:02d}s"
+            if r_h
+            else f"{r_m}m {r_s:02d}s"
+            if r_m
+            else f"{r_s}s"
+        )
+        eta_part = f"  |  ETA ~{eta_str}"
+    else:
+        eta_part = ""
+
+    err_part = f"  |  {err} errors" if err else ""
+    frac = f"{done}/{total_frames}" if total_frames else str(done)
+    print(
+        f"  [Progress]  {frac} frames  |  {ok} poses{err_part}"
+        f"  |  elapsed {_elapsed(phase_start)}{eta_part}",
+        flush=True,
+    )
+
 
 
 def _write_multimodel_pdb(path: Path, results: list[_FramePoseResult]) -> None:

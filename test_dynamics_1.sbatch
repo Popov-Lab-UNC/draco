@@ -35,7 +35,7 @@ pixi run draco \
   --gnina-binary   "apptainer run --nv /work/users/s/h/shuhang/gnina_build/gnina.sif" \
   --output-dir     "4GL2_XS421854b" \
   --num-conformers 100
-
+'''
 pixi run draco \
   --mode single \
   --steps docking scoring \
@@ -44,3 +44,4 @@ pixi run draco \
   --gnina-binary   "apptainer run --nv /work/users/s/h/shuhang/gnina_build/gnina.sif" \
   --output-dir     "4GL2_XS466077b" \
   --num-conformers 100
+'''

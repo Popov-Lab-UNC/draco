@@ -338,7 +338,16 @@ def _parse_gnina_sdf(sdf_text: str, *, ligand_name: str) -> list[GninaDockResult
     """
     results: list[GninaDockResult] = []
     # Split by the $$$$ record separator
-    blocks = [b.strip() for b in sdf_text.split("$$$$") if b.strip()]
+    # IMPORTANT: do NOT `.strip()` the block text.
+    # GNINA writes SD properties with required blank-line terminators; stripping
+    # can delete those and break downstream SDF parsers and/or drop properties.
+    sdf_text = sdf_text.replace("\r\n", "\n")
+    blocks: list[str] = []
+    for b in sdf_text.split("$$$$"):
+        if not b.strip():
+            continue
+        # Avoid leading blank lines which can confuse some readers.
+        blocks.append(b.lstrip("\n"))
 
     for rank, block in enumerate(blocks, start=1):
         vina = _parse_sdf_property(block, "minimizedAffinity", required=True)
@@ -363,7 +372,7 @@ def _parse_gnina_sdf(sdf_text: str, *, ligand_name: str) -> list[GninaDockResult
                 cnn_score=cnn_score,
                 cnn_affinity=cnn_aff,
                 cnn_vs=cnn_vs,
-                pose_sdf_block=block + "\n$$$$\n",
+                pose_sdf_block=(block if block.endswith("\n") else (block + "\n")) + "$$$$\n",
             )
         )
 
