@@ -9,7 +9,7 @@ Provides:
     original ``pocket`` step).
 
 When ``--steps`` includes ``pocket``, each frame's pockets are written to
-``pockets/frame{index:04d}.json`` (or ``frame_initial.json`` for frame_index ``-1``).
+``pockets/frame{index:04d}.json`` (or ``frame_initial.json`` for frame_index ``0``).
 A later run with ``docking`` / ``scoring`` but *without* ``pocket`` loads these files.
 """
 from __future__ import annotations
@@ -117,7 +117,7 @@ def docking_box_from_pocket(
 def pocket_artifact_path(project_output_dir: str | Path, frame_index: int) -> Path:
     """Path to the JSON artifact for one MD frame."""
     root = Path(project_output_dir) / "pockets"
-    if frame_index == -1:
+    if frame_index == 0:
         return root / "frame_initial.json"
     return root / f"frame{frame_index:04d}.json"
 

@@ -474,7 +474,7 @@ def run_dynamics(
         if is_novel:
             rmsd_report = 0.0 if not saved_ca_positions else min_rmsd_A
             log(
-                f"   → Frame {len(extracted_frames):4d}  "
+                f"   → Frame {len(extracted_frames) + 1:4d}  "
                 f"t={current_time_ps:8.1f} ps  "
                 f"minRMSD={rmsd_report:.2f} Å  — novel"
             )
@@ -489,7 +489,7 @@ def run_dynamics(
             ).get_structure(model=1)
 
             frame = DynamicsFrame(
-                frame_index=len(extracted_frames),
+                frame_index=len(extracted_frames) + 1,
                 simulation_time_ps=current_time_ps,
                 rmsd_from_prev_angstrom=rmsd_report,
                 protein_pdb_string=protein_pdb_str,

@@ -24,17 +24,12 @@ export PATH="$PIXI_HOME/bin:$PATH"
 
 cd /work/users/s/h/shuhang/draco
 
-OUTPUT_DIR="6WAU-frame7-3apr2026"
+OUTPUT_DIR="6WAU-lig-refined-3apr2026"
 
 pixi run draco \
-  --mode single \
-  --steps dynamics pocket docking scoring refinement \
-  --dock-filter -1 \
-  --protein-pdb       "6WAU-SAR-30mar2026/frames/frame_0007.pdb" \
-  --ligand-smiles        "Cn1nc(Br)c2c(N3CCC[C@@H](NC4CCC4)C3)nc(N3CCC(F)(F)C3)nc21" \
+  --mode sar \
+  --steps pocket docking scoring \
+  --protein-pdb       "frame_0007_lig_refined_apo.pdb" \
+  --ligand-csv        "/users/s/h/shuhang/PHF19/phf19_data_30mar2026.csv" \
   --gnina-binary      "apptainer run --nv /work/users/s/h/shuhang/gnina_build/gnina.sif" \
-  --output-dir        "${OUTPUT_DIR}" \
-  --production-steps 500000 \
-  --rmsd-threshold-angstrom 0.5 \
-  --gnina-timeout-seconds 180 \
-  --refine-iterations 10000
+  --output-dir        "${OUTPUT_DIR}"
