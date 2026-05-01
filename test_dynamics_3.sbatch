@@ -24,9 +24,7 @@ export PATH="$PIXI_HOME/bin:$PATH"
 
 cd /work/users/s/h/shuhang/draco
 
-# 6pbc-prepared.pdb
-# CN(CC1(CC1)c1ccc(F)cc1)C(=O)[C@H](Cc1csc2ccccc12)Nc1cc(ncn1)C(N)=O
-
+'''
 pixi run draco \
   --mode single \
   --steps docking scoring \
@@ -44,3 +42,12 @@ pixi run draco \
   --gnina-binary   "apptainer run --nv /work/users/s/h/shuhang/gnina_build/gnina.sif" \
   --output-dir     "3B6E_XS421854b" \
   --num-conformers 100
+'''
+
+pixi run draco \
+  --mode sar \
+  --steps dynamics pocket docking scoring \
+  --protein-pdb       "8T7C.pdb" \
+  --ligand-csv        "plcg2_activators_8apr2026.csv" \
+  --gnina-binary      "apptainer run --nv /work/users/s/h/shuhang/gnina_build/gnina.sif" \
+  --output-dir        "plcg2_10apr2026"

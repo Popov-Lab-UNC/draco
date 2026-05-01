@@ -24,9 +24,7 @@ export PATH="$PIXI_HOME/bin:$PATH"
 
 cd /work/users/s/h/shuhang/draco
 
-# 6pbc-prepared.pdb
-# CN(CC1(CC1)c1ccc(F)cc1)C(=O)[C@H](Cc1csc2ccccc12)Nc1cc(ncn1)C(N)=O
-
+'''
 pixi run draco \
   --mode single \
   --steps docking scoring \
@@ -35,7 +33,7 @@ pixi run draco \
   --gnina-binary   "apptainer run --nv /work/users/s/h/shuhang/gnina_build/gnina.sif" \
   --output-dir     "4GL2_XS421854b" \
   --num-conformers 100
-'''
+
 pixi run draco \
   --mode single \
   --steps docking scoring \
@@ -45,3 +43,14 @@ pixi run draco \
   --output-dir     "4GL2_XS466077b" \
   --num-conformers 100
 '''
+
+pixi run draco \
+  --mode single \
+  --steps dynamics pocket docking scoring refinement \
+  --protein-pdb    "6PBC.pdb" \
+  --ligand-smiles  "CN(CC1(CC1)c1ccc(F)cc1)C(=O)[C@H](Cc1csc2ccccc12)Nc1cc(ncn1)C(N)=O" \
+  --gnina-binary   "apptainer run --nv /work/users/s/h/shuhang/gnina_build/gnina.sif" \
+  --dynamics-backend bioemu \
+  --bioemu-num-samples 10 \
+  --output-dir     "6PBC_A46" \
+  --num-conformers 100

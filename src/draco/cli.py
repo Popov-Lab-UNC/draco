@@ -1,11 +1,11 @@
-"""cli.py – Entry point for the Draco pipeline: MD + GNINA docking.
+"""cli.py – Entry point for the Draco pipeline: conformation sampling + GNINA docking.
 
 Pipeline
 --------
                   ┌──────────────────────────────────────────────────────────┐
   protein-pdb +   │               dynamics.py (this script calls it)          │
-  compounds  ──►  │  prepare_protein → solvate → minimize → NVT/NPT →        │
-  .csv or         │  production MD → Cα RMSD-change frame extraction          │
+  compounds  ──►  │  OpenMM: prepare → solvate → MD → frame extraction         │
+  .csv or         │  or BioEmu: sequence from PDB → samples → frames from XTC  │
   --ligand-smiles └─────────────────────────┬────────────────────────────────┘
                                             │  conformational frames
                                             ▼  (protein-only snapshots)
@@ -33,7 +33,8 @@ Pipeline
                               │   Output                │
                               │  summary.csv            │
                               │  top5_poses.pdb         │
-                              │  trajectory.dcd         │
+                              │  trajectory (DCD or XTC)│
+                              │  topology PDB           │
                               └─────────────────────────┘
 
 Usage (SAR series mode):
@@ -49,6 +50,13 @@ Usage (single-compound mode):
         --protein-pdb 6pbc-prepared.pdb \
         --ligand-smiles "CN(CC1(CC1)c1ccc(F)cc1)C(=O)..." \\
         --output-dir dynamics_gnina_single
+
+Usage (virtual screening mode):
+    draco --mode screening \
+        --steps dynamics pocket docking refinement \
+        --protein-pdb 6pbc-prepared.pdb \
+        --ligand-csv compounds.csv \\
+        --output-dir dynamics_screening
 """
 from __future__ import annotations
 
@@ -151,14 +159,14 @@ from typing import Any
 
 import numpy as np
 
-from draco.dynamics import DynamicsFrame, DynamicsResult, run_dynamics
+from draco.dynamics import DynamicsFrame, DynamicsResult, run_bioemu_sampling, run_dynamics
 from draco.docking import (
     DockingBox, GninaDockResult, PocketDockResult,
     dock_ligands_to_pocket,
 )
 from draco.ligand_preparation import (
     PreparedLigand, prepare_ligand_from_smiles,
-    load_compound_csv, write_ligand_sdf, write_ligands_for_docking,
+    load_compound_csv, load_screening_csv, write_ligand_sdf, write_ligands_for_docking,
 )
 from draco.refinement import RefinementResult, refine_docked_pose
 from draco.sar_scoring import SARScoreResult, compute_sar_discrimination
@@ -216,8 +224,8 @@ def parse_args() -> argparse.Namespace:
     primary_grp.add_argument(
         "--mode",
         required=True,
-        choices=["single", "sar"],
-        help="[REQUIRED] Mode of operation: 'single' for one compound or 'sar' for structure-activity relationship scoring."
+        choices=["single", "sar", "screening"],
+        help="[REQUIRED] Mode of operation: 'single' for one compound, 'sar' for structure-activity discrimination, or 'screening' for unlabeled virtual screening."
     )
     primary_grp.add_argument(
         "--steps",
@@ -234,7 +242,26 @@ def parse_args() -> argparse.Namespace:
     )
     primary_grp.add_argument(
         "--ligand-csv",
-        help="[REQUIRED for --mode sar] CSV with columns name,smiles,active (1/0). Enables SAR discrimination scoring."
+        help=(
+            "[REQUIRED for --mode sar/screening] CSV for ligand input. "
+            "Default columns: SAR uses name,smiles,active (1/0); "
+            "screening uses name,smiles. Override via --csv-*-column flags."
+        ),
+    )
+    primary_grp.add_argument(
+        "--csv-name-column",
+        default="name",
+        help="Column name to use as ligand identifier in --ligand-csv.",
+    )
+    primary_grp.add_argument(
+        "--csv-smiles-column",
+        default="smiles",
+        help="Column name to use as SMILES in --ligand-csv.",
+    )
+    primary_grp.add_argument(
+        "--csv-activity-column",
+        default="active",
+        help="Column name to use as activity label (SAR mode only).",
     )
     primary_grp.add_argument(
         "--ligand-smiles",
@@ -269,6 +296,19 @@ def parse_args() -> argparse.Namespace:
     dyn_grp.add_argument("--report-interval-steps", type=int, default=5_000, help="Steps between frame reports.")
     dyn_grp.add_argument("--rmsd-threshold-angstrom", type=float, default=1.5, help="C-alpha RMSD threshold for keeping a frame.")
     dyn_grp.add_argument("--no-trajectory", action="store_true", default=False, help="Disable saving the MD trajectory (DCD).")
+    dyn_grp.add_argument(
+        "--dynamics-backend",
+        default="md",
+        choices=["md", "bioemu"],
+        help="Conformation source: explicit-solvent OpenMM MD (default) or BioEmu sampling.",
+    )
+    dyn_grp.add_argument(
+        "--bioemu-num-samples",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Number of BioEmu samples to generate (only used with --dynamics-backend bioemu).",
+    )
 
     # ── Pocket & Ligand Prep Parameters ───────────────────────────────────────
     pocket_grp = parser.add_argument_group("Pocket & Ligand Prep Parameters")
@@ -324,11 +364,19 @@ def parse_args() -> argparse.Namespace:
             parser.error("--ligand-csv is REQUIRED when --mode is 'sar'.")
         if args.ligand_smiles:
             parser.error("--ligand-smiles cannot be used when --mode is 'sar'. Use --ligand-csv instead.")
+    elif args.mode == "screening":
+        if not args.ligand_csv:
+            parser.error("--ligand-csv is REQUIRED when --mode is 'screening'.")
+        if args.ligand_smiles:
+            parser.error("--ligand-smiles cannot be used when --mode is 'screening'. Use --ligand-csv instead.")
     elif args.mode == "single":
         if not args.ligand_smiles:
             parser.error("--ligand-smiles is REQUIRED when --mode is 'single'.")
         if args.ligand_csv:
             parser.error("--ligand-csv cannot be used when --mode is 'single'. Use --ligand-smiles instead.")
+
+    if args.bioemu_num_samples < 1:
+        parser.error("--bioemu-num-samples must be >= 1.")
 
     return args
 
@@ -362,6 +410,7 @@ class _FramePoseResult:
     refined_complex_cif: str = ""
     status: str = "ok"
     error: str = ""
+    smiles: str = ""             # canonical smiles of the docked compound (if available)
 
 
 @dataclass
@@ -487,6 +536,7 @@ def _dock_frame_worker(
     protein_pdb_string: str,     # PDB text (kept for passing forward)
     ligand_sdf_paths: dict[str, str],  # {state_name: sdf_path_str}
     name_map: dict[str, str],          # {state_name: parent_ligand_name}
+    parent_smiles_map: dict[str, str], # {parent_ligand_name: canonical_smiles}
     active_names: list[str],           # parent-level active names
     inactive_names: list[str],         # parent-level inactive names
     pocket_score_threshold: float,
@@ -515,7 +565,8 @@ def _dock_frame_worker(
     If *gpu_id* is provided, the worker sets ``CUDA_VISIBLE_DEVICES`` so that
     GNINA uses only that specific GPU (useful for multi-GPU nodes).
 
-    Returns one _FramePoseResult per (pocket, parent_ligand) pair in `single` mode.
+    Returns one _FramePoseResult per (pocket, parent_ligand) pair in `single`
+    and `screening` modes.
     In `sar` mode it returns one result per (frame, pocket) with SAR discrimination
     metrics (and a representative active ligand used for pose export).
     """
@@ -641,7 +692,7 @@ def _dock_frame_worker(
         # ── Aggregate best score per parent ligand ─────────────────────────
         # pocket_dock.results keys are state-level names (e.g. "LIG_s0").
         # We group by parent name and pick the best pose (by scoring_method) per parent.
-        parent_best: dict[str, tuple[float, float, float, float, str]] = {}  # parent -> (best_scoring_metric, cnn_affinity, vina_score, cnn_score, cnn_vs, best_sdf)
+        parent_best: dict[str, tuple[float, float, float, float, float, str]] = {}  # parent -> (best_scoring_metric, cnn_affinity, vina_score, cnn_score, cnn_vs, best_sdf)
         for state_name, poses in pocket_dock.results.items():
             if not poses:
                 continue
@@ -787,6 +838,7 @@ def _dock_frame_worker(
                 frame_index=frame_index, frame_time_ps=frame_time_ps,
                 pocket_id=pocket_id, pocket_score=pocket_score,
                 ligand_name=best_active,
+                smiles=parent_smiles_map.get(best_active, ""),
                 cnn_affinity=best_cnn_aff, vina_score=best_vina,
                 cnn_score=best_cnn_score, cnn_vs=best_cnn_vs,
                 auc_roc=sar_val if "scoring" in steps else None,
@@ -828,6 +880,7 @@ def _dock_frame_worker(
                 results.append(_FramePoseResult(
                     frame_index=frame_index, frame_time_ps=frame_time_ps,
                     pocket_id=pocket_id, pocket_score=pocket_score, ligand_name=parent,
+                    smiles=parent_smiles_map.get(parent, ""),
                     cnn_affinity=best_cnn_aff,
                     vina_score=best_vina,
                     cnn_score=best_cnn_score,
@@ -984,6 +1037,7 @@ def main() -> None:
 
     # name_map: state_name → parent_ligand_name
     name_map: dict[str, str] = {}
+    parent_smiles_map: dict[str, str] = {}
     ligand_sdf_paths: dict[str, str] = {}
 
     ligand_manifest_path = outdir / "ligand_prep_manifest.json"
@@ -1021,9 +1075,16 @@ def main() -> None:
             cached_manifest = None
 
     if args.ligand_csv:
+        csv_columns: dict[str, str] = {
+            "name": args.csv_name_column,
+            "smiles": args.csv_smiles_column,
+        }
+        if args.mode == "sar":
+            csv_columns["active"] = args.csv_activity_column
         ligand_signature = {
-            "mode": "csv",
+            "mode": args.mode,
             "ligand_csv_sha256": _sha256_file(Path(args.ligand_csv)),
+            "csv_columns": csv_columns,
             "protonation": _DEFAULT_PROTONATION,
             "prep": _DEFAULT_PREP,
         }
@@ -1040,15 +1101,18 @@ def main() -> None:
         expected_state_names: list[str] = []
         expected_state_names.extend(cached_manifest.get("active_state_names", []))
         expected_state_names.extend(cached_manifest.get("inactive_state_names", []))
+        expected_state_names.extend(cached_manifest.get("screening_state_names", []))
         cache_hit = all((ligands_dir / f"{sn}.sdf").is_file() for sn in expected_state_names)
 
     if cache_hit and cached_manifest:
         name_map = dict(cached_manifest.get("name_map", {}))
+        parent_smiles_map = dict(cached_manifest.get("parent_smiles_map", {}))
         active_names = list(cached_manifest.get("active_parent_names", []))
         inactive_names = list(cached_manifest.get("inactive_parent_names", []))
         active_state_names = list(cached_manifest.get("active_state_names", []))
         inactive_state_names = list(cached_manifest.get("inactive_state_names", []))
-        for sn in active_state_names + inactive_state_names:
+        screening_state_names = list(cached_manifest.get("screening_state_names", []))
+        for sn in active_state_names + inactive_state_names + screening_state_names:
             ligand_sdf_paths[sn] = str((ligands_dir / f"{sn}.sdf").resolve())
         print(
             f"\n[2/4]  Preparing ligands …  [{_ts()}]  (cache hit)  "
@@ -1057,12 +1121,27 @@ def main() -> None:
     else:
         _ligand_prep_start = time.monotonic()
         print(f"\n[2/4]  Preparing ligands …  [{_ts()}]")
+        streamed_sdf_count = 0
 
-        if args.ligand_csv:
+        def _on_prepared_ligand(prep: PreparedLigand, _parent_name: str) -> None:
+            nonlocal streamed_sdf_count
+            sdf_path = write_ligand_sdf(prep, ligands_dir / f"{prep.name}.sdf")
+            ligand_sdf_paths[prep.name] = str(sdf_path.resolve())
+            streamed_sdf_count += 1
+            # Emit occasional heartbeat logs for long runs.
+            if streamed_sdf_count == 1 or streamed_sdf_count % 100 == 0:
+                print(f"  Prepared+written {streamed_sdf_count} ligands so far …")
+                sys.stdout.flush()
+
+        if args.mode == "sar":
             actives, inactives, name_map = load_compound_csv(
                 args.ligand_csv, num_conformers=args.num_conformers,
                 prune_rms_threshold=args.prune_rms_threshold,
                 energy_cutoff=args.energy_cutoff,
+                name_column=args.csv_name_column,
+                smiles_column=args.csv_smiles_column,
+                activity_column=args.csv_activity_column,
+                on_prepared=_on_prepared_ligand,
             )
             all_compounds = actives + inactives
             # active_names / inactive_names are PARENT-level names
@@ -1072,6 +1151,19 @@ def main() -> None:
                 f"  Loaded {len(active_names)} actives, "
                 f"{len(inactive_names)} inactives from {args.ligand_csv}"
             )
+        elif args.mode == "screening":
+            all_compounds, name_map = load_screening_csv(
+                args.ligand_csv,
+                num_conformers=args.num_conformers,
+                prune_rms_threshold=args.prune_rms_threshold,
+                energy_cutoff=args.energy_cutoff,
+                name_column=args.csv_name_column,
+                smiles_column=args.csv_smiles_column,
+                on_prepared=_on_prepared_ligand,
+            )
+            active_names = []
+            inactive_names = []
+            print(f"  Loaded {len(all_compounds)} compounds from {args.ligand_csv}")
         else:
             prep = prepare_ligand_from_smiles(
                 args.ligand_smiles, name=args.ligand_name,
@@ -1089,8 +1181,16 @@ def main() -> None:
                 f"({n_confs} conformers within {args.energy_cutoff} kcal/mol cutoff)"
             )
 
-        # Write SDF files once; pass absolute paths to workers
-        ligand_sdf_paths = write_ligands_for_docking(all_compounds, ligands_dir)
+        # parent_ligand_name -> canonical_smiles map for reporting.
+        parent_smiles_map = {
+            name_map.get(compound.name, compound.name): compound.canonical_smiles
+            for compound in all_compounds
+        }
+
+        # For CSV modes, SDFs are stream-written via on_prepared callback.
+        # Single-ligand mode still writes here.
+        if args.mode == "single":
+            ligand_sdf_paths = write_ligands_for_docking(all_compounds, ligands_dir)
         print(f"  Written {len(ligand_sdf_paths)} SDF files to {ligands_dir}/  (elapsed {_elapsed(_ligand_prep_start)})")
         sys.stdout.flush()
 
@@ -1098,15 +1198,22 @@ def main() -> None:
         manifest: dict[str, Any] = {
             "signature": ligand_signature,
             "name_map": name_map,
+            "parent_smiles_map": parent_smiles_map,
             "active_parent_names": active_names,
             "inactive_parent_names": inactive_names,
         }
-        if args.ligand_csv:
+        if args.mode == "sar":
             manifest["active_state_names"] = [l.name for l in actives]
             manifest["inactive_state_names"] = [l.name for l in inactives]
+            manifest["screening_state_names"] = []
+        elif args.mode == "screening":
+            manifest["active_state_names"] = []
+            manifest["inactive_state_names"] = []
+            manifest["screening_state_names"] = [c.name for c in all_compounds]
         else:
             manifest["active_state_names"] = [c.name for c in all_compounds]
             manifest["inactive_state_names"] = []
+            manifest["screening_state_names"] = []
         ligand_manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     # Prepare initial protein structure
@@ -1143,10 +1250,11 @@ def main() -> None:
                             metric_val = getattr(r, ranking_metric, None)
                             score_str = f"{ranking_metric}={metric_val:.3f}" if metric_val is not None else "sar=NA"
                         else:
+                            metric_val = getattr(r, ranking_metric, None)
                             score_str = (
-                                f"CNN={r.cnn_affinity:.2f}"
-                                if r.cnn_affinity is not None
-                                else "cnn=NA"
+                                f"{ranking_metric}={metric_val:.3f}"
+                                if metric_val is not None
+                                else f"{ranking_metric}=NA"
                             )
                         print(f"  [dock] frame={r.frame_index}  pocket={r.pocket_id}  {score_str}")
                         best = top_heap.current_best()
@@ -1211,7 +1319,10 @@ def main() -> None:
                                 "pocket_id": r.pocket_id,
                                 "pocket_score": "",
                                 "ligand_name": r.ligand_name,
+                                "smiles": r.smiles,
+                                "cnn_vs": "",
                                 "cnn_affinity": "",
+                                "cnn_score": "",
                                 "vina_score": "",
                                 "auc_roc": "",
                                 "initial_energy_kj_per_mol": "",
@@ -1245,7 +1356,13 @@ def main() -> None:
     
     if "dynamics" in args.steps:
         _phase1_start = time.monotonic()
-        print(f"  [Phase 1] MD + Pocket Detection  [{_ts()}]  —  {num_pocket_workers} CPU pocket workers")
+        phase_tag = "BioEmu" if args.dynamics_backend == "bioemu" else "MD"
+        phase_title = (
+            "BioEmu sampling + Pocket Detection"
+            if args.dynamics_backend == "bioemu"
+            else "MD + Pocket Detection"
+        )
+        print(f"  [Phase 1] {phase_title}  [{_ts()}]  —  {num_pocket_workers} CPU pocket workers")
         sys.stdout.flush()
         
         with concurrent.futures.ProcessPoolExecutor(max_workers=num_pocket_workers, mp_context=multiprocessing.get_context("spawn"), initializer=_worker_init) as executor:
@@ -1257,7 +1374,7 @@ def main() -> None:
                 future = executor.submit(
                     _dock_frame_worker,
                     frame_index=f_idx, frame_time_ps=f_time, protein_pdb_path=pdb_path, protein_pdb_string=pdb_str,
-                    ligand_sdf_paths={}, name_map={}, active_names=[], inactive_names=[],
+                    ligand_sdf_paths={}, name_map={}, parent_smiles_map={}, active_names=[], inactive_names=[],
                     pocket_score_threshold=args.pocket_score_threshold, gnina_binary=args.gnina_binary,
                     exhaustiveness=args.exhaustiveness, num_modes=args.num_modes, cnn_scoring="none",
                     gnina_seed=args.gnina_seed, dry_run=args.dry_run, scoring_method=args.scoring_method,
@@ -1277,33 +1394,51 @@ def main() -> None:
                 submit_pocket_job(frame.protein_pdb_string, str(f_path), frame.frame_index, frame.simulation_time_ps)
                 dynamics_frames.append((frame.frame_index, frame.simulation_time_ps, str(f_path), frame.protein_pdb_string))
                 print(
-                    f"  [MD] frame={frame.frame_index}  t={frame.simulation_time_ps:.1f} ps  "
+                    f"  [{phase_tag}] frame={frame.frame_index}  t={frame.simulation_time_ps:.1f} ps  "
                     f"frames_so_far={len(dynamics_frames)}  [{_ts()}]  elapsed {_elapsed(_phase1_start)}",
                     flush=True,
                 )
-                
-            dynamics_result = run_dynamics(
-                initial_prepared, ph=args.ph, box_padding_nm=args.box_padding_nm,
-                ionic_strength_molar=args.ionic_strength, nvt_steps=args.nvt_steps,
-                npt_steps=args.npt_steps, production_steps=args.production_steps,
-                temperature_kelvin=args.temperature_kelvin, friction_per_ps=args.friction_per_ps,
-                timestep_fs=args.timestep_fs, report_interval_steps=args.report_interval_steps,
-                rmsd_threshold_angstrom=args.rmsd_threshold_angstrom, platform_name=args.platform_name,
-                cuda_precision=args.cuda_precision, output_dir=outdir,
-                save_trajectory=not args.no_trajectory, water_model=args.water_model,
-                frame_callback=frame_callback, verbose=True
-            )
-            
+
+            if args.dynamics_backend == "bioemu":
+                dynamics_result = run_bioemu_sampling(
+                    initial_prepared,
+                    ph=args.ph,
+                    num_samples=args.bioemu_num_samples,
+                    output_dir=outdir,
+                    save_trajectory=not args.no_trajectory,
+                    frame_callback=frame_callback,
+                    verbose=True,
+                )
+            else:
+                dynamics_result = run_dynamics(
+                    initial_prepared, ph=args.ph, box_padding_nm=args.box_padding_nm,
+                    ionic_strength_molar=args.ionic_strength, nvt_steps=args.nvt_steps,
+                    npt_steps=args.npt_steps, production_steps=args.production_steps,
+                    temperature_kelvin=args.temperature_kelvin, friction_per_ps=args.friction_per_ps,
+                    timestep_fs=args.timestep_fs, report_interval_steps=args.report_interval_steps,
+                    rmsd_threshold_angstrom=args.rmsd_threshold_angstrom, platform_name=args.platform_name,
+                    cuda_precision=args.cuda_precision, output_dir=outdir,
+                    save_trajectory=not args.no_trajectory, water_model=args.water_model,
+                    frame_callback=frame_callback, verbose=True
+                )
+
             dynamics_sim_time = dynamics_result.simulation_time_ps
             dynamics_frames_len = len(dynamics_result.frames)
-            dynamics_trajectory_dcd = dynamics_result.trajectory_dcd
+            dynamics_trajectory = dynamics_result.trajectory_dcd
             dynamics_topology_pdb = dynamics_result.topology_pdb
-            
-            print(
-                f"\n  [Phase 1] MD complete  [{_ts()}]  elapsed {_elapsed(_phase1_start)}  —  "
-                f"{dynamics_result.simulation_time_ps:.1f} ps,  {len(dynamics_frames)} frames"
-                f"\n  Waiting for any remaining pocket analysis workers…"
-            )
+
+            if args.dynamics_backend == "bioemu":
+                print(
+                    f"\n  [Phase 1] BioEmu complete  [{_ts()}]  elapsed {_elapsed(_phase1_start)}  —  "
+                    f"{len(dynamics_result.frames)} samples,  {len(dynamics_frames)} frames (including initial)"
+                    f"\n  Waiting for any remaining pocket analysis workers…"
+                )
+            else:
+                print(
+                    f"\n  [Phase 1] MD complete  [{_ts()}]  elapsed {_elapsed(_phase1_start)}  —  "
+                    f"{dynamics_result.simulation_time_ps:.1f} ps,  {len(dynamics_frames)} frames"
+                    f"\n  Waiting for any remaining pocket analysis workers…"
+                )
             sys.stdout.flush()
             concurrent.futures.wait(active_pocket_futures)
             for f in active_pocket_futures:
@@ -1311,7 +1446,7 @@ def main() -> None:
     else:
         dynamics_sim_time = 0.0
         dynamics_frames_len = 0
-        dynamics_trajectory_dcd = None
+        dynamics_trajectory = None
         dynamics_topology_pdb = None
         
         # Ensure initial frame is present in frames directory even if dynamics is not run
@@ -1328,9 +1463,19 @@ def main() -> None:
         for pdb_path in pdb_files:
             pdb_str = pdb_path.read_text()
             import re
-            m = re.search(r"frame_(\d+)", pdb_path.name)
-            f_idx = int(m.group(1)) if m else 0
+            m = re.fullmatch(r"frame_(\d+)\.pdb", pdb_path.name)
+            if not m:
+                # Ignore helper/auxiliary PDBs (e.g., frame_initial_input.pdb) so
+                # --dock-filter frame indices map one-to-one to actual frame files.
+                continue
+            f_idx = int(m.group(1))
             dynamics_frames.append((f_idx, 0.0, str(pdb_path), pdb_str))
+        if not dynamics_frames:
+            print(
+                f"  Error: No frame_####.pdb files found in {frame_dir}. "
+                "Cannot run docking without valid frame snapshots."
+            )
+            return
         
         # We still need to run pocket detection if it was passed without dynamics
         if "pocket" in args.steps:
@@ -1343,7 +1488,7 @@ def main() -> None:
                     future = executor.submit(
                         _dock_frame_worker,
                         frame_index=f_idx, frame_time_ps=f_time, protein_pdb_path=p_path, protein_pdb_string=p_str,
-                        ligand_sdf_paths={}, name_map={}, active_names=[], inactive_names=[],
+                        ligand_sdf_paths={}, name_map={}, parent_smiles_map={}, active_names=[], inactive_names=[],
                         pocket_score_threshold=args.pocket_score_threshold, gnina_binary=args.gnina_binary,
                         exhaustiveness=args.exhaustiveness, num_modes=args.num_modes, cnn_scoring="none",
                         gnina_seed=args.gnina_seed, dry_run=args.dry_run, scoring_method=args.scoring_method,
@@ -1355,11 +1500,8 @@ def main() -> None:
             print(f"  [Phase 1] Pocket detection complete  [{_ts()}]  elapsed {_elapsed(_pocket_only_start)}", flush=True)
 
 
-    # PHASE 2: Docking & Scoring (GPU Heavy!)
-    do_dock = "docking" in args.steps or "scoring" in args.steps
-    if do_dock:
-        docking_steps = [s for s in args.steps if s in ("docking", "scoring")]
-
+    # PHASE 2A: Docking (GPU heavy; --dock-filter applies only here)
+    if "docking" in args.steps:
         dock_filter: dict[int, set[int] | None] | None = None
         if args.dock_filter:
             dock_filter = _parse_dock_filter(args.dock_filter)
@@ -1369,20 +1511,43 @@ def main() -> None:
             )
             print(f"  [dock-filter] Restricting to: {filter_desc}")
 
-        # Count how many frames will actually be dispatched so we can show X/N progress
         frames_to_dock = [
             (f_idx, f_time, p_path, p_str)
             for f_idx, f_time, p_path, p_str in dynamics_frames
             if dock_filter is None or f_idx in dock_filter
         ]
+        _dock_progress.update({"frames_done": 0, "poses_ok": 0, "poses_err": 0})
         _dock_total_frames[0] = len(frames_to_dock)
         _dock_phase_start[0] = time.monotonic()
 
-        print(f"\n  [Phase 2] Docking  [{_ts()}]  —  "
+        print(f"\n  [Phase 2A] Docking  [{_ts()}]  —  "
               f"{_dock_total_frames[0]} frames queued  |"
               f"  {max_docking_workers} workers × {gnina_cpu_threads} thread(s)  |"
               f"  GPU(s): {sorted(set(g for g in gpu_assignment if g is not None)) if num_gpus > 0 else 'CPU-only'}")
         print(f"  {'─' * 66}")
+
+        def on_docking_only_done(future):
+            try:
+                frame_results = future.result()
+                with results_lock:
+                    _dock_progress["frames_done"] += 1
+                    if frame_results:
+                        for r in frame_results:
+                            if r.status in ("ok", "refined"):
+                                _dock_progress["poses_ok"] += 1
+                            else:
+                                _dock_progress["poses_err"] += 1
+                                print(f"  [dock] FAILED frame={r.frame_index} pocket={r.pocket_id}: {r.error[:120]}")
+                    _print_dock_progress(_dock_progress, _dock_total_frames[0], _dock_phase_start[0])
+                sys.stdout.flush()
+            except Exception as exc:
+                import traceback
+                print(f"  [ERROR] docking worker crashed: {exc}\n{traceback.format_exc()}")
+                with results_lock:
+                    _dock_progress["frames_done"] += 1
+                    _print_dock_progress(_dock_progress, _dock_total_frames[0], _dock_phase_start[0])
+                sys.stdout.flush()
+
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=max_docking_workers,
             mp_context=multiprocessing.get_context("spawn"),
@@ -1392,26 +1557,84 @@ def main() -> None:
             worker_index = 0
             for f_idx, f_time, p_path, p_str in frames_to_dock:
                 pocket_filter_for_frame = dock_filter[f_idx] if dock_filter is not None else None
-                # Assign GPU round-robin so that (with N GPUs) consecutive
-                # workers cycle across all GPUs rather than piling onto GPU 0.
                 assigned_gpu = gpu_assignment[worker_index % max_docking_workers] if gpu_assignment else None
                 worker_index += 1
                 future = executor.submit(
                     _dock_frame_worker,
                     frame_index=f_idx, frame_time_ps=f_time, protein_pdb_path=p_path, protein_pdb_string=p_str,
-                    ligand_sdf_paths=ligand_sdf_paths, name_map=name_map, active_names=active_names, inactive_names=inactive_names,
+                    ligand_sdf_paths=ligand_sdf_paths, name_map=name_map, parent_smiles_map=parent_smiles_map, active_names=active_names, inactive_names=inactive_names,
                     pocket_score_threshold=args.pocket_score_threshold, gnina_binary=args.gnina_binary,
                     exhaustiveness=args.exhaustiveness, num_modes=args.num_modes, cnn_scoring=args.cnn_scoring,
                     gnina_seed=args.gnina_seed, dry_run=args.dry_run, scoring_method=args.scoring_method,
                     sar_metric=args.sar_metric, docking_output_dir=str(docking_output_dir), gnina_timeout_seconds=args.gnina_timeout_seconds,
-                    steps=docking_steps, project_output_dir=str(outdir),
+                    steps=["docking"], project_output_dir=str(outdir),
                     pocket_filter=pocket_filter_for_frame,
                     gnina_cpu_threads=gnina_cpu_threads,
                     gpu_id=assigned_gpu,
                 )
-                future.add_done_callback(on_dock_done)
+                future.add_done_callback(on_docking_only_done)
                 dock_futures.append(future)
             concurrent.futures.wait(dock_futures)
+
+    # PHASE 2B: Scoring (scan all existing docking_output frame/pocket folders)
+    if "scoring" in args.steps:
+        import re
+        frame_pocket_dirs = sorted((outdir / "docking_output").glob("frame*_pocket*"))
+        pockets_by_frame: dict[int, set[int]] = {}
+        for d in frame_pocket_dirs:
+            if not d.is_dir():
+                continue
+            m = re.fullmatch(r"frame(\d+)_pocket(\d+)", d.name)
+            if not m:
+                continue
+            f_idx = int(m.group(1))
+            p_idx = int(m.group(2))
+            pockets_by_frame.setdefault(f_idx, set()).add(p_idx)
+
+        frames_to_score: list[tuple[int, float, str, str, set[int] | None]] = []
+        for f_idx, pocket_ids in sorted(pockets_by_frame.items()):
+            frame_pdb_path = frame_dir / f"frame_{f_idx:04d}.pdb"
+            if not frame_pdb_path.is_file():
+                # Keep scoring robust for partial outputs; skip frames lacking a local snapshot.
+                continue
+            frame_pdb_str = frame_pdb_path.read_text()
+            frames_to_score.append((f_idx, 0.0, str(frame_pdb_path), frame_pdb_str, pocket_ids))
+
+        _dock_progress.update({"frames_done": 0, "poses_ok": 0, "poses_err": 0})
+        _dock_total_frames[0] = len(frames_to_score)
+        _dock_phase_start[0] = time.monotonic()
+
+        print(f"\n  [Phase 2B] Scoring  [{_ts()}]  —  "
+              f"{_dock_total_frames[0]} frames discovered in docking_output  |"
+              f"  filter scope: ALL docking_output entries")
+        print(f"  {'─' * 66}")
+
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_docking_workers,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=_worker_init,
+        ) as executor:
+            score_futures = []
+            worker_index = 0
+            for f_idx, f_time, p_path, p_str, scored_pockets in frames_to_score:
+                assigned_gpu = gpu_assignment[worker_index % max_docking_workers] if gpu_assignment else None
+                worker_index += 1
+                future = executor.submit(
+                    _dock_frame_worker,
+                    frame_index=f_idx, frame_time_ps=f_time, protein_pdb_path=p_path, protein_pdb_string=p_str,
+                    ligand_sdf_paths=ligand_sdf_paths, name_map=name_map, parent_smiles_map=parent_smiles_map, active_names=active_names, inactive_names=inactive_names,
+                    pocket_score_threshold=args.pocket_score_threshold, gnina_binary=args.gnina_binary,
+                    exhaustiveness=args.exhaustiveness, num_modes=args.num_modes, cnn_scoring=args.cnn_scoring,
+                    gnina_seed=args.gnina_seed, dry_run=args.dry_run, scoring_method=args.scoring_method,
+                    sar_metric=args.sar_metric, docking_output_dir=str(docking_output_dir), gnina_timeout_seconds=args.gnina_timeout_seconds,
+                    steps=["scoring"], project_output_dir=str(outdir),
+                    pocket_filter=scored_pockets,
+                    gnina_cpu_threads=gnina_cpu_threads,
+                    gpu_id=assigned_gpu,
+                )
+                future.add_done_callback(on_dock_done)
+                score_futures.append(future)
+            concurrent.futures.wait(score_futures)
 
     csv_fh.close()
 
@@ -1431,10 +1654,18 @@ def main() -> None:
     all_rows_sorted = sorted(all_rows, key=_summary_rank_key)
     _write_csv(summary_csv_path, all_rows_sorted, fieldnames=summary_fieldnames)
 
+    if "dynamics" in args.steps and args.dynamics_backend == "bioemu":
+        _complete_mid = (
+            f"{dynamics_frames_len} BioEmu samples, {len(all_rows)} poses assessed."
+        )
+    else:
+        _complete_mid = (
+            f"{dynamics_sim_time:.1f} ps simulated, "
+            f"{dynamics_frames_len} frames analyzed, {len(all_rows)} poses assessed."
+        )
     print(
         f"\n  ✓ All stages complete  [{_ts()}]  elapsed {_elapsed(pipeline_start)}: "
-        f"{dynamics_sim_time:.1f} ps simulated, "
-        f"{dynamics_frames_len} frames analyzed, {len(all_rows)} poses assessed."
+        f"{_complete_mid}"
     )
     sys.stdout.flush()
 
@@ -1564,9 +1795,9 @@ def main() -> None:
     else:
         print("  No successful poses – nothing to write.")
 
-    if dynamics_trajectory_dcd:
-        print(f"  Trajectory DCD  : {dynamics_trajectory_dcd}")
-        print(f"  Topology PDB    : {dynamics_topology_pdb}")
+    if dynamics_trajectory:
+        print(f"  Trajectory       : {dynamics_trajectory}")
+        print(f"  Topology PDB     : {dynamics_topology_pdb}")
 
     print("\n  Done.")
 
@@ -1583,7 +1814,7 @@ def _energy_for_topk_ranking(r: _FramePoseResult) -> float:
 _FIELDNAMES_SINGLE = [
     "status", "frame_index", "frame_time_ps",
     "pocket_id", "pocket_score",
-    "ligand_name", "cnn_vs", "cnn_affinity", "cnn_score", "vina_score", "auc_roc",
+    "ligand_name", "smiles", "cnn_vs", "cnn_affinity", "cnn_score", "vina_score", "auc_roc",
     "initial_energy_kj_per_mol", "final_energy_kj_per_mol",
     "interaction_energy_kj_per_mol",
     "ligand_rmsd_from_dock_angstrom",
@@ -1624,6 +1855,7 @@ def _to_row_single(r: _FramePoseResult) -> dict[str, Any]:
         "pocket_id": r.pocket_id,
         "pocket_score": f"{r.pocket_score:.3f}",
         "ligand_name": r.ligand_name,
+        "smiles": r.smiles or "",
         "cnn_vs": f"{r.cnn_vs:.3f}" if r.cnn_vs != "" else "",
         "cnn_affinity": f"{r.cnn_affinity:.3f}" if r.cnn_affinity != "" else "",
         "cnn_score": f"{r.cnn_score:.3f}" if r.cnn_score != "" else "",

@@ -1,12 +1,15 @@
-"""dynamics.py – Explicit-solvent OpenMM MD engine for Draco.
+"""dynamics.py – Conformation sampling for Draco (OpenMM MD and optional BioEmu).
 
 Role in the Pipeline
 --------------------
-This is the **first stage** of the Draco pipeline.  It takes a prepared
-protein PDB and runs a full explicit-solvent MD simulation on a CUDA GPU.
-During production MD it continuously monitors the protein backbone (Cα)
-RMSD and extracts a new **conformational frame** whenever the structure has
-drifted by more than *rmsd_threshold* Å from the last extracted frame.
+This is the **first stage** of the Draco pipeline.  By default it takes a
+prepared protein PDB and runs explicit-solvent MD on a CUDA GPU, monitoring
+backbone (Cα) RMSD and extracting frames when the structure drifts beyond
+*rmsd_threshold* Å from prior saved frames.
+
+Alternatively, :func:`run_bioemu_sampling` generates independent samples from
+the one-letter sequence inferred from the same prepared structure and loads
+``samples.xtc`` + ``topology.pdb`` into the same :class:`DynamicsFrame` objects.
 
 Extracted frames (protein-only, stripped of water/ions) are returned as
 :class:`DynamicsFrame` objects, which downstream stages consume:
@@ -42,6 +45,9 @@ Public API
 from __future__ import annotations
 
 import io
+import shutil
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -104,6 +110,41 @@ _SOLVENT_ION_RESNAMES = SOLVENT_ION_RESNAMES
 # TIP3P-FB uses the same 3-site geometry as TIP3P; parameters come from the FF XML.
 _MODELLER_SOLVENT_MODEL_ALIASES: dict[str, str] = {"tip3pfb": "tip3p"}
 
+# Standard and common alternate protonation / modified residue names → one-letter codes.
+_AA3_TO_1: dict[str, str] = {
+    "ALA": "A",
+    "ARG": "R",
+    "ASN": "N",
+    "ASP": "D",
+    "ASH": "D",
+    "CYS": "C",
+    "CYM": "C",
+    "CYX": "C",
+    "GLN": "Q",
+    "GLU": "E",
+    "GLH": "E",
+    "GLY": "G",
+    "HIS": "H",
+    "HID": "H",
+    "HIE": "H",
+    "HIP": "H",
+    "ILE": "I",
+    "LEU": "L",
+    "LYS": "K",
+    "LYN": "K",
+    "MET": "M",
+    "MSE": "M",
+    "PHE": "F",
+    "PRO": "P",
+    "SER": "S",
+    "THR": "T",
+    "TRP": "W",
+    "TYR": "Y",
+    "VAL": "V",
+    "SEC": "U",
+    "PYL": "O",
+}
+
 
 def _modeller_solvent_model(water_model: str) -> str:
     """Return the ``model=`` string required by ``Modeller.addSolvent``."""
@@ -116,7 +157,7 @@ def _modeller_solvent_model(water_model: str) -> str:
 
 @dataclass(frozen=True)
 class DynamicsFrame:
-    """A single conformational snapshot extracted from the MD trajectory.
+    """A single conformational snapshot from MD or BioEmu sampling.
 
     Only protein atoms are stored (water/ions stripped).  This object is
     everything the downstream pocketeer → overlay → minimization pipeline needs.
@@ -153,10 +194,10 @@ class DynamicsResult:
     """Conformationally distinct frames extracted during production MD."""
 
     trajectory_dcd: Path | None
-    """Path to the DCD trajectory file (full solvated system), or None if disabled."""
+    """Path to the trajectory file (OpenMM: DCD of the solvated system; BioEmu: ``samples.xtc``), or None if disabled."""
 
     topology_pdb: Path | None
-    """Path to a solvated-system topology PDB used as DCD reference, or None if disabled."""
+    """Path to a topology PDB for the trajectory (solvated system for MD, BioEmu ``topology.pdb``), or None if disabled."""
 
     prepared_protein: PreparedProtein
     """The PreparedProtein used for MD (re-use for per-frame minimization)."""
@@ -515,6 +556,161 @@ def run_dynamics(
         prepared_protein=prepared_protein,
         n_protein_atoms=n_protein_atoms,
         simulation_time_ps=production_time_ps,
+    )
+
+
+def protein_one_letter_sequence_from_prepared(prepared: PreparedProtein) -> str:
+    """Extract a one-letter amino-acid sequence from a prepared protein (in chain / residue order).
+
+    Skips solvent, ions, and other entries in :data:`draco.constants.SOLVENT_ION_RESNAMES`.
+    Unknown residue names are mapped to ``X`` so the length stays aligned with polymer residues.
+    """
+    letters: list[str] = []
+    for chain in prepared.topology.chains():
+        for res in chain.residues():
+            name = res.name.strip().upper()
+            if name in _SOLVENT_ION_RESNAMES:
+                continue
+            letters.append(_AA3_TO_1.get(name, "X"))
+    seq = "".join(letters)
+    if not seq:
+        raise ValueError(
+            "No protein residues found when extracting sequence from the prepared PDB "
+            "(check for ligands-only input or missing polymer residues)."
+        )
+    return seq
+
+
+def run_bioemu_sampling(
+    protein_input: str | Path | PreparedProtein,
+    *,
+    ph: float = 7.4,
+    num_samples: int = 10,
+    output_dir: str | Path | None = None,
+    save_trajectory: bool = True,
+    frame_callback: Callable[[DynamicsFrame], None] | None = None,
+    verbose: bool = True,
+) -> DynamicsResult:
+    """Run BioEmu conformational sampling and return :class:`DynamicsFrame` list compatible with the MD path.
+
+    Sequence is taken from the prepared input structure (same as :func:`run_dynamics` step 1).
+    BioEmu writes ``samples.xtc`` and ``topology.pdb`` under ``<output_dir>/bioemu/``; frames are
+    read with ``mdtraj`` (already a dependency of ``bioemu``).
+
+    Frame indices start at **1** (frame **0** is the initial prepared structure, written by the CLI).
+    """
+    if num_samples < 1:
+        raise ValueError("num_samples must be >= 1")
+
+    outdir = Path(output_dir) if output_dir else Path("dynamics_output")
+    outdir.mkdir(parents=True, exist_ok=True)
+    bioemu_dir = outdir / "bioemu"
+    if bioemu_dir.exists():
+        shutil.rmtree(bioemu_dir)
+    bioemu_dir.mkdir(parents=True, exist_ok=True)
+
+    log = _Logger(verbose)
+
+    if isinstance(protein_input, PreparedProtein):
+        log("── BioEmu: using pre-prepared protein …")
+        prepared_protein = protein_input
+    else:
+        log("── BioEmu: preparing protein (PDBFixer) …")
+        prepared_protein = prepare_protein(protein_input, ph=ph, output_dir=outdir)
+
+    sequence = protein_one_letter_sequence_from_prepared(prepared_protein)
+    log(f"   Extracted sequence ({len(sequence)} residues) for BioEmu.")
+
+    from bioemu.sample import main as bioemu_sample
+    import math
+
+    # BioEmu calculates: batch_size = int(batch_size_100 * (100 / len(sequence)) ** 2)
+    # For large proteins, default batch_size_100=10 can result in batch_size=0, crashing range()
+    seq_len = len(sequence)
+    target_batch_size = max(1, int(10 * (100 / seq_len) ** 2))
+    safe_batch_size_100 = int(math.ceil(target_batch_size * (seq_len / 100) ** 2))
+
+    log(f"   Running bioemu.sample API with {num_samples} samples...")
+    bioemu_sample(
+        sequence=sequence,
+        num_samples=num_samples,
+        output_dir=str(bioemu_dir),
+        batch_size_100=safe_batch_size_100,
+    )
+
+    xtc_path = bioemu_dir / "samples.xtc"
+    topo_path = bioemu_dir / "topology.pdb"
+    if not xtc_path.is_file() or not topo_path.is_file():
+        raise FileNotFoundError(
+            f"BioEmu did not produce samples.xtc and topology.pdb under {bioemu_dir}"
+        )
+
+    try:
+        import mdtraj as md  # type: ignore[import-untyped]
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "mdtraj is required to load BioEmu trajectories; it should be installed with bioemu."
+        ) from exc
+
+    traj = md.load_xtc(str(xtc_path), top=str(topo_path))
+    n_frames = traj.n_frames
+    n_atoms = traj.n_atoms
+    ca_idx = traj.topology.select("name CA")
+
+    extracted_frames: list[DynamicsFrame] = []
+    prev_ca: npt.NDArray[np.float64] | None = None
+
+    for i in range(n_frames):
+        slab = traj[i : i + 1]
+        tmp_pdb = outdir / f"_bioemu_frame_{i:06d}.pdb"
+        slab.save_pdb(str(tmp_pdb))
+        try:
+            protein_pdb_str = tmp_pdb.read_text()
+        finally:
+            tmp_pdb.unlink(missing_ok=True)
+
+        frame_atomarray = _biotite_pdb.PDBFile.read(io.StringIO(protein_pdb_str)).get_structure(
+            model=1
+        )
+        positions_nm = np.asarray(traj.xyz[i], dtype=np.float64)
+
+        if len(ca_idx) == 0:
+            rmsd_angstrom = 0.0
+        else:
+            ca_xyz = traj.xyz[i, ca_idx].astype(np.float64)
+            if prev_ca is None:
+                rmsd_angstrom = 0.0
+            else:
+                rmsd_angstrom = _rmsd(ca_xyz, prev_ca) * 10.0
+            prev_ca = ca_xyz
+
+        frame = DynamicsFrame(
+            frame_index=i + 1,
+            simulation_time_ps=float(i + 1),
+            rmsd_from_prev_angstrom=rmsd_angstrom,
+            protein_pdb_string=protein_pdb_str,
+            protein_positions_nm=positions_nm,
+            atomarray=frame_atomarray,
+        )
+        extracted_frames.append(frame)
+        if frame_callback:
+            frame_callback(frame)
+
+    if not save_trajectory:
+        xtc_path.unlink(missing_ok=True)
+        traj_path: Path | None = None
+    else:
+        traj_path = xtc_path
+
+    log(f"   BioEmu complete. Loaded {n_frames} sample structure(s).")
+
+    return DynamicsResult(
+        frames=extracted_frames,
+        trajectory_dcd=traj_path,
+        topology_pdb=topo_path,
+        prepared_protein=prepared_protein,
+        n_protein_atoms=n_atoms,
+        simulation_time_ps=float(n_frames),
     )
 
 

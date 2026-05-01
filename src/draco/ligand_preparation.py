@@ -7,13 +7,17 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import numpy.typing as npt
 
 from rdkit import Chem
 from rdkit.Chem import AllChem, rdMolDescriptors
+from rdkit.Chem.EnumerateStereoisomers import (
+    EnumerateStereoisomers,
+    StereoEnumerationOptions,
+)
 from rdkit.Chem.rdchem import Mol
 from rdkit.Chem.SaltRemover import SaltRemover
 from rdkit.Chem.MolStandardize import rdMolStandardize
@@ -126,6 +130,8 @@ def prepare_ligand_from_smiles(
     energy_cutoff: float = 5.0,
     enumerate_tautomers: bool = True,
     max_tautomers: int = 4,
+    enumerate_stereoisomers: bool = True,
+    max_stereoisomers: int = 16,
 ) -> PreparedLigand:
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
@@ -144,6 +150,8 @@ def prepare_ligand_from_smiles(
         energy_cutoff=energy_cutoff,
         enumerate_tautomers=enumerate_tautomers,
         max_tautomers=max_tautomers,
+        enumerate_stereoisomers=enumerate_stereoisomers,
+        max_stereoisomers=max_stereoisomers,
     )
 
 
@@ -159,6 +167,8 @@ def prepare_ligand_from_file(
     energy_cutoff: float = 5.0,
     enumerate_tautomers: bool = True,
     max_tautomers: int = 4,
+    enumerate_stereoisomers: bool = True,
+    max_stereoisomers: int = 16,
 ) -> PreparedLigand:
     path = Path(ligand_path)
     mol = _load_molecule_from_file(path)
@@ -175,6 +185,8 @@ def prepare_ligand_from_file(
         energy_cutoff=energy_cutoff,
         enumerate_tautomers=enumerate_tautomers,
         max_tautomers=max_tautomers,
+        enumerate_stereoisomers=enumerate_stereoisomers,
+        max_stereoisomers=max_stereoisomers,
     )
 
 
@@ -201,10 +213,18 @@ def _prepare_csv_row(
     energy_cutoff: float,
     enumerate_tautomers: bool,
     max_tautomers: int,
-) -> tuple[bool, str, PreparedLigand | None, str | None]:
+    enumerate_stereoisomers: bool,
+    max_stereoisomers: int,
+) -> tuple[bool | None, str, PreparedLigand | None, str | None]:
     name = row["name"].strip()
     smiles = row["smiles"].strip()
-    is_active = str(row["active"]).strip() in ("1", "true", "True", "yes")
+    activity_raw = str(row["active"]).strip()
+    if activity_raw == "1":
+        is_active: bool | None = True
+    elif activity_raw == "0":
+        is_active = False
+    else:
+        return None, name, None, f"invalid activity value '{activity_raw}' (expected 0 or 1)"
 
     try:
         prep = prepare_ligand_from_smiles(
@@ -215,10 +235,44 @@ def _prepare_csv_row(
             energy_cutoff=energy_cutoff,
             enumerate_tautomers=enumerate_tautomers,
             max_tautomers=max_tautomers,
+            enumerate_stereoisomers=enumerate_stereoisomers,
+            max_stereoisomers=max_stereoisomers,
         )
         return is_active, name, prep, None
     except Exception as e:
         return is_active, name, None, str(e)
+
+
+def _prepare_screening_csv_row(
+    row: dict[str, str],
+    num_conformers: int,
+    prune_rms_threshold: float,
+    random_seed: int,
+    energy_cutoff: float,
+    enumerate_tautomers: bool,
+    max_tautomers: int,
+    enumerate_stereoisomers: bool,
+    max_stereoisomers: int,
+) -> tuple[str, PreparedLigand | None, str | None]:
+    name = row["name"].strip()
+    smiles = row["smiles"].strip()
+
+    try:
+        prep = prepare_ligand_from_smiles(
+            smiles,
+            name=name,
+            num_conformers=num_conformers,
+            prune_rms_threshold=prune_rms_threshold,
+            random_seed=random_seed,
+            energy_cutoff=energy_cutoff,
+            enumerate_tautomers=enumerate_tautomers,
+            max_tautomers=max_tautomers,
+            enumerate_stereoisomers=enumerate_stereoisomers,
+            max_stereoisomers=max_stereoisomers,
+        )
+        return name, prep, None
+    except Exception as e:
+        return name, None, str(e)
 
 
 def load_compound_csv(
@@ -230,16 +284,23 @@ def load_compound_csv(
     energy_cutoff: float = 5.0,
     enumerate_tautomers: bool = True,
     max_tautomers: int = 4,
+    enumerate_stereoisomers: bool = True,
+    max_stereoisomers: int = 16,
+    name_column: str = "name",
+    smiles_column: str = "smiles",
+    activity_column: str = "active",
+    on_prepared: Callable[[PreparedLigand, str], None] | None = None,
 ) -> tuple[list[PreparedLigand], list[PreparedLigand], dict[str, str]]:
     """Load a compound CSV and return (actives, inactives, name_map).
 
     The returned ``name_map`` maps each state-level name back to the parent
     compound name (identity mapping now that protonation states are removed).
 
-    CSV format (required columns):
+    CSV format (required columns by default):
         name,smiles,active
         compound_A,CCOc1ccc(...)cc1,1
         inactive_1,CCCCCC,0
+    Rows with ``active`` values other than ``0`` or ``1`` are skipped with a warning.
 
     Parameters
     ----------
@@ -247,6 +308,12 @@ def load_compound_csv(
         Path to the CSV file.
     num_conformers / prune_rms_threshold / random_seed / energy_cutoff:
         Forwarded to ligand preparation.
+    name_column / smiles_column / activity_column:
+        CSV column names to use for parent ligand name, SMILES, and activity
+        label respectively.
+    on_prepared:
+        Optional callback invoked in the parent process for each successfully
+        prepared ligand as ``on_prepared(prepared_ligand, parent_name)``.
 
     Returns
     -------
@@ -259,15 +326,22 @@ def load_compound_csv(
     inactives: list[PreparedLigand] = []
     name_map: dict[str, str] = {}  # state_name → parent_name
 
-    with path.open(newline="", encoding="utf-8") as fh:
+    with path.open(newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
-        required = {"name", "smiles", "active"}
+        required = {name_column, smiles_column, activity_column}
         if reader.fieldnames is None or not required.issubset(reader.fieldnames):
             raise ValueError(
                 f"Compound CSV {path} must have columns: {required}. "
                 f"Found: {reader.fieldnames}"
             )
-        rows = list(reader)
+        rows = [
+            {
+                "name": str(row[name_column]),
+                "smiles": str(row[smiles_column]),
+                "active": str(row[activity_column]),
+            }
+            for row in reader
+        ]
 
     import concurrent.futures
     import functools
@@ -281,6 +355,8 @@ def load_compound_csv(
         energy_cutoff=energy_cutoff,
         enumerate_tautomers=enumerate_tautomers,
         max_tautomers=max_tautomers,
+        enumerate_stereoisomers=enumerate_stereoisomers,
+        max_stereoisomers=max_stereoisomers,
     )
 
     max_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
@@ -290,16 +366,111 @@ def load_compound_csv(
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         for is_active, name, prep, err in executor.map(worker, rows):
             if err is not None:
-                _log.warning("Failed to prepare ligand '%s': %s", name, err)
+                if is_active is None:
+                    _log.warning("Skipping ligand '%s': %s", name, err)
+                else:
+                    _log.warning("Failed to prepare ligand '%s': %s", name, err)
                 continue
             assert prep is not None
+            assert is_active is not None
             name_map[prep.name] = name
+            if on_prepared is not None:
+                on_prepared(prep, name)
             if is_active:
                 actives.append(prep)
             else:
                 inactives.append(prep)
 
     return actives, inactives, name_map
+
+
+def load_screening_csv(
+    csv_path: str | os.PathLike[str],
+    *,
+    num_conformers: int = 10,
+    prune_rms_threshold: float = 1.0,
+    random_seed: int = 0xF00D,
+    energy_cutoff: float = 5.0,
+    enumerate_tautomers: bool = True,
+    max_tautomers: int = 4,
+    enumerate_stereoisomers: bool = True,
+    max_stereoisomers: int = 16,
+    name_column: str = "name",
+    smiles_column: str = "smiles",
+    on_prepared: Callable[[PreparedLigand, str], None] | None = None,
+) -> tuple[list[PreparedLigand], dict[str, str]]:
+    """Load an unlabeled screening CSV and return (ligands, name_map).
+
+    CSV format (required columns by default):
+        name,smiles
+        compound_A,CCOc1ccc(...)cc1
+        compound_B,CCCCCC
+
+    Returns
+    -------
+    tuple[list[PreparedLigand], dict[str, str]]
+        ``(ligands, name_map)`` where ``name_map`` maps
+        ``state_name → parent_name``.
+
+    Parameters
+    ----------
+    name_column / smiles_column:
+        CSV column names to use for parent ligand name and SMILES.
+    on_prepared:
+        Optional callback invoked in the parent process for each successfully
+        prepared ligand as ``on_prepared(prepared_ligand, parent_name)``.
+    """
+    path = Path(csv_path)
+    ligands: list[PreparedLigand] = []
+    name_map: dict[str, str] = {}
+
+    with path.open(newline="", encoding="utf-8-sig") as fh:
+        reader = csv.DictReader(fh)
+        required = {name_column, smiles_column}
+        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+            raise ValueError(
+                f"Screening CSV {path} must have columns: {required}. "
+                f"Found: {reader.fieldnames}"
+            )
+        rows = [
+            {
+                "name": str(row[name_column]),
+                "smiles": str(row[smiles_column]),
+            }
+            for row in reader
+        ]
+
+    import concurrent.futures
+    import functools
+    import os
+
+    worker = functools.partial(
+        _prepare_screening_csv_row,
+        num_conformers=num_conformers,
+        prune_rms_threshold=prune_rms_threshold,
+        random_seed=random_seed,
+        energy_cutoff=energy_cutoff,
+        enumerate_tautomers=enumerate_tautomers,
+        max_tautomers=max_tautomers,
+        enumerate_stereoisomers=enumerate_stereoisomers,
+        max_stereoisomers=max_stereoisomers,
+    )
+
+    max_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
+    max_workers = max(1, max_workers - 1)
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        for name, prep, err in executor.map(worker, rows):
+            if err is not None:
+                _log.warning("Failed to prepare ligand '%s': %s", name, err)
+                continue
+            assert prep is not None
+            name_map[prep.name] = name
+            if on_prepared is not None:
+                on_prepared(prep, name)
+            ligands.append(prep)
+
+    return ligands, name_map
 
 
 def write_ligand_sdf(
@@ -421,42 +592,52 @@ def _prepare_ligand_mol(
     energy_cutoff: float,
     enumerate_tautomers: bool,
     max_tautomers: int,
+    enumerate_stereoisomers: bool,
+    max_stereoisomers: int,
 ) -> PreparedLigand:
     mol = _strip_salts(mol)
     
     tautomer_mols = _enumerate_tautomers_limited(mol, enumerate_tautomers, max_tautomers)
     canonical_smiles = Chem.MolToSmiles(Chem.RemoveHs(Chem.Mol(mol)))
     prepared_conformers: list[PreparedLigandConformer] = []
+    state_index = 0
 
-    for tautomer_index, tautomer in enumerate(tautomer_mols):
-        mol_with_h = Chem.AddHs(Chem.Mol(tautomer))
-        
-        conformer_ids = _embed_conformers(mol_with_h, num_conformers, random_seed + tautomer_index)
-        if not conformer_ids:
-            continue
-
-        if optimize:
-            energies = _optimize_conformers(mol_with_h, conformer_ids, max_iterations)
-        else:
-            energies = _calc_unoptimized_energies(mol_with_h, conformer_ids)
-
-        keep_cids = _filter_and_prune_conformers(
-            mol_with_h, energies, energy_cutoff, prune_rms_threshold
+    for tautomer in tautomer_mols:
+        stereoisomer_mols = _enumerate_stereoisomers_limited(
+            tautomer, enumerate_stereoisomers, max_stereoisomers
         )
+        for stereoisomer in stereoisomer_mols:
+            mol_with_h = Chem.AddHs(Chem.Mol(stereoisomer))
 
-        for conf_id in keep_cids:
-            extracted = _extract_conformer(mol_with_h, conf_id)
-            prepared_conformers.append(
-                PreparedLigandConformer(
-                    conformer_id=len(prepared_conformers),
-                    all_atom_coords=extracted.all_atom_coords,
-                    atom_symbols=extracted.atom_symbols,
-                    bonds=extracted.bonds,
-                    heavy_atom_indices=extracted.heavy_atom_indices,
-                    shape_atom_radii=extracted.shape_atom_radii,
-                    mol_block=extracted.mol_block,
-                )
+            conformer_ids = _embed_conformers(
+                mol_with_h, num_conformers, random_seed + state_index
             )
+            state_index += 1
+            if not conformer_ids:
+                continue
+
+            if optimize:
+                energies = _optimize_conformers(mol_with_h, conformer_ids, max_iterations)
+            else:
+                energies = _calc_unoptimized_energies(mol_with_h, conformer_ids)
+
+            keep_cids = _filter_and_prune_conformers(
+                mol_with_h, energies, energy_cutoff, prune_rms_threshold
+            )
+
+            for conf_id in keep_cids:
+                extracted = _extract_conformer(mol_with_h, conf_id)
+                prepared_conformers.append(
+                    PreparedLigandConformer(
+                        conformer_id=len(prepared_conformers),
+                        all_atom_coords=extracted.all_atom_coords,
+                        atom_symbols=extracted.atom_symbols,
+                        bonds=extracted.bonds,
+                        heavy_atom_indices=extracted.heavy_atom_indices,
+                        shape_atom_radii=extracted.shape_atom_radii,
+                        mol_block=extracted.mol_block,
+                    )
+                )
 
     if not prepared_conformers:
         raise ValueError(f"RDKit failed to embed conformers for ligand '{name}'")
@@ -493,12 +674,33 @@ def _enumerate_tautomers_limited(mol: Mol, enumerate_tautomers: bool, max_tautom
     return _enumerate_tautomer_molecules(mol, max_tautomers=max_tautomers)
 
 
+def _enumerate_stereoisomers_limited(
+    mol: Mol, enumerate_stereoisomers: bool, max_stereoisomers: int
+) -> list[Mol]:
+    if not enumerate_stereoisomers:
+        return [Chem.RemoveHs(Chem.Mol(mol))]
+    return _enumerate_stereoisomer_molecules(mol, max_stereoisomers=max_stereoisomers)
+
+
 def _enumerate_tautomer_molecules(mol: Mol, max_tautomers: int) -> list[Mol]:
     enumerator = rdMolStandardize.TautomerEnumerator()
     # Enumerate generates tautomers; we take up to max_tautomers.
     # Note: Enumerate returns a TautomerEnumeratorResult which is iterable.
     tautomers = enumerator.Enumerate(mol)
     return [t for i, t in enumerate(tautomers) if i < max_tautomers]
+
+
+def _enumerate_stereoisomer_molecules(mol: Mol, max_stereoisomers: int) -> list[Mol]:
+    options = StereoEnumerationOptions(
+        tryEmbedding=False,
+        unique=True,
+        onlyUnassigned=False,
+        maxIsomers=max_stereoisomers,
+    )
+    stereoisomers = list(EnumerateStereoisomers(mol, options=options))
+    if not stereoisomers:
+        return [Chem.RemoveHs(Chem.Mol(mol))]
+    return [Chem.RemoveHs(Chem.Mol(iso)) for iso in stereoisomers]
 
 
 def _embed_conformers(mol_with_h: Mol, num_conformers: int, seed: int) -> list[int]:
