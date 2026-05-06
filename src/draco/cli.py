@@ -1,4 +1,4 @@
-"""cli.py – Entry point for the Draco pipeline: conformation sampling + GNINA docking.
+"""cli.py – Entry point for the Draco pipeline: conformation sampling + GNINA/Glide docking.
 
 Pipeline
 --------
@@ -161,12 +161,13 @@ import numpy as np
 
 from draco.dynamics import DynamicsFrame, DynamicsResult, run_bioemu_sampling, run_dynamics
 from draco.docking import (
-    DockingBox, GninaDockResult, PocketDockResult,
-    dock_ligands_to_pocket,
+    DockingBox, GlideDockResult, GninaDockResult, PocketDockResult,
+    dock_ligands_to_pocket, dock_ligands_to_pocket_glide,
 )
 from draco.ligand_preparation import (
     PreparedLigand, prepare_ligand_from_smiles,
     load_compound_csv, load_screening_csv, write_ligand_sdf, write_ligands_for_docking,
+    prepare_ligands_for_glide,
 )
 from draco.refinement import RefinementResult, refine_docked_pose
 from draco.sar_scoring import SARScoreResult, compute_sar_discrimination
@@ -318,14 +319,75 @@ def parse_args() -> argparse.Namespace:
     pocket_grp.add_argument("--energy-cutoff", type=float, default=5.0, help="Energy cutoff (kcal/mol) for conformer pruning.")
     pocket_grp.add_argument("--ligand-name", default="LIG", help="Name for --ligand-smiles compound.")
 
-    # ── GNINA Docking Parameters ──────────────────────────────────────────────
-    docking_grp = parser.add_argument_group("GNINA Docking Parameters")
+    # ── GNINA / Glide Docking Parameters ─────────────────────────────────────
+    docking_grp = parser.add_argument_group("Docking Parameters")
+    docking_grp.add_argument(
+        "--docking-engine",
+        default="adgpu_gnina",
+        choices=["adgpu_gnina", "gnina", "glide"],
+        help="Docking engine to use. 'adgpu_gnina' (default), 'gnina', or 'glide' (Schrödinger). "
+             "When 'glide' is selected, ligand preparation switches to LigPrep.",
+    )
+    # GNINA-specific
     docking_grp.add_argument("--gnina-binary", default="gnina", help="Path or name of the gnina binary.")
     docking_grp.add_argument("--exhaustiveness", type=int, default=8, help="GNINA exhaustiveness.")
-    docking_grp.add_argument("--num-modes", type=int, default=9, help="Number of docked poses per ligand.")
+    docking_grp.add_argument("--num-modes", type=int, default=9, help="Number of docked poses per ligand (GNINA).")
     docking_grp.add_argument("--cnn-scoring", default="rescore", choices=["rescore", "refinement", "none"], help="GNINA CNN scoring mode.")
     docking_grp.add_argument("--gnina-seed", type=int, default=0, help="Random seed for GNINA.")
     docking_grp.add_argument("--gnina-timeout-seconds", type=int, default=None, metavar="N", help="Wall-clock limit per GNINA subprocess (seconds).")
+    # Glide-specific
+    docking_grp.add_argument("--glide-binary", default=None, metavar="PATH", help="Path to Glide binary (default: $SCHRODINGER/glide).")
+    docking_grp.add_argument("--ligprep-binary", default=None, metavar="PATH", help="Path to LigPrep binary (default: $SCHRODINGER/ligprep). Used when --docking-engine glide.")
+    docking_grp.add_argument("--glide-precision", default="SP", choices=["HTVS", "SP", "XP"], help="Glide docking precision (default SP).")
+    docking_grp.add_argument("--glide-num-poses", type=int, default=5, metavar="N", help="Number of Glide output poses per ligand (default 5).")
+    docking_grp.add_argument("--glide-timeout-seconds", type=int, default=600, metavar="N", help="Wall-clock limit per Glide subprocess (default 600 s).")
+    # AutoDock-GPU + GNINA rescoring (adgpu_gnina engine)
+    docking_grp.add_argument(
+        "--adgpu-binary",
+        default="adgpu",
+        help="AutoDock-GPU executable name or path (--docking-engine adgpu_gnina).",
+    )
+    docking_grp.add_argument(
+        "--autogrid-binary",
+        default="autogrid4",
+        help="AutoGrid4 executable (--docking-engine adgpu_gnina).",
+    )
+    docking_grp.add_argument(
+        "--mk-prepare-receptor-binary",
+        default="mk_prepare_receptor.py",
+        help="Meeko mk_prepare_receptor.py script (--docking-engine adgpu_gnina).",
+    )
+    docking_grp.add_argument(
+        "--mk-prepare-ligand-binary",
+        default="mk_prepare_ligand.py",
+        help="Meeko mk_prepare_ligand.py script (--docking-engine adgpu_gnina).",
+    )
+    docking_grp.add_argument(
+        "--adgpu-nrun",
+        type=int,
+        default=None,
+        metavar="N",
+        help="AutoDock-GPU --nrun (poses per ligand conformer). Default: max(--num-modes, 9).",
+    )
+    docking_grp.add_argument(
+        "--adgpu-timeout-seconds",
+        type=int,
+        default=3600,
+        metavar="N",
+        help="Wall-clock limit per AutoDock-GPU subprocess (--docking-engine adgpu_gnina).",
+    )
+    docking_grp.add_argument(
+        "--adgpu-grid-timeout-seconds",
+        type=int,
+        default=1800,
+        metavar="N",
+        help="Wall-clock limit for Meeko receptor prep + AutoGrid4 (--docking-engine adgpu_gnina).",
+    )
+    docking_grp.add_argument(
+        "--adgpu-delete-bad-res",
+        action="store_true",
+        help="Pass --delete_bad_res to mk_prepare_receptor.py (--docking-engine adgpu_gnina).",
+    )
     docking_grp.add_argument(
         "--dock-filter",
         nargs="+",
@@ -339,15 +401,36 @@ def parse_args() -> argparse.Namespace:
             "If omitted entirely, all frames and pockets are docked."
         ),
     )
-    docking_grp.add_argument("--scoring-method", default="cnn_vs", choices=["cnn_vs", "cnn_affinity", "cnn_score", "vina_score"], help="Which GNINA metric to use for ranking poses and computing SAR.")
+    docking_grp.add_argument("--scoring-method", default="cnn_vs", choices=["cnn_vs", "cnn_affinity", "cnn_score", "vina_score", "glide_score"], help="Which docking metric to use for ranking poses and SAR. Use 'glide_score' with --docking-engine glide.")
     docking_grp.add_argument(
         "--sar-metric",
         default="auc_roc",
         choices=["auc_roc", "auc_pr", "enrichment_1pct", "enrichment_5pct", "enrichment_10pct"],
         help="Metric to rank poses by in 'sar' mode. Defaults to auc_roc.",
     )
-    docking_grp.add_argument("--max-docking-workers", type=int, default=None, help="Maximum concurrent GNINA instances. Defaults to min(4, CPU_COUNT//4).")
+    docking_grp.add_argument(
+        "--max-docking-workers",
+        type=int,
+        default=None,
+        help=(
+            "Maximum concurrent docking workers. For --docking-engine gnina/glide, defaults to "
+            "2×(max(1, num_gpus)). For adgpu_gnina (GPU-heavy), defaults to 1 to avoid oversubscribing "
+            "the GPU unless you override this explicitly."
+        ),
+    )
     docking_grp.add_argument("--gnina-cpu", type=int, default=None, metavar="N", help="CPU threads per GNINA call for Vina sampling. Auto-computed as CPU_COUNT // docking_workers when omitted (recommended).")
+    docking_grp.add_argument(
+        "--n-cpus",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Number of CPU cores available for Glide/LigPrep jobs. "
+            "Controls LigPrep parallelism (max_workers=N) and per-Glide-job CPU count "
+            "(-HOST localhost:N). On SLURM nodes set this to $SLURM_CPUS_PER_TASK to avoid "
+            "CPU detection issues. Defaults to SLURM_CPUS_PER_TASK env var or os.cpu_count()."
+        ),
+    )
 
     # ── Refinement Parameters ───────────────────────────────────────────────────
     refine_grp = parser.add_argument_group("Refinement Parameters")
@@ -378,6 +461,9 @@ def parse_args() -> argparse.Namespace:
     if args.bioemu_num_samples < 1:
         parser.error("--bioemu-num-samples must be >= 1.")
 
+    if args.scoring_method == "glide_score" and args.docking_engine != "glide":
+        parser.error("--scoring-method glide_score requires --docking-engine glide.")
+
     return args
 
 
@@ -394,11 +480,12 @@ class _FramePoseResult:
     pocket_score: float          # pocketeer score
     ligand_name: str             # name of the docked compound
     cnn_affinity: float          # best GNINA CNN affinity (pK; higher = better)
-    vina_score: float            # best GNINA Vina score
-    cnn_score: float             # best GNINA CNN pose score (0-1)
-    cnn_vs: float                # best GNINA CNN VS score (0-1)
+    vina_score: float            # best GNINA Vina score / Glide GlideScore (lower = better)
+    cnn_score: float             # best GNINA CNN pose score (0-1); 0.0 for Glide
+    cnn_vs: float                # best GNINA CNN VS score (0-1); 0.0 for Glide
     auc_roc: float | None        # SAR discrimination metric (None in single-compound mode)
     docked_sdf_block: str = ""   # The SDF block of the docked pose
+    docking_engine: str = "adgpu_gnina"  # 'adgpu_gnina'/'gnina' or 'glide'
     # Post-refinement fields (filled only for top-K poses)
     initial_energy_kj_per_mol: float = 0.0
     final_energy_kj_per_mol: float = 0.0
@@ -428,11 +515,10 @@ class _TopKHeap:
             return sar_val if sar_val is not None else result.cnn_vs
 
         # In single mode, the ranking metric is the primary scoring method.
-        # Note: vina_score is lower-is-better, but we want to maximize the rank score.
-        # So if ranking_metric is vina_score, we must negate it so that the heap works correctly (it's a min-heap tracking the worst retained entry)
-        # Actually, higher=better is assumed by _TopKHeap logic.
+        # For lower-is-better metrics (vina_score, glide_score) we negate so
+        # the heap always maximises the rank score.
         val = getattr(result, self.ranking_metric)
-        if self.ranking_metric == "vina_score":
+        if self.ranking_metric in ("vina_score", "glide_score"):
             return -val
         return val
 
@@ -534,7 +620,7 @@ def _dock_frame_worker(
     frame_time_ps: float,
     protein_pdb_path: str,       # path to temp PDB file for this frame
     protein_pdb_string: str,     # PDB text (kept for passing forward)
-    ligand_sdf_paths: dict[str, str],  # {state_name: sdf_path_str}
+    ligand_sdf_paths: dict[str, str],  # {state_name: sdf_path_str} — GNINA mode
     name_map: dict[str, str],          # {state_name: parent_ligand_name}
     parent_smiles_map: dict[str, str], # {parent_ligand_name: canonical_smiles}
     active_names: list[str],           # parent-level active names
@@ -555,8 +641,25 @@ def _dock_frame_worker(
     pocket_filter: set[int] | None = None,
     gnina_cpu_threads: int = 1,
     gpu_id: int | None = None,
+    # Glide engine parameters
+    docking_engine: str = "adgpu_gnina",
+    glide_binary: str | None = None,
+    glide_precision: str = "SP",
+    glide_num_poses: int = 5,
+    glide_timeout_seconds: int = 600,
+    glide_n_cpus: int | None = None,  # forwarded as -HOST localhost:N
+    ligand_maegz_paths: dict[str, str] | None = None,  # {state_name: maegz_path_str} — Glide mode
+    # AutoDock-GPU + GNINA (adgpu_gnina engine)
+    adgpu_binary: str = "adgpu",
+    autogrid_binary: str = "autogrid4",
+    mk_prepare_receptor_binary: str = "mk_prepare_receptor.py",
+    mk_prepare_ligand_binary: str = "mk_prepare_ligand.py",
+    adgpu_nrun: int | None = None,
+    adgpu_timeout_seconds: int | None = None,
+    adgpu_grid_timeout_seconds: int | None = None,
+    adgpu_delete_bad_res: bool = False,
 ) -> list[_FramePoseResult]:
-    """Worker: Detect pockets, dock all ligands with GNINA, compute SAR score.
+    """Worker: Detect pockets, dock all ligands (GNINA or Glide), compute SAR score.
 
     All protonation states of each parent ligand are docked. Scores are
     aggregated to report the **best score per parent ligand** for SAR
@@ -573,7 +676,10 @@ def _dock_frame_worker(
     if gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
-    from draco.docking import DockingBox, dock_ligands_to_pocket
+    from draco.docking import (
+        DockingBox, PocketDockResult,
+        dock_ligands_to_pocket, dock_ligands_to_pocket_adgpu_gnina, dock_ligands_to_pocket_glide,
+    )
     from draco.pocket import (
         docking_box_from_pocket,
         find_pockets_above_threshold,
@@ -581,7 +687,6 @@ def _dock_frame_worker(
         write_pocket_artifact_for_frame,
     )
     from draco.sar_scoring import compute_sar_discrimination
-    from draco.docking import PocketDockResult
 
     if dry_run:
         return []
@@ -601,7 +706,7 @@ def _dock_frame_worker(
             return [_FramePoseResult(
                 frame_index=frame_index, frame_time_ps=frame_time_ps,
                 pocket_id=-1, pocket_score=0.0, ligand_name="",
-                cnn_affinity=0.0, vina_score=0.0, auc_roc=None,
+                cnn_affinity=0.0, vina_score=0.0, cnn_score=0.0, cnn_vs=0.0, auc_roc=None,
                 status="error", error=f"Pocketeer failed: {exc}\n{traceback.format_exc()}"
             )]
         if project_output_dir:
@@ -653,30 +758,95 @@ def _dock_frame_worker(
 
         try:
             if "docking" not in steps and out_dir_str:
-                import draco.docking as docking
-                pocket_dock = docking.PocketDockResult(pocket_id=pocket_id, docking_box=box)
-                for name, sdf_path in ligand_sdf_paths.items():
-                    out_sdf = Path(out_dir_str) / f"{name}.gnina.sdf"
-                    if out_sdf.exists():
-                        pocket_dock.results[name] = docking._parse_gnina_sdf(out_sdf.read_text(), ligand_name=name)
-                    else:
-                        pocket_dock.results[name] = []
+                import draco.docking as docking_mod
+                pocket_dock = docking_mod.PocketDockResult(pocket_id=pocket_id, docking_box=box)
+                if docking_engine == "glide":
+                    # Reload Glide poses SDF from disk
+                    _lig_paths = ligand_maegz_paths or {}
+                    for name in _lig_paths:
+                        glide_sdf = Path(out_dir_str) / f"{name}.glide_lib.sdf"
+                        if glide_sdf.exists():
+                            pocket_dock.results[name] = docking_mod._parse_glide_sdf(
+                                glide_sdf.read_text(), ligand_name=name
+                            )
+                        else:
+                            pocket_dock.results[name] = []
+                else:
+                    for name, sdf_path in ligand_sdf_paths.items():
+                        out_sdf = Path(out_dir_str) / f"{name}.gnina.sdf"
+                        if out_sdf.exists():
+                            pocket_dock.results[name] = docking_mod._parse_gnina_sdf(
+                                out_sdf.read_text(), ligand_name=name
+                            )
+                        else:
+                            pocket_dock.results[name] = []
             elif "docking" in steps:
-                pocket_dock = dock_ligands_to_pocket(
-                    protein_pdb_path,
-                    {n: __import__('pathlib').Path(p) for n, p in ligand_sdf_paths.items()},
-                    box,
-                    pocket_id=pocket_id,
-                    gnina_binary=gnina_binary,
-                    exhaustiveness=exhaustiveness,
-                    num_modes=num_modes,
-                    cnn_scoring=cnn_scoring,
-                    seed=gnina_seed,
-                    cpu=gnina_cpu_threads,
-                    timeout_seconds=gnina_timeout_seconds,
-                    output_dir=out_dir_str,
-                    write_gnina_logs=True,
-                )
+                if docking_engine == "glide":
+                    _maegz_map = {
+                        n: __import__('pathlib').Path(p)
+                        for n, p in (ligand_maegz_paths or {}).items()
+                    }
+                    pocket_dock = dock_ligands_to_pocket_glide(
+                        protein_pdb_path,
+                        _maegz_map,
+                        box,
+                        pocket_id=pocket_id,
+                        precision=glide_precision,
+                        num_poses=glide_num_poses,
+                        glide_binary=glide_binary,
+                        timeout_seconds=glide_timeout_seconds,
+                        output_dir=out_dir_str,
+                        write_glide_logs=True,
+                        n_cpus=glide_n_cpus,
+                    )
+                    # Persist parsed poses as canonical SDF files so the
+                    # scoring-only pass can reload them without re-docking.
+                    if out_dir_str:
+                        for lig_name, poses in pocket_dock.results.items():
+                            if poses:
+                                sdf_out = Path(out_dir_str) / f"{lig_name}.glide_lib.sdf"
+                                sdf_out.write_text(
+                                    "".join(p.pose_sdf_block for p in poses)
+                                )
+                elif docking_engine == "adgpu_gnina":
+                    pocket_dock = dock_ligands_to_pocket_adgpu_gnina(
+                        protein_pdb_path,
+                        {n: __import__('pathlib').Path(p) for n, p in ligand_sdf_paths.items()},
+                        box,
+                        pocket_id=pocket_id,
+                        gnina_binary=gnina_binary,
+                        cnn_scoring=cnn_scoring,
+                        seed=gnina_seed,
+                        cpu=gnina_cpu_threads,
+                        num_modes=num_modes,
+                        adgpu_nrun=adgpu_nrun,
+                        gnina_timeout_seconds=gnina_timeout_seconds,
+                        adgpu_timeout_seconds=adgpu_timeout_seconds,
+                        adgpu_grid_timeout_seconds=adgpu_grid_timeout_seconds,
+                        output_dir=out_dir_str,
+                        write_gnina_logs=True,
+                        adgpu_binary=adgpu_binary,
+                        autogrid_binary=autogrid_binary,
+                        mk_prepare_receptor=mk_prepare_receptor_binary,
+                        mk_prepare_ligand=mk_prepare_ligand_binary,
+                        adgpu_delete_bad_res=adgpu_delete_bad_res,
+                    )
+                else:
+                    pocket_dock = dock_ligands_to_pocket(
+                        protein_pdb_path,
+                        {n: __import__('pathlib').Path(p) for n, p in ligand_sdf_paths.items()},
+                        box,
+                        pocket_id=pocket_id,
+                        gnina_binary=gnina_binary,
+                        exhaustiveness=exhaustiveness,
+                        num_modes=num_modes,
+                        cnn_scoring=cnn_scoring,
+                        seed=gnina_seed,
+                        cpu=gnina_cpu_threads,
+                        timeout_seconds=gnina_timeout_seconds,
+                        output_dir=out_dir_str,
+                        write_gnina_logs=True,
+                    )
             else:
                 pocket_dock = PocketDockResult(pocket_id=pocket_id, docking_box=box)
         except Exception as exc:
@@ -684,27 +854,44 @@ def _dock_frame_worker(
             results.append(_FramePoseResult(
                 frame_index=frame_index, frame_time_ps=frame_time_ps,
                 pocket_id=pocket_id, pocket_score=pocket_score, ligand_name="",
-                cnn_affinity=0.0, vina_score=0.0, auc_roc=None,
-                status="error", error=f"GNINA failed pocket {pocket_id}: {exc}\n{traceback.format_exc()}"
+                cnn_affinity=0.0, vina_score=0.0, cnn_score=0.0, cnn_vs=0.0, auc_roc=None,
+                docking_engine=docking_engine,
+                status="error", error=f"Docking failed pocket {pocket_id}: {exc}\n{traceback.format_exc()}"
             ))
             continue
 
         # ── Aggregate best score per parent ligand ─────────────────────────
         # pocket_dock.results keys are state-level names (e.g. "LIG_s0").
         # We group by parent name and pick the best pose (by scoring_method) per parent.
+        # For Glide results: glide_score maps to vina_score slot; CNN fields = 0.
         parent_best: dict[str, tuple[float, float, float, float, float, str]] = {}  # parent -> (best_scoring_metric, cnn_affinity, vina_score, cnn_score, cnn_vs, best_sdf)
+        _lower_is_better = scoring_method in ("vina_score", "glide_score")
         for state_name, poses in pocket_dock.results.items():
             if not poses:
                 continue
             parent = name_map.get(state_name, state_name)
 
             # Find the best pose for this state by the requested scoring method
-            if scoring_method == "vina_score":
-                best_pose = min(poses, key=lambda p: p.vina_score)
+            if _lower_is_better:
+                best_pose = min(poses, key=lambda p: getattr(p, scoring_method, 0.0))
             else:
-                best_pose = max(poses, key=lambda p: getattr(p, scoring_method))
+                best_pose = max(poses, key=lambda p: getattr(p, scoring_method, 0.0))
 
-            p_val = getattr(best_pose, scoring_method)
+            p_val = getattr(best_pose, scoring_method, 0.0)
+
+            # For Glide poses, map scores to _FramePoseResult slots:
+            #   glide_score → vina_score field; CNN fields = 0.0
+            from draco.docking import GlideDockResult as _GlideDockResult
+            if isinstance(best_pose, _GlideDockResult):
+                _cnn_aff = 0.0
+                _vina = best_pose.glide_score
+                _cnn_sc = 0.0
+                _cnn_vs = 0.0
+            else:
+                _cnn_aff = best_pose.cnn_affinity
+                _vina = best_pose.vina_score
+                _cnn_sc = best_pose.cnn_score
+                _cnn_vs = best_pose.cnn_vs
 
             # Determine if this state's best pose is better than the parent's current best
             is_better = False
@@ -712,23 +899,23 @@ def _dock_frame_worker(
                 is_better = True
             else:
                 current_best_val = parent_best[parent][0]
-                if scoring_method == "vina_score":
+                if _lower_is_better:
                     is_better = p_val < current_best_val
                 else:
                     is_better = p_val > current_best_val
 
             if is_better:
-                parent_best[parent] = (p_val, best_pose.cnn_affinity, best_pose.vina_score, best_pose.cnn_score, best_pose.cnn_vs, best_pose.pose_sdf_block)
+                parent_best[parent] = (p_val, _cnn_aff, _vina, _cnn_sc, _cnn_vs, best_pose.pose_sdf_block)
 
         # In SAR mode, also write a ligand-only SDF for this pocket containing the
         # best pose per parent ligand, sorted by the selected scoring method.
         if sar_mode and out_dir_str and parent_best:
             try:
                 # Sort parents by "best pose" scoring_method.
-                # For vina_score: lower is better. For others: higher is better.
+                # For vina_score/glide_score: lower is better. For others: higher is better.
                 def _parent_sort_key(item: tuple[str, tuple[float, float, float, float, float, str]]) -> float:
                     score_val = item[1][0]
-                    return score_val if scoring_method != "vina_score" else -score_val
+                    return score_val if scoring_method not in ("vina_score", "glide_score") else -score_val
 
                 ranked = sorted(parent_best.items(), key=_parent_sort_key, reverse=True)
                 ranked_sdf_blocks = [t[-1] for _, t in ranked if (t[-1] or "").strip()]
@@ -820,7 +1007,7 @@ def _dock_frame_worker(
                         best_active = n
                         best_active_val = val
                     else:
-                        if scoring_method == "vina_score":
+                        if _lower_is_better:
                             if val < best_active_val:
                                 best_active = n
                                 best_active_val = val
@@ -843,6 +1030,7 @@ def _dock_frame_worker(
                 cnn_score=best_cnn_score, cnn_vs=best_cnn_vs,
                 auc_roc=sar_val if "scoring" in steps else None,
                 docked_sdf_block=best_sdf,
+                docking_engine=docking_engine,
                 status="ok",
             )
             # monkey-patch other metrics in case TopKHeap wants them
@@ -885,8 +1073,9 @@ def _dock_frame_worker(
                     vina_score=best_vina,
                     cnn_score=best_cnn_score,
                     cnn_vs=best_cnn_vs,
-                    auc_roc=None, 
+                    auc_roc=None,
                     docked_sdf_block=best_sdf,
+                    docking_engine=docking_engine,
                     status="ok",
                 ))
 
@@ -961,7 +1150,12 @@ def main() -> None:
     #
     # --max-docking-workers and --gnina-cpu CLI overrides take full precedence.
     _eff_gpus = max(1, num_gpus)           # treat 0-GPU nodes as "1 slot"
-    _default_workers = _eff_gpus * 2       # 2 workers pipelined per GPU
+    if args.docking_engine == "adgpu_gnina":
+        # AutoDock-GPU + GNINA rescoring holds the GPU for long stretches; default
+        # to a single concurrent docking worker to avoid oversubscription.
+        _default_workers = 1
+    else:
+        _default_workers = _eff_gpus * 2   # 2 workers pipelined per GPU (GNINA)
     max_docking_workers = (
         args.max_docking_workers
         if args.max_docking_workers is not None
@@ -995,7 +1189,10 @@ def main() -> None:
     print("RESOURCE ALLOCATION")
     print(f"  Dynamics (MD)      : 1 process · {md_gpu_desc}")
     print(f"  Pocket detection   : {num_pocket_workers} CPU workers (concurrent with MD)")
-    print(f"  Docking (GNINA)    : {max_docking_workers} workers · {gnina_cpu_threads} thread(s) each"
+    _dock_engine_label = (
+        "AD-GPU+GNINA" if args.docking_engine == "adgpu_gnina" else "GNINA/Glide"
+    )
+    print(f"  Docking ({_dock_engine_label}) : {max_docking_workers} workers · {gnina_cpu_threads} thread(s) each"
           + (f"  ·  GPUs: {sorted(set(g for g in gpu_assignment if g is not None))}"
              if num_gpus > 0 else "  ·  CPU-only"))
     if num_gpus > 1:
@@ -1038,7 +1235,8 @@ def main() -> None:
     # name_map: state_name → parent_ligand_name
     name_map: dict[str, str] = {}
     parent_smiles_map: dict[str, str] = {}
-    ligand_sdf_paths: dict[str, str] = {}
+    ligand_sdf_paths: dict[str, str] = {}    # GNINA: {state_name: sdf_path}
+    ligand_maegz_paths: dict[str, str] = {}  # Glide:  {state_name: maegz_path}
 
     ligand_manifest_path = outdir / "ligand_prep_manifest.json"
 
@@ -1112,11 +1310,30 @@ def main() -> None:
         active_state_names = list(cached_manifest.get("active_state_names", []))
         inactive_state_names = list(cached_manifest.get("inactive_state_names", []))
         screening_state_names = list(cached_manifest.get("screening_state_names", []))
-        for sn in active_state_names + inactive_state_names + screening_state_names:
-            ligand_sdf_paths[sn] = str((ligands_dir / f"{sn}.sdf").resolve())
+        all_state_names = active_state_names + inactive_state_names + screening_state_names
+        shared_glide_lib = cached_manifest.get("glide_ligprep_library_maegz") if args.docking_engine == "glide" else None
+        for sn in all_state_names:
+            if args.docking_engine == "glide":
+                if isinstance(shared_glide_lib, str):
+                    shared_maegz_p = Path(shared_glide_lib)
+                    if not shared_maegz_p.is_absolute():
+                        shared_maegz_p = (ligands_dir / shared_maegz_p).resolve()
+                    if shared_maegz_p.is_file():
+                        ligand_maegz_paths[sn] = str(shared_maegz_p)
+                        continue
+                maegz_p = ligands_dir / f"{sn}.maegz"
+                if maegz_p.is_file():
+                    ligand_maegz_paths[sn] = str(maegz_p.resolve())
+            else:
+                ligand_sdf_paths[sn] = str((ligands_dir / f"{sn}.sdf").resolve())
+        _reused_n = (
+            len(set(ligand_maegz_paths.values()))
+            if args.docking_engine == "glide"
+            else len(ligand_sdf_paths)
+        )
         print(
             f"\n[2/4]  Preparing ligands …  [{_ts()}]  (cache hit)  "
-            f"{len(ligand_sdf_paths)} SDFs reused from {ligands_dir}/"
+            f"{_reused_n} files reused from {ligands_dir}/"
         )
     else:
         _ligand_prep_start = time.monotonic()
@@ -1189,9 +1406,25 @@ def main() -> None:
 
         # For CSV modes, SDFs are stream-written via on_prepared callback.
         # Single-ligand mode still writes here.
-        if args.mode == "single":
-            ligand_sdf_paths = write_ligands_for_docking(all_compounds, ligands_dir)
-        print(f"  Written {len(ligand_sdf_paths)} SDF files to {ligands_dir}/  (elapsed {_elapsed(_ligand_prep_start)})")
+        if args.docking_engine == "glide":
+            # For Glide: run LigPrep once to produce a shared ligand library.
+            print(f"  Preparing ligands with LigPrep (--docking-engine glide) …")
+            sys.stdout.flush()
+            ligand_maegz_paths = prepare_ligands_for_glide(
+                all_compounds,
+                ligands_dir,
+                ligprep_binary=args.ligprep_binary,
+                max_workers=args.n_cpus,  # None → auto-detect from SLURM_CPUS_PER_TASK / cpu_count
+            )
+            _shared_n = len(set(ligand_maegz_paths.values()))
+            print(
+                f"  LigPrep prepared {len(ligand_maegz_paths)}/{len(all_compounds)} ligands  "
+                f"into {_shared_n} library file(s)  (elapsed {_elapsed(_ligand_prep_start)})"
+            )
+        else:
+            if args.mode == "single":
+                ligand_sdf_paths = write_ligands_for_docking(all_compounds, ligands_dir)
+            print(f"  Written {len(ligand_sdf_paths)} SDF files to {ligands_dir}/  (elapsed {_elapsed(_ligand_prep_start)})")
         sys.stdout.flush()
 
         # Write cache manifest so subsequent runs can skip ligand preparation.
@@ -1214,6 +1447,12 @@ def main() -> None:
             manifest["active_state_names"] = [c.name for c in all_compounds]
             manifest["inactive_state_names"] = []
             manifest["screening_state_names"] = []
+        if args.docking_engine == "glide" and ligand_maegz_paths:
+            _shared_maegz = next(iter(set(ligand_maegz_paths.values())))
+            try:
+                manifest["glide_ligprep_library_maegz"] = str(Path(_shared_maegz).resolve().relative_to(ligands_dir.resolve()))
+            except Exception:
+                manifest["glide_ligprep_library_maegz"] = str(Path(_shared_maegz).resolve())
         ligand_manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     # Prepare initial protein structure
@@ -1267,14 +1506,18 @@ def main() -> None:
                                 print(f"  [top-{args.top_k}] NEW BEST {best_str} | frame={best.frame_index} pocket={best.pocket_id} ligand={best.ligand_name}")
                         if heap_updated and args.top_k > 0:
                             top_now = top_heap.sorted_best()
-                            # In SAR mode, export pose models sorted by CNN_VS (more intuitive for pose inspection),
-                            # even if the *selection* criterion is a SAR metric like AUC/enrichment.
+                            # In SAR mode, sort exported pose models by the primary scoring metric
+                            # (most intuitive for pose inspection), regardless of the SAR selection
+                            # criterion (AUC/enrichment). Direction-aware: lower = better for
+                            # vina_score/glide_score; higher = better for CNN metrics.
                             if args.mode == "sar":
-                                top_now = sorted(top_now, key=lambda rr: rr.cnn_vs, reverse=True)
+                                _lower = args.scoring_method in ("vina_score", "glide_score")
+                                _key = "vina_score" if _lower else args.scoring_method
+                                top_now = sorted(top_now, key=lambda rr: getattr(rr, _key, 0.0), reverse=not _lower)
                             _write_multimodel_pdb(outdir / args.top_output, top_now)
                     else:
                         _dock_progress["poses_err"] += 1
-                        print(f"  [dock] FAILED frame={r.frame_index} pocket={r.pocket_id}: {r.error[:120]}")
+                        _print_dock_failure(r)
                         if args.mode == "sar":
                             row = {
                                 "status": "error",
@@ -1501,6 +1744,7 @@ def main() -> None:
 
 
     # PHASE 2A: Docking (GPU heavy; --dock-filter applies only here)
+    skip_scoring_due_to_docking_failure = False
     if "docking" in args.steps:
         dock_filter: dict[int, set[int] | None] | None = None
         if args.dock_filter:
@@ -1537,7 +1781,7 @@ def main() -> None:
                                 _dock_progress["poses_ok"] += 1
                             else:
                                 _dock_progress["poses_err"] += 1
-                                print(f"  [dock] FAILED frame={r.frame_index} pocket={r.pocket_id}: {r.error[:120]}")
+                                _print_dock_failure(r)
                     _print_dock_progress(_dock_progress, _dock_total_frames[0], _dock_phase_start[0])
                 sys.stdout.flush()
             except Exception as exc:
@@ -1571,13 +1815,38 @@ def main() -> None:
                     pocket_filter=pocket_filter_for_frame,
                     gnina_cpu_threads=gnina_cpu_threads,
                     gpu_id=assigned_gpu,
+                    docking_engine=args.docking_engine,
+                    glide_binary=args.glide_binary,
+                    glide_precision=args.glide_precision,
+                    glide_num_poses=args.glide_num_poses,
+                    glide_timeout_seconds=args.glide_timeout_seconds,
+                    glide_n_cpus=args.n_cpus,
+                    ligand_maegz_paths=ligand_maegz_paths if args.docking_engine == "glide" else None,
+                    adgpu_binary=args.adgpu_binary,
+                    autogrid_binary=args.autogrid_binary,
+                    mk_prepare_receptor_binary=args.mk_prepare_receptor_binary,
+                    mk_prepare_ligand_binary=args.mk_prepare_ligand_binary,
+                    adgpu_nrun=args.adgpu_nrun,
+                    adgpu_timeout_seconds=args.adgpu_timeout_seconds,
+                    adgpu_grid_timeout_seconds=args.adgpu_grid_timeout_seconds,
+                    adgpu_delete_bad_res=args.adgpu_delete_bad_res,
                 )
                 future.add_done_callback(on_docking_only_done)
                 dock_futures.append(future)
             concurrent.futures.wait(dock_futures)
 
+        skip_scoring_due_to_docking_failure = (
+            len(frames_to_dock) > 0 and _dock_progress.get("poses_ok", 0) == 0
+        )
+        if skip_scoring_due_to_docking_failure and "scoring" in args.steps:
+            print(
+                "\n  [FAIL-FAST] Phase 2A produced zero successful docking poses; "
+                "skipping Phase 2B scoring to avoid misleading placeholder SAR rows."
+            )
+            sys.stdout.flush()
+
     # PHASE 2B: Scoring (scan all existing docking_output frame/pocket folders)
-    if "scoring" in args.steps:
+    if "scoring" in args.steps and not skip_scoring_due_to_docking_failure:
         import re
         frame_pocket_dirs = sorted((outdir / "docking_output").glob("frame*_pocket*"))
         pockets_by_frame: dict[int, set[int]] = {}
@@ -1631,6 +1900,21 @@ def main() -> None:
                     pocket_filter=scored_pockets,
                     gnina_cpu_threads=gnina_cpu_threads,
                     gpu_id=assigned_gpu,
+                    docking_engine=args.docking_engine,
+                    glide_binary=args.glide_binary,
+                    glide_precision=args.glide_precision,
+                    glide_num_poses=args.glide_num_poses,
+                    glide_timeout_seconds=args.glide_timeout_seconds,
+                    glide_n_cpus=args.n_cpus,
+                    ligand_maegz_paths=ligand_maegz_paths if args.docking_engine == "glide" else None,
+                    adgpu_binary=args.adgpu_binary,
+                    autogrid_binary=args.autogrid_binary,
+                    mk_prepare_receptor_binary=args.mk_prepare_receptor_binary,
+                    mk_prepare_ligand_binary=args.mk_prepare_ligand_binary,
+                    adgpu_nrun=args.adgpu_nrun,
+                    adgpu_timeout_seconds=args.adgpu_timeout_seconds,
+                    adgpu_grid_timeout_seconds=args.adgpu_grid_timeout_seconds,
+                    adgpu_delete_bad_res=args.adgpu_delete_bad_res,
                 )
                 future.add_done_callback(on_dock_done)
                 score_futures.append(future)
@@ -1643,7 +1927,7 @@ def main() -> None:
     def _summary_rank_key(row: dict[str, Any]) -> tuple[int, float]:
         try:
             val = float(row.get(ranking_metric, ""))
-            if ranking_metric == "vina_score":
+            if ranking_metric in ("vina_score", "glide_score"):
                 val = -val
         except (TypeError, ValueError):
             val = float("-inf")
@@ -1681,8 +1965,11 @@ def main() -> None:
     if top_poses:
         frame_dir = outdir / "frames"
         if args.mode == "sar":
-            # For SAR, write the exported pose models ordered by CNN_VS.
-            top_poses = sorted(top_poses, key=lambda rr: rr.cnn_vs, reverse=True)
+            # Sort exported pose models by the primary scoring metric (direction-aware).
+            # vina_score also holds glide_score in Glide mode; both are lower-is-better.
+            _lower = args.scoring_method in ("vina_score", "glide_score")
+            _key = "vina_score" if _lower else args.scoring_method
+            top_poses = sorted(top_poses, key=lambda rr: getattr(rr, _key, 0.0), reverse=not _lower)
             # Also export ligand-only SDFs:
             # - per-rank: all ligands' best poses for that frame/pocket, sorted by scoring_method
             # - combined: the single best ligand per selected frame/pocket (top-K pockets)
@@ -1815,6 +2102,7 @@ _FIELDNAMES_SINGLE = [
     "status", "frame_index", "frame_time_ps",
     "pocket_id", "pocket_score",
     "ligand_name", "smiles", "cnn_vs", "cnn_affinity", "cnn_score", "vina_score", "auc_roc",
+    "docking_engine",
     "initial_energy_kj_per_mol", "final_energy_kj_per_mol",
     "interaction_energy_kj_per_mol",
     "ligand_rmsd_from_dock_angstrom",
@@ -1839,6 +2127,7 @@ _FIELDNAMES_SAR = [
     "overall_min_score", "overall_max_score",
     "mean_rank_active_minus_inactive",
     "enrichment_1pct", "enrichment_5pct", "enrichment_10pct",
+    "docking_engine",
     "initial_energy_kj_per_mol", "final_energy_kj_per_mol",
     "interaction_energy_kj_per_mol",
     "ligand_rmsd_from_dock_angstrom",
@@ -1861,6 +2150,7 @@ def _to_row_single(r: _FramePoseResult) -> dict[str, Any]:
         "cnn_score": f"{r.cnn_score:.3f}" if r.cnn_score != "" else "",
         "vina_score": f"{r.vina_score:.3f}" if r.vina_score != "" else "",
         "auc_roc": f"{r.auc_roc:.4f}" if r.auc_roc is not None and r.auc_roc != "" else "",
+        "docking_engine": getattr(r, "docking_engine", "adgpu_gnina"),
         "initial_energy_kj_per_mol": (
             f"{r.initial_energy_kj_per_mol:.2f}"
             if isinstance(r.initial_energy_kj_per_mol, (int, float)) else r.initial_energy_kj_per_mol
@@ -1925,6 +2215,7 @@ def _to_row_sar(r: _FramePoseResult) -> dict[str, Any]:
         "enrichment_1pct": f"{e1:.4f}" if e1 is not None and e1 != "" else "",
         "enrichment_5pct": f"{e5:.4f}" if e5 is not None and e5 != "" else "",
         "enrichment_10pct": f"{e10:.4f}" if e10 is not None and e10 != "" else "",
+        "docking_engine": getattr(r, "docking_engine", "adgpu_gnina"),
         "initial_energy_kj_per_mol": (
             f"{r.initial_energy_kj_per_mol:.2f}"
             if isinstance(r.initial_energy_kj_per_mol, (int, float)) else r.initial_energy_kj_per_mol
@@ -2017,6 +2308,14 @@ def _print_dock_progress(
         f"  |  elapsed {_elapsed(phase_start)}{eta_part}",
         flush=True,
     )
+
+
+def _print_dock_failure(result: "_FramePoseResult") -> None:
+    """Print docking failure details without truncating traceback/stderr."""
+    print(f"  [dock] FAILED frame={result.frame_index} pocket={result.pocket_id}")
+    err = (result.error or "").rstrip()
+    if err:
+        print(err)
 
 
 

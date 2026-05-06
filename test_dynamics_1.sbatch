@@ -18,6 +18,9 @@
 
 module load cuda
 module load apptainer
+# Meeko + AutoGrid4 + adgpu (used by --docking-engine adgpu_gnina, the Draco default)
+module load autodock-gpu
+module load autogrid
 
 export PIXI_HOME=/work/users/s/h/shuhang/.pixi
 export PATH="$PIXI_HOME/bin:$PATH"
@@ -49,6 +52,7 @@ pixi run draco \
   --steps dynamics pocket docking scoring refinement \
   --protein-pdb    "6PBC.pdb" \
   --ligand-smiles  "CN(CC1(CC1)c1ccc(F)cc1)C(=O)[C@H](Cc1csc2ccccc12)Nc1cc(ncn1)C(N)=O" \
+  --docking-engine adgpu_gnina \
   --gnina-binary   "apptainer run --nv /work/users/s/h/shuhang/gnina_build/gnina.sif" \
   --dynamics-backend bioemu \
   --bioemu-num-samples 10 \

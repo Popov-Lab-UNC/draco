@@ -18,6 +18,8 @@
 
 module load cuda
 module load apptainer
+module load autodock-gpu
+module load autogrid
 
 export PIXI_HOME=/work/users/s/h/shuhang/.pixi
 export PATH="$PIXI_HOME/bin:$PATH"
@@ -49,5 +51,6 @@ pixi run draco \
   --steps dynamics pocket docking scoring \
   --protein-pdb       "8T7C.pdb" \
   --ligand-csv        "plcg2_activators_8apr2026.csv" \
+  --docking-engine    adgpu_gnina \
   --gnina-binary      "apptainer run --nv /work/users/s/h/shuhang/gnina_build/gnina.sif" \
   --output-dir        "plcg2_10apr2026"

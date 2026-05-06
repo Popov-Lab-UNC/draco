@@ -328,8 +328,10 @@ def load_compound_csv(
 
     with path.open(newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
+        if reader.fieldnames is None:
+            raise ValueError(f"Compound CSV {path} has no header row.")
         required = {name_column, smiles_column, activity_column}
-        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+        if not required.issubset(reader.fieldnames):
             raise ValueError(
                 f"Compound CSV {path} must have columns: {required}. "
                 f"Found: {reader.fieldnames}"
@@ -426,8 +428,10 @@ def load_screening_csv(
 
     with path.open(newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
+        if reader.fieldnames is None:
+            raise ValueError(f"Screening CSV {path} has no header row.")
         required = {name_column, smiles_column}
-        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+        if not required.issubset(reader.fieldnames):
             raise ValueError(
                 f"Screening CSV {path} must have columns: {required}. "
                 f"Found: {reader.fieldnames}"
@@ -830,3 +834,290 @@ def compute_molecular_formula(prepared_ligand: PreparedLigand) -> str:
     if mol is None:
         return ""
     return rdMolDescriptors.CalcMolFormula(mol)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LigPrep-based ligand preparation (for Glide docking)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_schrodinger_binary(name: str) -> str:
+    """Resolve a Schrödinger binary path via the ``SCHRODINGER`` env variable."""
+    schrodinger = os.environ.get("SCHRODINGER", "").strip()
+    if schrodinger:
+        from pathlib import Path as _Path
+        return str(_Path(schrodinger) / name)
+    return name
+
+
+def run_ligprep(
+    smiles: str,
+    output_maegz: "os.PathLike[str] | str",
+    *,
+    name: str | None = None,
+    ph: float = 7.0,
+    ph_tolerance: float = 1.0,
+    max_states: int = 1,
+    ligprep_binary: str | None = None,
+    timeout_seconds: int | None = 300,
+    work_dir: "os.PathLike[str] | str | None" = None,
+) -> Path:
+    """Run Schrödinger LigPrep on a single SMILES to produce a ``.maegz`` file.
+
+    LigPrep handles protonation, tautomer enumeration, and 3-D conformer
+    generation at the specified pH, making it suitable as input for Glide.
+
+    Parameters
+    ----------
+    smiles:
+        Input SMILES string.
+    output_maegz:
+        Path for the output ``.maegz`` file.
+    name:
+        Optional molecule name embedded in the output file.
+    ph:
+        Target pH for protonation (default 7.0).
+    ph_tolerance:
+        pH range ± around ``ph`` (default 1.0 → pH 6.0–8.0).
+    max_states:
+        Maximum number of protonation / tautomer states to generate
+        (default 1 = single best state).
+    ligprep_binary:
+        Path or name of the LigPrep binary. Defaults to
+        ``$SCHRODINGER/ligprep``.
+    timeout_seconds:
+        Wall-clock timeout in seconds (default 300).
+    work_dir:
+        Working directory for LigPrep sidecar logs/files. If None, defaults
+        to ``output_maegz.parent``.
+
+    Returns
+    -------
+    Path
+        Resolved path of the written ``.maegz`` file.
+
+    Raises
+    ------
+    RuntimeError
+        If LigPrep fails or produces no output.
+    """
+    import subprocess
+    import tempfile
+    from pathlib import Path as _Path
+
+    output_maegz = _Path(output_maegz).resolve()
+    output_maegz.parent.mkdir(parents=True, exist_ok=True)
+    run_cwd = _Path(work_dir).resolve() if work_dir is not None else output_maegz.parent
+    run_cwd.mkdir(parents=True, exist_ok=True)
+
+    ligprep_bin = ligprep_binary or _resolve_schrodinger_binary("ligprep")
+
+    # Write SMILES input file
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".smi", delete=False, prefix="draco_ligprep_"
+    ) as tmp_smi:
+        mol_name = name or smiles[:30].replace(" ", "_")
+        tmp_smi.write(f"{smiles} {mol_name}\n")
+        smi_path = _Path(tmp_smi.name)
+
+    try:
+        cmd = [
+            ligprep_bin,
+            "-ismi", str(smi_path),
+            "-omae", str(output_maegz),
+            "-ph", str(ph),
+            "-pht", str(ph_tolerance),
+            "-s", str(max_states),
+            "-epik",   # use Epik for protonation state prediction
+            "-WAIT",
+            "-LOCAL",
+        ]
+        _log.debug("LigPrep cmd: %s", " ".join(cmd))
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                cwd=str(run_cwd),
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"LigPrep timed out after {timeout_seconds} s for SMILES '{smiles[:40]}…'"
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"LigPrep binary not found at '{ligprep_bin}'. "
+                "Ensure $SCHRODINGER is set (module load schrodinger)."
+            )
+
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"LigPrep failed (exit {proc.returncode}) for SMILES '{smiles[:40]}':\n"
+                f"stdout: {proc.stdout[:400]}\nstderr: {proc.stderr[:400]}"
+            )
+
+        if not output_maegz.exists() or output_maegz.stat().st_size == 0:
+            raise RuntimeError(
+                f"LigPrep produced no output at '{output_maegz}' for SMILES '{smiles[:40]}'."
+            )
+
+        return output_maegz
+    finally:
+        try:
+            smi_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _ligprep_worker(
+    args: tuple[str, str, str, float, float, int, str | None, int | None, str | None],
+) -> tuple[str, str | None, str | None]:
+    """Worker for parallel LigPrep execution.
+
+    Parameters
+    ----------
+    args:
+        ``(name, smiles, output_maegz_str, ph, ph_tolerance, max_states,
+           ligprep_binary, timeout_seconds, work_dir_str)``
+
+    Returns
+    -------
+    tuple[str, str | None, str | None]
+        ``(name, maegz_path_str | None, error_msg | None)``
+    """
+    name, smiles, output_maegz_str, ph, ph_tolerance, max_states, ligprep_bin, timeout_seconds, work_dir_str = args
+    try:
+        path = run_ligprep(
+            smiles,
+            output_maegz_str,
+            name=name,
+            ph=ph,
+            ph_tolerance=ph_tolerance,
+            max_states=max_states,
+            ligprep_binary=ligprep_bin,
+            timeout_seconds=timeout_seconds,
+            work_dir=work_dir_str,
+        )
+        return name, str(path), None
+    except Exception as exc:
+        return name, None, str(exc)
+
+
+def prepare_ligands_for_glide(
+    compounds: list[PreparedLigand],
+    ligands_dir: "os.PathLike[str] | str",
+    *,
+    ph: float = 7.0,
+    ph_tolerance: float = 1.0,
+    max_states: int = 1,
+    ligprep_binary: str | None = None,
+    timeout_seconds: int | None = 300,
+    max_workers: int | None = None,
+) -> dict[str, str]:
+    """Run LigPrep on ligands and return ``.maegz`` paths.
+
+    By default this prepares all ligands from the input set into a single
+    LigPrep library file ``ligprep_all.maegz`` under ``ligands_dir`` and
+    returns a mapping from each ligand name to that shared file path.
+
+    Parameters
+    ----------
+    compounds:
+        List of ``PreparedLigand`` objects. Only ``canonical_smiles`` and
+        ``name`` fields are used; the RDKit conformers are not forwarded
+        (LigPrep generates its own 3-D structures).
+    ligands_dir:
+        Directory in which to write the output ``.maegz`` files.
+    ph:
+        Target pH for LigPrep protonation (default 7.0).
+    ph_tolerance:
+        pH range ± around ``ph`` (default 1.0).
+    max_states:
+        Maximum protonation / tautomer states per ligand (default 1).
+    ligprep_binary:
+        Path or name of the LigPrep binary. Defaults to ``$SCHRODINGER/ligprep``.
+    timeout_seconds:
+        Per-ligand LigPrep timeout in seconds (default 300).
+    max_workers:
+        Reserved for backward compatibility (unused in shared-library mode).
+
+    Returns
+    -------
+    dict[str, str]
+        Mapping ``{ligand_name: absolute_maegz_path}``. In shared-library mode,
+        each ligand maps to the same ``ligprep_all.maegz`` path.
+    """
+    import subprocess
+
+    out_dir = Path(ligands_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ligprep_logs_dir = out_dir / "ligprep_logs"
+    ligprep_logs_dir.mkdir(parents=True, exist_ok=True)
+
+    ligprep_bin = ligprep_binary or _resolve_schrodinger_binary("ligprep")
+    if not compounds:
+        return {}
+
+    # Shared LigPrep input/output for all CSV ligands to keep file count low.
+    smi_path = ligprep_logs_dir / "ligprep_input_all.smi"
+    output_maegz = (out_dir / "ligprep_all.maegz").resolve()
+    stdout_path = ligprep_logs_dir / "ligprep_all.stdout.log"
+    stderr_path = ligprep_logs_dir / "ligprep_all.stderr.log"
+
+    lines = []
+    for compound in compounds:
+        lines.append(f"{compound.canonical_smiles} {compound.name}")
+    smi_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    cmd = [
+        ligprep_bin,
+        "-ismi", str(smi_path.resolve()),
+        "-omae", str(output_maegz),
+        "-ph", str(ph),
+        "-pht", str(ph_tolerance),
+        "-s", str(max_states),
+        "-epik",
+        "-WAIT",
+        "-LOCAL",
+    ]
+    _log.debug("LigPrep batch cmd: %s", " ".join(cmd))
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            # LigPrep requires output paths to be under the process CWD.
+            # Run from out_dir so -omae <out_dir>/ligprep_all.maegz is valid.
+            cwd=str(out_dir),
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"LigPrep batch timed out after {timeout_seconds} s for {len(compounds)} ligands."
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"LigPrep binary not found at '{ligprep_bin}'. "
+            "Ensure $SCHRODINGER is set (module load schrodinger)."
+        )
+
+    try:
+        stdout_path.write_text(proc.stdout or "", encoding="utf-8")
+        stderr_path.write_text(proc.stderr or "", encoding="utf-8")
+    except OSError as exc:
+        _log.warning("Failed to write LigPrep batch logs: %s", exc)
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"LigPrep batch failed (exit {proc.returncode}) for {len(compounds)} ligands.\n"
+            f"stdout: {(proc.stdout or '')[:400]}\nstderr: {(proc.stderr or '')[:400]}"
+        )
+
+    if not output_maegz.exists() or output_maegz.stat().st_size == 0:
+        raise RuntimeError(
+            f"LigPrep batch produced no output at '{output_maegz}'."
+        )
+
+    shared_path = str(output_maegz)
+    return {compound.name: shared_path for compound in compounds}

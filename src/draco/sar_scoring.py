@@ -1,4 +1,4 @@
-"""sar_scoring.py – SAR-discriminative scoring from GNINA docking results.
+"""sar_scoring.py – SAR-discriminative scoring from GNINA/Glide docking results.
 
 Role in the Pipeline
 --------------------
@@ -12,9 +12,16 @@ enrichment-based discrimination metrics:
   - Enrichment Factor at 1%, 5%, 10%: fraction of actives recovered at a
     given fraction of the ranked list
 
-The primary signal is the best GNINA score per compound (most negative
-CNN affinity or Vina score). A (conformation, pocket) pair is "good" if
-actives consistently outscore inactives.
+The primary signal is the best docking score per compound. A (conformation,
+pocket) pair is "good" if actives consistently outscore inactives.
+
+Supported ``score_key`` values
+------------------------------
+- ``'cnn_affinity'``  – GNINA CNN predicted affinity in pK units (higher = better)
+- ``'cnn_score'``     – GNINA CNN pose quality 0–1 (higher = better)
+- ``'cnn_vs'``        – GNINA CNN virtual screening score 0–1 (higher = better)
+- ``'vina_score'``    – GNINA AutoDock Vina score kcal/mol (lower = better)
+- ``'glide_score'``   – Glide GlideScore kcal/mol (lower = better)
 
 When only a single compound is provided (``--ligand-smiles`` mode), SAR
 scoring is not applicable and this module is not called; ranking is done
@@ -29,7 +36,7 @@ from typing import Sequence
 import numpy as np
 import numpy.typing as npt
 
-from draco.docking import GninaDockResult, PocketDockResult
+from draco.docking import GlideDockResult, GninaDockResult, PocketDockResult
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -110,7 +117,12 @@ class SARScoreResult:
     """Best docking score per inactive compound."""
 
     score_key: str
-    """Which GNINA score was used: 'cnn_affinity', 'vina_score', or 'cnn_score'."""
+    """Which score was used for ranking.
+
+    GNINA options: ``'cnn_affinity'``, ``'vina_score'``, ``'cnn_score'``,
+    ``'cnn_vs'``.
+    Glide options: ``'glide_score'`` (GlideScore, lower = better).
+    """
 
     undocked_actives: list[str] = field(default_factory=list)
     """Active compound names that produced no docking poses (GNINA failed)."""
@@ -154,8 +166,9 @@ def compute_sar_discrimination(
     -------
     SARScoreResult
     """
-    # Ranking direction: vina_score → lower (more negative) is better.
-    # cnn_affinity (pK), cnn_vs (0-1), and cnn_score (0-1) → higher is better.
+    # Ranking direction:
+    #   higher-is-better: cnn_affinity (pK), cnn_score (0-1), cnn_vs (0-1)
+    #   lower-is-better:  vina_score (kcal/mol), glide_score (kcal/mol)
     higher_is_better_score = score_key in ("cnn_affinity", "cnn_score", "cnn_vs")
 
     active_scores: list[float] = []
@@ -396,18 +409,21 @@ def _auprc_average_precision(
 
 
 def _best_score(
-    poses: list[GninaDockResult],
+    poses: list[GninaDockResult | GlideDockResult],
     score_key: str,
 ) -> float | None:
     """Return the best (extreme) score from a list of docked poses.
 
     Returns None if ``poses`` is empty (compound not docked).
-    For ``cnn_affinity`` (pK): returns maximum. For ``vina_score``: minimum (most negative).
-    For ``cnn_score`` (0–1) and ``cnn_vs`` (0-1): returns maximum.
+
+    Score directions:
+    - ``cnn_affinity`` (pK): maximum (higher = tighter binding).
+    - ``cnn_score`` / ``cnn_vs`` (0–1): maximum.
+    - ``vina_score`` / ``glide_score`` (kcal/mol): minimum (most negative = best).
     """
     if not poses:
         return None
     vals = [getattr(p, score_key) for p in poses]
     if score_key in ("cnn_score", "cnn_affinity", "cnn_vs"):
         return max(vals)
-    return min(vals)  # vina: most negative = best
+    return min(vals)  # vina_score / glide_score: most negative = best
