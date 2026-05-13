@@ -314,6 +314,17 @@ def parse_args() -> argparse.Namespace:
     # ── Pocket & Ligand Prep Parameters ───────────────────────────────────────
     pocket_grp = parser.add_argument_group("Pocket & Ligand Prep Parameters")
     pocket_grp.add_argument("--pocket-score-threshold", type=float, default=5.0, help="Pocketeer score threshold.")
+    pocket_grp.add_argument(
+        "--pocket-xyz",
+        nargs=3,
+        type=float,
+        metavar=("X", "Y", "Z"),
+        default=None,
+        help=(
+            "Optional point in Angstroms used to select pockets. "
+            "Only pockets whose docking box contains this point are kept."
+        ),
+    )
     pocket_grp.add_argument("--num-conformers", type=int, default=10, help="Number of conformers to generate for ligands.")
     pocket_grp.add_argument("--prune-rms-threshold", type=float, default=1.0, help="RMSD threshold for conformer pruning.")
     pocket_grp.add_argument("--energy-cutoff", type=float, default=5.0, help="Energy cutoff (kcal/mol) for conformer pruning.")
@@ -464,6 +475,9 @@ def parse_args() -> argparse.Namespace:
     if args.scoring_method == "glide_score" and args.docking_engine != "glide":
         parser.error("--scoring-method glide_score requires --docking-engine glide.")
 
+    if args.pocket_xyz is not None:
+        args.pocket_xyz = tuple(float(v) for v in args.pocket_xyz)
+
     return args
 
 
@@ -593,6 +607,16 @@ def _parse_dock_filter(tokens: list[str]) -> dict[int, set[int] | None]:
     return result
 
 
+def _box_contains_xyz(box: "DockingBox", xyz: tuple[float, float, float]) -> bool:
+    """Return True when (x, y, z) lies inside the axis-aligned box."""
+    x, y, z = xyz
+    return (
+        abs(x - box.center_x) <= box.size_x / 2.0
+        and abs(y - box.center_y) <= box.size_y / 2.0
+        and abs(z - box.center_z) <= box.size_z / 2.0
+    )
+
+
 def _worker_init(gpu_id: int | None = None) -> None:
     """Initializer for ProcessPoolExecutor workers.
 
@@ -626,6 +650,7 @@ def _dock_frame_worker(
     active_names: list[str],           # parent-level active names
     inactive_names: list[str],         # parent-level inactive names
     pocket_score_threshold: float,
+    pocket_xyz: tuple[float, float, float] | None,
     gnina_binary: str,
     exhaustiveness: int,
     num_modes: int,
@@ -709,15 +734,19 @@ def _dock_frame_worker(
                 cnn_affinity=0.0, vina_score=0.0, cnn_score=0.0, cnn_vs=0.0, auc_roc=None,
                 status="error", error=f"Pocketeer failed: {exc}\n{traceback.format_exc()}"
             )]
-        if project_output_dir:
-            write_pocket_artifact_for_frame(project_output_dir, frame_index, pockets)
-        if not pockets:
-            return []
+        pocket_entries: list[tuple[int, float, DockingBox, Any]] = []
         for idx, pocket in enumerate(pockets):
             pid = int(getattr(pocket, "pocket_id", idx))
             score = float(getattr(pocket, "score", 0.0))
             box = docking_box_from_pocket(pocket)
+            if pocket_xyz is not None and not _box_contains_xyz(box, pocket_xyz):
+                continue
+            pocket_entries.append((pid, score, box, pocket))
             work_items.append((pid, score, box))
+
+        if project_output_dir:
+            filtered_pockets = [entry[3] for entry in pocket_entries]
+            write_pocket_artifact_for_frame(project_output_dir, frame_index, filtered_pockets)
     elif "docking" in steps or "scoring" in steps:
         if not project_output_dir:
             raise ValueError(
@@ -731,8 +760,12 @@ def _dock_frame_worker(
                 "Docking/scoring without the 'pocket' step requires precomputed pocket "
                 f"artifacts. {exc}"
             ) from exc
-        if not work_items:
-            return []
+        if pocket_xyz is not None:
+            work_items = [
+                (pid, score, box)
+                for (pid, score, box) in work_items
+                if _box_contains_xyz(box, pocket_xyz)
+            ]
 
     if not work_items:
         return []
@@ -1201,6 +1234,9 @@ def main() -> None:
         print(f"    GPU round-robin  : "
               + "  ".join(f"GPU {g} → {n} workers" for g, n in sorted(gpu_counts.items())))
     print("═" * 70)
+    if args.pocket_xyz is not None:
+        x, y, z = args.pocket_xyz
+        print(f"  Pocket XYZ filter  : ({x:.3f}, {y:.3f}, {z:.3f})")
 
     # ── [1/4] Explicit-solvent MD ────────────────────────────────────────────
     print("\n" + "═" * 70)
@@ -1618,7 +1654,7 @@ def main() -> None:
                     _dock_frame_worker,
                     frame_index=f_idx, frame_time_ps=f_time, protein_pdb_path=pdb_path, protein_pdb_string=pdb_str,
                     ligand_sdf_paths={}, name_map={}, parent_smiles_map={}, active_names=[], inactive_names=[],
-                    pocket_score_threshold=args.pocket_score_threshold, gnina_binary=args.gnina_binary,
+                    pocket_score_threshold=args.pocket_score_threshold, pocket_xyz=args.pocket_xyz, gnina_binary=args.gnina_binary,
                     exhaustiveness=args.exhaustiveness, num_modes=args.num_modes, cnn_scoring="none",
                     gnina_seed=args.gnina_seed, dry_run=args.dry_run, scoring_method=args.scoring_method,
                     sar_metric=args.sar_metric, docking_output_dir=None, gnina_timeout_seconds=args.gnina_timeout_seconds,
@@ -1732,7 +1768,7 @@ def main() -> None:
                         _dock_frame_worker,
                         frame_index=f_idx, frame_time_ps=f_time, protein_pdb_path=p_path, protein_pdb_string=p_str,
                         ligand_sdf_paths={}, name_map={}, parent_smiles_map={}, active_names=[], inactive_names=[],
-                        pocket_score_threshold=args.pocket_score_threshold, gnina_binary=args.gnina_binary,
+                        pocket_score_threshold=args.pocket_score_threshold, pocket_xyz=args.pocket_xyz, gnina_binary=args.gnina_binary,
                         exhaustiveness=args.exhaustiveness, num_modes=args.num_modes, cnn_scoring="none",
                         gnina_seed=args.gnina_seed, dry_run=args.dry_run, scoring_method=args.scoring_method,
                         sar_metric=args.sar_metric, docking_output_dir=None, gnina_timeout_seconds=args.gnina_timeout_seconds,
@@ -1807,7 +1843,7 @@ def main() -> None:
                     _dock_frame_worker,
                     frame_index=f_idx, frame_time_ps=f_time, protein_pdb_path=p_path, protein_pdb_string=p_str,
                     ligand_sdf_paths=ligand_sdf_paths, name_map=name_map, parent_smiles_map=parent_smiles_map, active_names=active_names, inactive_names=inactive_names,
-                    pocket_score_threshold=args.pocket_score_threshold, gnina_binary=args.gnina_binary,
+                    pocket_score_threshold=args.pocket_score_threshold, pocket_xyz=args.pocket_xyz, gnina_binary=args.gnina_binary,
                     exhaustiveness=args.exhaustiveness, num_modes=args.num_modes, cnn_scoring=args.cnn_scoring,
                     gnina_seed=args.gnina_seed, dry_run=args.dry_run, scoring_method=args.scoring_method,
                     sar_metric=args.sar_metric, docking_output_dir=str(docking_output_dir), gnina_timeout_seconds=args.gnina_timeout_seconds,
@@ -1892,7 +1928,7 @@ def main() -> None:
                     _dock_frame_worker,
                     frame_index=f_idx, frame_time_ps=f_time, protein_pdb_path=p_path, protein_pdb_string=p_str,
                     ligand_sdf_paths=ligand_sdf_paths, name_map=name_map, parent_smiles_map=parent_smiles_map, active_names=active_names, inactive_names=inactive_names,
-                    pocket_score_threshold=args.pocket_score_threshold, gnina_binary=args.gnina_binary,
+                    pocket_score_threshold=args.pocket_score_threshold, pocket_xyz=args.pocket_xyz, gnina_binary=args.gnina_binary,
                     exhaustiveness=args.exhaustiveness, num_modes=args.num_modes, cnn_scoring=args.cnn_scoring,
                     gnina_seed=args.gnina_seed, dry_run=args.dry_run, scoring_method=args.scoring_method,
                     sar_metric=args.sar_metric, docking_output_dir=str(docking_output_dir), gnina_timeout_seconds=args.gnina_timeout_seconds,
