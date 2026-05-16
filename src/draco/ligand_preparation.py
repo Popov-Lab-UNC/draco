@@ -766,6 +766,9 @@ def _filter_and_prune_conformers(
     if prune_rms_threshold <= 0:
         return filtered_cids
 
+    # Perform RMSD comparison on heavy atoms only and without expensive isomorphism search
+    mol_no_h = Chem.RemoveHs(mol)
+
     keep_cids: list[int] = []
     for cid in filtered_cids:
         if not keep_cids:
@@ -773,7 +776,10 @@ def _filter_and_prune_conformers(
             continue
         too_close = False
         for kept_cid in keep_cids:
-            rmsd = AllChem.GetBestRMS(mol, mol, cid, kept_cid)
+            # We use prealigned=False because we don't globally align all conformers.
+            # GetConformerRMS(prealigned=False) automatically computes the optimal
+            # alignment between just the two conformers being compared.
+            rmsd = AllChem.GetConformerRMS(mol_no_h, cid, kept_cid, prealigned=False)
             if rmsd < prune_rms_threshold:
                 too_close = True
                 break
